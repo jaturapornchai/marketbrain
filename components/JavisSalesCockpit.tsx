@@ -317,6 +317,7 @@ export default function JavisSalesCockpit({
     void drainAudioQueue();
   }, [drainAudioQueue]);
 
+  const sendTurnRef = useRef<(text: string) => Promise<void> | void>(() => {});
   const sendTurn = useCallback(
     async (
       rawText: string,
@@ -524,6 +525,7 @@ export default function JavisSalesCockpit({
     },
     [cart.items, closeQtyModal, customer, enqueueOmniVoiceSentence, promptAddToCart, replaceServerCart, stopAllAudioPlayback, turns, updateCustomer],
   );
+  sendTurnRef.current = sendTurn;
 
   // Consume external text prompt sent from /search or /n/[slug]
   useEffect(() => {
@@ -749,7 +751,8 @@ export default function JavisSalesCockpit({
                   const finalWords = (d.text ?? "").trim();
                   setLiveUserHeard("");
                   if (d.voiced && finalWords) {
-                    void sendTurn(finalWords);
+                    // Latest sendTurn, not the one captured when the mic started (stale cart/history wiped the cart).
+                    void sendTurnRef.current(finalWords);
                   } else {
                     setHudState("listening");
                     setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
@@ -769,7 +772,7 @@ export default function JavisSalesCockpit({
       source.connect(proc);
       proc.connect(ctx.destination);
     },
-    [sendTurn, stopAllAudioPlayback, teardownMicGraph],
+    [stopAllAudioPlayback, teardownMicGraph],
   );
 
   const startLiveCall = useCallback(
