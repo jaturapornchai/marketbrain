@@ -1,0 +1,14 @@
+node_modules/
+.next/
+.data/
+.deploy/
+__pycache__/
+voice_sidecar/__pycache__/
+*.tar.gz
+.env*
+!.env.example
+*.pem
+*.key
+*.log
+next-env.d.ts
+*.tsbuildinfo

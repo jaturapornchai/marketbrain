@@ -1,0 +1,11 @@
+# MarketBrain — สมองสินค้าไทย & เลขาน้องตี๋ (Javis Sales Concierge)
+
+> เว็บไซต์หลัก: https://marketbrain.bcsmethai.com
+> ระบบสมองค้นหาสินค้าและผู้ช่วยขายเสียงภาษาไทยครบวงจร (Local OmniVoice GPU + OpenThai ASR + Local Vision AI + DeepSeek + GraphRAG + MCP)
+
+## หน้าหลักของระบบ
+- https://marketbrain.bcsmethai.com/ : หน้าสนทนาและช้อปปิ้งสดกับ **น้องตี๋ (Javis)** เปิดมาพร้อมคุยทันที เลือกไมค์/ลำโพง/กล้อง ส่องรูปสินค้า จัดตะกร้า และปิดการขายออกใบสั่งซื้อพร้อม QR พร้อมเพย์
+- https://marketbrain.bcsmethai.com/search : หน้าค้นหาสินค้าแบบละเอียดเต็มความกว้างหน้าจอ (Mobile-First) กรองตามกลุ่มสินค้า แบรนด์ หน่วยนับ คุณลักษณะ ช่วงราคา บาร์โค้ดไทย GS1 (885) และค้นหาด้วยรูปสินค้า
+- https://marketbrain.bcsmethai.com/brain : แผนภาพสมองสินค้า 3 มิติ (9 กลุ่มความรู้, 16 ชนิดไซแนปส์)
+- https://marketbrain.bcsmethai.com/n : สารบัญเซลล์สมองทั้งหมด
+- https://marketbrain.bcsmethai.com/mcp : Stateless Streamable HTTP MCP Endpoint (JSON-RPC 2.0)
