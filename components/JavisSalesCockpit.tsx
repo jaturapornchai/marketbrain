@@ -12,10 +12,29 @@ import type {
   JavisTeamJob,
 } from "@/lib/product-card";
 import { BARGE_FRAMES, EchoGuard, playedLevel, wavEnvelope } from "@/lib/echo-guard";
-import { parseScreenCommand, screenCommandHelp, type ScreenCommand } from "@/lib/voice-commands";
+import { parseBudget, parseScreenCommand, screenCommandHelp, type ScreenCommand } from "@/lib/voice-commands";
+import { parseThaiNumber } from "@/lib/numbered-order";
+import {
+  BudgetBar,
+  CountUpBaht,
+  DuelView,
+  KaraokeWords,
+  LuckyWheel,
+  MISSIONS,
+  PayCountdown,
+  PlayPanel,
+  ThinkingBrain,
+  burstConfetti,
+  flyToCart,
+  judgeDuel,
+  playTing,
+  type MissionKey,
+} from "./FunZone";
 import { useRouter } from "next/navigation";
 import DevicePickerPopover from "./DevicePickerPopover";
 import { useJavis } from "./JavisContext";
+import CouponStrip from "./CouponStrip";
+import { PROMOTIONS, applyCoupon, bestPromotion, findPromotion, parseCouponCommand, type CouponCommand } from "@/lib/promotions";
 import ProductVisionScanner, { identifyProductFromFile, type VisionLookupResult } from "./ProductVisionScanner";
 
 type SinkableAudio = HTMLAudioElement & {
@@ -86,7 +105,11 @@ function bahtSpoken(formatted: string): string {
   return `${formatted.replace(/฿\s*/, "").replace(/\.00$/, "")} บาท`;
 }
 
-const COMMAND_HELP = screenCommandHelp();
+const COMMAND_HELP: Array<{ id: string; label: string; examples: string[] }> = [
+  ...screenCommandHelp(),
+  { id: "coupon", label: "ใช้คูปองส่วนลด", examples: ["ใช้คูปอง", "มีโปรอะไรบ้าง", "ยกเลิกคูปอง"] },
+  { id: "budget", label: "ตั้งงบช้อป", examples: ["งบ 500 บาท", "ยกเลิกงบ"] },
+];
 
 const QUICK_SCENARIOS = [
   { icon: "🌶️", label: "น้ำจิ้ม/ซอส ไม่ใส่ผงชูรส", prompt: "ตี๋ หาน้ำจิ้มไก่หรือซอสที่ไม่ใส่ผงชูรสให้หน่อยครับ" },
@@ -100,6 +123,19 @@ function renderSafeMd(md: string): string {
   return marked.parse(md.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, ""), { async: false, gfm: true }) as string;
 }
 
+type RelatedSet = { cards: JavisProductCard[]; reasons: Record<string, string> };
+
+/** Brain synapse neighbours (similarity, not purchase data). */
+async function fetchRelated(seeds: string[]): Promise<RelatedSet | null> {
+  if (!seeds.length) return null;
+  try {
+    const r = await fetch(`/api/products/related?slugs=${encodeURIComponent(seeds.slice(0, 6).join(","))}`);
+    return r.ok ? ((await r.json()) as RelatedSet) : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function JavisSalesCockpit({
   featuredProducts,
   totalProductsCount,
@@ -109,6 +145,8 @@ export default function JavisSalesCockpit({
 }) {
   const {
     cart,
+    couponCode,
+    setCouponCode,
     customer,
     pendingPrompt,
     pendingVision,
@@ -141,6 +179,38 @@ export default function JavisSalesCockpit({
   const screenHistRef = useRef(screenHist);
   screenHistRef.current = screenHist;
   const [helpOpen, setHelpOpen] = useState(false);
+  const [couponPulse, setCouponPulse] = useState(0);
+  const [wheelOpen, setWheelOpen] = useState(false);
+  const [wheelSpinKey, setWheelSpinKey] = useState(0);
+  const [playOpen, setPlayOpen] = useState(true);
+  const [missions, setMissions] = useState<Partial<Record<MissionKey, boolean>>>({});
+  const [budget, setBudget] = useState("");
+  const [duel, setDuel] = useState<{ a: JavisProductCard; b: JavisProductCard; noA: number; noB: number } | null>(null);
+  const budgetWarnRef = useRef<"" | "near" | "over">("");
+  const prevPiecesRef = useRef<Map<string, number> | null>(null);
+  const [related, setRelated] = useState<RelatedSet | null>(null);
+  const lastOrderNoRef = useRef("");
+  const markMission = useCallback((key: MissionKey) => {
+    setMissions((prev) => {
+      if (prev[key]) return prev;
+      const next = { ...prev, [key]: true };
+      try {
+        localStorage.setItem("mb_missions_v1", JSON.stringify(next));
+      } catch {}
+      if (MISSIONS.every((m) => next[m.key])) setTimeout(() => burstConfetti(160), 300);
+      return next;
+    });
+  }, []);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("mb_missions_v1");
+      if (raw) setMissions(JSON.parse(raw) as Partial<Record<MissionKey, boolean>>);
+    } catch {}
+  }, []);
+  const runCouponCommandRef = useRef<(cmd: CouponCommand, heard: string) => void>(() => {});
+  const runBudgetRef = useRef<(amount: string, heard: string) => void>(() => {});
+  const couponCodeRef = useRef(couponCode);
+  couponCodeRef.current = couponCode;
   const modalOpenRef = useRef(false);
   const runScreenCommandRef = useRef<(cmd: ScreenCommand, heard?: string) => void>(() => {});
   const qtyModalSlugRef = useRef("");
@@ -391,7 +461,25 @@ export default function JavisSalesCockpit({
         runScreenCommandRef.current(screenCmd, q);
         return;
       }
+      // "งบ 500 บาท" -> budget bar, 0 tokens
+      const budgetCmd = q && !extra?.visionSlugs ? parseBudget(q, parseThaiNumber) : null;
+      if (budgetCmd !== null) {
+        setInput("");
+        setLiveUserHeard("");
+        runBudgetRef.current(budgetCmd, q);
+        return;
+      }
+      // "ใช้คูปอง", "ยกเลิกคูปอง", "มีโปรอะไรบ้าง" -> exact, 0 tokens
+      const couponCmd = q && !extra?.visionSlugs ? parseCouponCommand(q) : null;
+      if (couponCmd) {
+        setInput("");
+        setLiveUserHeard("");
+        runCouponCommandRef.current(couponCmd, q);
+        return;
+      }
       if (!q || busyRef.current) return;
+      setWheelOpen(false);
+      setDuel(null);
 
       stopAllAudioPlayback();
       setBusy(true);
@@ -446,6 +534,7 @@ export default function JavisSalesCockpit({
             visionSummary: extra?.visionSummary,
             focusSlugs,
             pendingSlug: qtyModalSlugRef.current || undefined,
+            couponCode: couponCodeRef.current || undefined,
           }),
           signal: controller.signal,
         });
@@ -494,6 +583,7 @@ export default function JavisSalesCockpit({
               );
             } else if (ev.type === "cards") {
               setStageCards(ev.cards);
+              if (ev.cards.length > 0) markMission("search");
               if (ev.cards[0]) setSpotlight(ev.cards[0]);
               setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, cards: ev.cards } : t)));
             } else if (ev.type === "stage") {
@@ -536,6 +626,7 @@ export default function JavisSalesCockpit({
               updateCustomer(ev.customer);
             } else if (ev.type === "order") {
               setConfirmedOrder(ev.order);
+              setCouponCode("");
             } else if (ev.type === "sentence") {
               enqueueOmniVoiceSentence(ev.text);
             } else if (ev.type === "delta") {
@@ -998,12 +1089,14 @@ export default function JavisSalesCockpit({
           action: "place_order",
           items: cart.items,
           customer,
+          couponCode: couponCode || undefined,
         }),
       });
       const data = (await res.json()) as { ok?: boolean; order?: SalesOrder; error?: string };
       if (data.ok && data.order) {
         setConfirmedOrder(data.order);
         clearCart();
+        setCouponCode(""); // one coupon per order
         setStageMode("order_confirmed");
         setStageTitle(`ยืนยันคำสั่งซื้อสำเร็จ #${data.order.orderNo}`);
         enqueueOmniVoiceSentence(
@@ -1057,7 +1150,7 @@ export default function JavisSalesCockpit({
     return () => clearTimeout(timer);
   }, [stageMode, stageCards, spotlight, stageTitle]);
 
-  modalOpenRef.current = ordersModalOpen || helpOpen;
+  modalOpenRef.current = ordersModalOpen || helpOpen || wheelOpen || Boolean(duel);
 
   const goScreenHistory = useCallback((delta: number): ScreenSnap | null => {
     const h = screenHistRef.current;
@@ -1110,13 +1203,47 @@ export default function JavisSalesCockpit({
       if (!showCard(next)) reply = dir > 0 ? `นี่คือตัวสุดท้ายแล้วครับ บนจอมี ${cards.length} เบอร์` : "นี่คือเบอร์ 1 ตัวแรกแล้วครับ";
     };
 
+    // Moving anywhere else closes the wheel / duel, so voice alone never gets stuck behind an overlay.
+    if (!["spin", "duel", "stop_talk", "mute", "unmute", "repeat", "mic_off", "help"].includes(cmd.id)) {
+      setWheelOpen(false);
+      setDuel(null);
+    }
     switch (cmd.id) {
       case "back":
         moveHistory(-1);
+        markMission("back");
         break;
       case "forward":
         moveHistory(1);
+        markMission("back");
         break;
+      case "spin":
+        setWheelOpen(true);
+        setWheelSpinKey((n) => n + 1);
+        reply = "หมุนวงล้อนำโชคเลยครับ ลุ้นๆ";
+        break;
+      case "play_off":
+        setPlayOpen(false);
+        reply = "ซ่อนภารกิจแล้วครับ พูดว่า ลองเล่น เพื่อเปิดใหม่ได้ครับ";
+        break;
+      case "play":
+        setPlayOpen(true);
+        setStageMode("showcase");
+        setTimeout(() => document.querySelector(".fz-play")?.scrollIntoView({ block: "center", behavior: "smooth" }), 80);
+        reply = `มีภารกิจนักช้อป ${MISSIONS.length} ข้อครับ ทำครบได้ถ้วยรางวัล ลองพูดว่า หมุนวงล้อ ดูก่อนก็ได้ครับ`;
+        break;
+      case "duel": {
+        const a = cards[(cmd.no ?? 0) - 1];
+        const b = cards[(cmd.no2 ?? 0) - 1];
+        if (!a || !b) {
+          reply = `บนจอมีเบอร์ 1 ถึง ${cards.length} ครับ บอกสองเบอร์ที่อยากเทียบได้เลย`;
+          break;
+        }
+        setDuel({ a, b, noA: cmd.no!, noB: cmd.no2! });
+        reply = judgeDuel(a, b, cmd.no!, cmd.no2!).text;
+        markMission("duel");
+        break;
+      }
       case "next":
         if (stageMode === "spotlight") moveItem(1);
         else moveHistory(1);
@@ -1140,6 +1267,7 @@ export default function JavisSalesCockpit({
         reply = `บนจอมีสินค้า ${cards.length} เบอร์ครับ พูดว่า ดูเบอร์ไหน หรือ เอาเบอร์ไหนกี่ชิ้น ได้เลย`;
         break;
       case "open_no":
+        markMission("open");
         if (!showCard((cmd.no ?? 0) - 1)) reply = `บนจอมีเบอร์ 1 ถึง ${cards.length} ครับ ไม่มีเบอร์ ${cmd.no}`;
         break;
       case "details": {
@@ -1220,6 +1348,8 @@ export default function JavisSalesCockpit({
         closeQtyModal();
         setOrdersModalOpen(false);
         setHelpOpen(false);
+        setWheelOpen(false);
+        setDuel(null);
         reply = "ปิดแล้วครับ";
         break;
       case "orders":
@@ -1235,6 +1365,9 @@ export default function JavisSalesCockpit({
           : "ยังไม่มีประวัติหน้าจอครับ";
         break;
       }
+      case "related":
+        void showRelated(heard);
+        return;
       case "help":
         setHelpOpen(true);
         reply = "นี่คือคำสั่งเสียงทั้งหมดครับ พูดตามตัวอย่างบนจอได้เลย";
@@ -1248,6 +1381,27 @@ export default function JavisSalesCockpit({
         break;
     }
 
+    reportCommand(reply, heard, speak);
+  };
+  runScreenCommandRef.current = runScreenCommand;
+
+  /** "ดูของที่เกี่ยวข้อง": neighbours of the product in view (else the cart, else the cards) as numbered cards. */
+  const showRelated = async (heard: string | undefined) => {
+    const inView = stageMode === "spotlight" && spotlight ? [spotlight.slug] : [];
+    const seeds = inView.length ? inView : cart.items.length ? cart.items.map((it) => it.slug) : stageCardsRef.current.slice(0, 3).map((c) => c.slug);
+    if (!seeds.length) return reportCommand("ยังไม่มีสินค้าให้สมองหาของเกี่ยวข้องครับ บอกชื่อสินค้าก่อนนะครับ", heard, true);
+    const r = await fetchRelated(seeds);
+    if (!r?.cards.length) return reportCommand("สมองยังไม่เจอของที่เกี่ยวข้องกับตัวนี้ครับ", heard, true);
+    setRelated(r);
+    setStageCards(r.cards);
+    setSpotlight(r.cards[0]);
+    setStageMode("showcase");
+    setStageTitle("🔗 สมองแนะนำของที่เกี่ยวข้อง");
+    reportCommand(`สมองเจอของที่เกี่ยวข้อง ${r.cards.length} รายการครับ พูดว่า ใส่เบอร์ 1 หรือ ดูเบอร์ 2 ได้เลยครับ`, heard, true);
+  };
+
+  /** Chip + chat line + spoken answer for a command run on the screen (no AI). */
+  const reportCommand = (reply: string, heard: string | undefined, speak: boolean) => {
     const fx: ActionFx = { id: `cmd-${performance.now()}`, kind: "cmd", text: reply.replace(/ครับ.*$/, "").trim() || reply };
     setActionFx((prev) => [...prev.slice(-2), fx]);
     actionFxTimersRef.current.push(setTimeout(() => setActionFx((prev) => prev.filter((x) => x.id !== fx.id)), ACTION_FX_MS));
@@ -1259,7 +1413,87 @@ export default function JavisSalesCockpit({
     if (speak && reply) enqueueOmniVoiceSentence(reply);
     setHudState(callActiveRef.current ? "listening" : "idle");
   };
-  runScreenCommandRef.current = runScreenCommand;
+
+  const runCouponCommand = (cmd: CouponCommand, heard: string) => {
+    let reply = "";
+    if (cmd.action === "remove") {
+      setCouponCode("");
+      reply = couponCode ? `เอาคูปองออกแล้วครับ ยอดรวม ${bahtSpoken(applyCoupon(cart, "").grandTotalFormatted)}` : "ตอนนี้ยังไม่ได้ใช้คูปองครับ";
+    } else if (cmd.action === "list") {
+      reply = `วันนี้มีคูปอง ${PROMOTIONS.length} ใบครับ ${PROMOTIONS.map((p) => p.title).join(" ")} พูดว่า ใช้คูปอง ได้เลยครับ`;
+    } else {
+      const p = findPromotion(cmd.code) ?? bestPromotion(cart.subtotal);
+      const priced = applyCoupon(cart, p.code);
+      setCouponCode(p.code);
+      setCouponPulse((n) => n + 1);
+      reply = priced.coupon?.applied
+        ? `ใช้คูปอง ${p.title} แล้วครับ ลดไป ${bahtSpoken(priced.discountFormatted ?? "฿0")} เหลือจ่าย ${bahtSpoken(priced.grandTotalFormatted)}`
+        : cart.items.length
+          ? `เก็บคูปอง ${p.title} ไว้ให้แล้วครับ ${priced.coupon?.note ?? ""}`
+          : `เก็บคูปอง ${p.title} ไว้ให้แล้วครับ ใส่สินค้าแล้วระบบลดให้อัตโนมัติครับ`;
+    }
+    setWheelOpen(false);
+    setStageMode("cart");
+    setStageTitle("คูปองส่วนลด");
+    setTimeout(() => document.querySelector(".cart-coupons")?.scrollIntoView({ block: "center", behavior: "smooth" }), 80);
+    reportCommand(reply, heard, true);
+  };
+  runCouponCommandRef.current = runCouponCommand;
+
+  const runBudget = (amount: string, heard: string) => {
+    budgetWarnRef.current = "";
+    setWheelOpen(false);
+    setDuel(null);
+    if (amount === "0") {
+      setBudget("");
+      reportCommand("ยกเลิกงบแล้วครับ ช้อปได้เต็มที่เลยครับ", heard, true);
+      return;
+    }
+    setBudget(amount);
+    markMission("budget");
+    reportCommand(`ตั้งงบ ${amount} บาทแล้วครับ ตี๋จะคอยเตือนเมื่อใกล้ถึงงบครับ`, heard, true);
+  };
+  runBudgetRef.current = runBudget;
+
+  // Something new went into the cart (voice, card number, button): picture flies in + "ติ๊ง".
+  useEffect(() => {
+    const now = new Map(cart.items.map((it) => [`${it.slug}::${it.unitCode}`, it.qty]));
+    const prev = prevPiecesRef.current;
+    prevPiecesRef.current = now;
+    if (!prev) return;
+    const grown = cart.items.find((it) => (now.get(`${it.slug}::${it.unitCode}`) ?? 0) > (prev.get(`${it.slug}::${it.unitCode}`) ?? 0));
+    if (!grown) return;
+    flyToCart(grown.slug);
+    playTing("add");
+    markMission("add");
+    void fetchRelated([grown.slug]).then((r) => r && r.cards.length > 0 && setRelated(r));
+  }, [cart.items, markMission]);
+
+  // Budget voice warnings, once per level.
+  useEffect(() => {
+    if (!budget || !cart.items.length) return;
+    const b = Number.parseInt(budget, 10) * 100;
+    const [i, d = "00"] = cart.grandTotal.split(".");
+    const spent = Number.parseInt(i, 10) * 100 + Number.parseInt(d.slice(0, 2), 10); // integer satang
+    const level = spent > b ? "over" : spent * 10 >= b * 8 ? "near" : "";
+    if (!level || level === budgetWarnRef.current) return;
+    budgetWarnRef.current = level;
+    enqueueOmniVoiceSentence(
+      level === "over"
+        ? `เกินงบ ${budget} บาทแล้วนะครับ ลองเอาบางอย่างออก หรือพูดว่า ใช้คูปอง ช่วยลดได้ครับ`
+        : `ใกล้ถึงงบแล้วครับ ยอดตอนนี้ ${bahtSpoken(cart.grandTotalFormatted)}`,
+    );
+  }, [budget, cart.grandTotal, cart.grandTotalFormatted, cart.items.length, enqueueOmniVoiceSentence]);
+
+  // Order closed: confetti + win jingle.
+  useEffect(() => {
+    if (!confirmedOrder || confirmedOrder.orderNo === lastOrderNoRef.current) return;
+    lastOrderNoRef.current = confirmedOrder.orderNo;
+    burstConfetti();
+    playTing("win");
+    markMission("order");
+    setBudget("");
+  }, [confirmedOrder, markMission]);
 
   const latestTurn = turns.findLast((t) => !t.isCommand) ?? null;
   const latestJobs = useMemo(() => latestTurn?.jobs ?? [], [latestTurn]);
@@ -1382,12 +1616,7 @@ export default function JavisSalesCockpit({
               {liveUserHeard ? (
                 <p className="jc-k-user">🎤 ได้ยินว่า: “{liveUserHeard}”</p>
               ) : (
-                <p
-                  className="jc-k-bot"
-                  style={{ "--pct": `${karaokeProgress}%` } as React.CSSProperties}
-                >
-                  {liveKaraokeText}
-                </p>
+                <KaraokeWords text={liveKaraokeText} pct={karaokeProgress} />
               )}
             </div>
           )}
@@ -1585,7 +1814,22 @@ export default function JavisSalesCockpit({
             <button type="button" className="jc-hist-btn jc-hist-help" onClick={() => setHelpOpen(true)}>
               🎙️ คำสั่งเสียง
             </button>
+            <button type="button" className="jc-hist-btn fz-spin-btn" onClick={() => setWheelOpen(true)} title='พูดว่า "หมุนวงล้อ"'>
+              🎡 วงล้อนำโชค
+            </button>
+            <button
+              type="button"
+              className="jc-hist-btn"
+              onClick={() => {
+                setPlayOpen(true);
+                setStageMode("showcase");
+              }}
+              title='พูดว่า "ลองเล่น"'
+            >
+              🎮 ภารกิจ {MISSIONS.filter((m) => missions[m.key]).length}/{MISSIONS.length}
+            </button>
           </div>
+          {budget && <BudgetBar budget={budget} cart={cart} onClear={() => setBudget("")} />}
           <div className="jc-stage-tabs">
             <button
               type="button"
@@ -1623,6 +1867,7 @@ export default function JavisSalesCockpit({
               type="button"
               className={`jc-stab${stageMode === "cart" ? " active" : ""}`}
               onClick={() => setStageMode("cart")}
+              data-cart-target
             >
               🛒 ตะกร้า ({cart.itemCount})
             </button>
@@ -1639,6 +1884,34 @@ export default function JavisSalesCockpit({
           </div>
 
           <div className="jc-stage-body">
+            {busy && <ThinkingBrain jobs={latestJobs} cards={latestTurn?.cards ?? []} />}
+            {wheelOpen && (
+              <LuckyWheel
+                onWin={(p) => {
+                  setCouponCode(p.code);
+                  setCouponPulse((n) => n + 1);
+                  burstConfetti();
+                  playTing("win");
+                  markMission("spin");
+                  enqueueOmniVoiceSentence(`ยินดีด้วยครับ ได้คูปอง ${p.title} ใส่ให้ในตะกร้าแล้วครับ`);
+                }}
+                spinKey={wheelSpinKey}
+                onClose={() => {
+                  setWheelOpen(false);
+                  if (couponCodeRef.current) setStageMode("cart");
+                }}
+              />
+            )}
+            {duel && (
+              <DuelView
+                {...duel}
+                onClose={() => setDuel(null)}
+                onAdd={(c) => {
+                  setDuel(null);
+                  promptAddToCart(c);
+                }}
+              />
+            )}
             {helpOpen && (
               <div className="jc-help" role="dialog" aria-label="คำสั่งเสียงทั้งหมด">
                 <div className="jc-help-head">
@@ -1683,6 +1956,9 @@ export default function JavisSalesCockpit({
 
             {(stageMode === "welcome" || stageMode === "showcase") && (
               <div className="st-showcase">
+                {playOpen && (
+                  <PlayPanel done={missions} onSay={(t) => void sendTurnRef.current(t)} onClose={() => setPlayOpen(false)} />
+                )}
                 <div className="st-head">
                   <div>
                     <h2>{stageTitle}</h2>
@@ -1706,6 +1982,7 @@ export default function JavisSalesCockpit({
                   {stageCards.map((c, cardIdx) => (
                     <article
                       key={c.slug}
+                      data-slug={c.slug}
                       className={`st-card${actionFx.some((fx) => fx.slug === c.slug) ? ` fx-${actionFx.findLast((fx) => fx.slug === c.slug)!.kind}` : ""}`}
                     >
                       <button
@@ -1930,6 +2207,16 @@ export default function JavisSalesCockpit({
                   )}
                 </div>
 
+                <CouponStrip
+                  cart={cart}
+                  couponCode={couponCode}
+                  pulseKey={couponPulse}
+                  onPick={(code) => {
+                    setCouponCode(code);
+                    if (code) setCouponPulse((n) => n + 1);
+                  }}
+                />
+
                 {cart.items.length === 0 ? (
                   <div className="wb-empty">
                     <p>ตะกร้ายังว่างอยู่ครับ บอกน้องตี๋ ส่องกล้องรูปสินค้า หรือเลือกจากหน้าภาพสินค้าได้เลยครับ</p>
@@ -1991,7 +2278,14 @@ export default function JavisSalesCockpit({
                     <div className="cart-grand-box">
                       <div>
                         <span>รวมทั้งหมด {cart.totalPieces} หน่วย ({cart.itemCount} รายการ)</span>
-                        <strong className="cart-grand-num">{cart.grandTotalFormatted}</strong>
+                        {cart.coupon?.applied && (
+                          <span className="cart-disc-line">
+                            ยอดสินค้า {cart.subtotalFormatted} · 🎟️ {cart.coupon.code} −{cart.coupon.discountFormatted}
+                          </span>
+                        )}
+                        <strong className="cart-grand-num">
+                          <CountUpBaht value={cart.grandTotal} formatted={cart.grandTotalFormatted} />
+                        </strong>
                       </div>
                       <button
                         type="button"
@@ -2002,6 +2296,34 @@ export default function JavisSalesCockpit({
                       </button>
                     </div>
                   </>
+                )}
+
+                {related && related.cards.some((c) => !cart.items.some((it) => it.slug === c.slug)) && (
+                  <div className="fz-related">
+                    <div className="fz-related-head">
+                      <b>🔗 สมองแนะนำของที่เกี่ยวข้อง</b>
+                      <button type="button" className="btn-reset-sm" onClick={() => void showRelated(undefined)}>
+                        ดูบนจอทั้งหมด
+                      </button>
+                    </div>
+                    <p className="fz-play-tip">พูดว่า “ดูของที่เกี่ยวข้อง” แล้วสั่งตามเบอร์ได้เลย</p>
+                    <div className="fz-related-row">
+                      {related.cards
+                        .filter((c) => !cart.items.some((it) => it.slug === c.slug))
+                        .slice(0, 6)
+                        .map((c) => (
+                          <button type="button" key={c.slug} className="fz-rel-card" data-slug={c.slug} onClick={() => promptAddToCart(c)}>
+                            <span className="fz-rel-img">{c.imageUrl ? <img src={c.imageUrl} alt={c.title} loading="lazy" /> : "📦"}</span>
+                            <span className="fz-rel-title">{c.title}</span>
+                            <span className="fz-rel-meta">
+                              <b>{c.priceLabel}</b>
+                              <small>{related.reasons[c.slug]}</small>
+                            </span>
+                            <span className="fz-rel-add">🛒 ใส่ตะกร้า</span>
+                          </button>
+                        ))}
+                    </div>
+                  </div>
                 )}
               </div>
             )}
@@ -2094,6 +2416,12 @@ export default function JavisSalesCockpit({
                           </li>
                         ))}
                       </ul>
+                      {cart.coupon?.applied && (
+                        <div className="chk-disc-line">
+                          <span>🎟️ คูปอง {cart.coupon.code}</span>
+                          <b>−{cart.coupon.discountFormatted}</b>
+                        </div>
+                      )}
                       <div className="chk-total-line">
                         <span>ยอดสุทธิทั้งสิ้น</span>
                         <strong>{cart.grandTotalFormatted}</strong>
@@ -2158,6 +2486,14 @@ export default function JavisSalesCockpit({
                       </tbody>
                     </table>
 
+                    {confirmedOrder.cart.coupon?.applied && (
+                      <div className="chk-disc-line">
+                        <span>
+                          ยอดสินค้า {confirmedOrder.cart.subtotalFormatted} · 🎟️ คูปอง {confirmedOrder.cart.coupon.code}
+                        </span>
+                        <b>−{confirmedOrder.cart.coupon.discountFormatted}</b>
+                      </div>
+                    )}
                     <div className="chk-total-line">
                       <span>ยอดสุทธิรวมทั้งสิ้น</span>
                       <strong>{confirmedOrder.cart.grandTotalFormatted}</strong>
@@ -2179,6 +2515,7 @@ export default function JavisSalesCockpit({
                   {confirmedOrder.customer.paymentMethod === "promptpay" && (
                     <div className="rc-qr-box">
                       <div className="rc-qr-head">THAI QR PAYMENT · พร้อมเพย์</div>
+                      <PayCountdown createdAt={confirmedOrder.createdAt} />
                       <svg viewBox="0 0 160 160" className="rc-qr-svg" aria-label="PromptPay QR">
                         <rect width="160" height="160" fill="#ffffff" rx="8" />
                         <rect x="14" y="14" width="38" height="38" fill="none" stroke="#0f172a" strokeWidth="6" />
@@ -2260,10 +2597,10 @@ export default function JavisSalesCockpit({
       </div>
 
       {cart.items.length > 0 && stageMode !== "cart" && stageMode !== "checkout" && (
-        <div className="jc-mobile-cart-bar">
+        <div className="jc-mobile-cart-bar" data-cart-target>
           <div>
             <strong>🛒 {cart.itemCount} รายการ ({cart.totalPieces} หน่วย)</strong>
-            <span className="jc-mcart-sum">{cart.grandTotalFormatted}</span>
+            <CountUpBaht className="jc-mcart-sum" value={cart.grandTotal} formatted={cart.grandTotalFormatted} />
           </div>
           <div className="jc-mcart-btns">
             <button type="button" className="btn" onClick={() => setStageMode("cart")}>

@@ -89,6 +89,12 @@ export default function ProductVisionScanner({
   const [scanning, setScanning] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState("");
+  // Floating price tag over the live video for a moment before the stage switches to the product.
+  const [priceTag, setPriceTag] = useState<{ title: string; price: string; exact: boolean } | null>(null);
+  const tagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (tagTimerRef.current) clearTimeout(tagTimerRef.current);
+  }, []);
   const [scanHint, setScanHint] = useState("ถือสินค้าหรือบาร์โค้ดส่องหน้ากล้อง ระบบจะค้นหาสินค้าให้อัตโนมัติทันทีครับ");
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -272,10 +278,13 @@ export default function ProductVisionScanner({
           }
           lastMatchedKeyRef.current = { key: dedupKey, at: now };
           setScanHint(`✅ เจอสินค้า "${json.cards[0]?.title || json.detected.summaryTh}" แล้ว! กำลังเปิดแสดงทันที…`);
-          onProductFoundRef.current({
-            ...json,
-            snapshotDataUrl: frame.dataUrl,
-          });
+          const found = { ...json, snapshotDataUrl: frame.dataUrl };
+          const top = json.cards[0];
+          if (top) {
+            setPriceTag({ title: top.title, price: top.priceLabel, exact: json.exactMatch });
+            if (tagTimerRef.current) clearTimeout(tagTimerRef.current);
+            tagTimerRef.current = setTimeout(() => onProductFoundRef.current(found), 1400);
+          } else onProductFoundRef.current(found);
         } else if (opts.manual) {
           setScanHint("ยังไม่เห็นตัวสินค้าหรือฉลากชัดเจน ลองขยับสินค้าเข้ามาใกล้กล้องอีกนิดแล้วกดถ่ายใหม่นะครับ");
         } else {
@@ -399,6 +408,13 @@ export default function ProductVisionScanner({
               <span className="vc br" />
             </div>
             {scanning && <div className="vscan-badge">🔍 กำลังค้นหาสินค้าในสมอง…</div>}
+            {priceTag && (
+              <div className="fz-cam-tag" role="status">
+                <small>{priceTag.exact ? "✅ เจอตรงรุ่น" : "🔎 ใกล้เคียงที่สุด"}</small>
+                <b>{priceTag.price}</b>
+                <span>{priceTag.title}</span>
+              </div>
+            )}
           </div>
         )}
       </div>

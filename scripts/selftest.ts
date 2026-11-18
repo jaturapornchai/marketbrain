@@ -210,6 +210,45 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   assert.deepEqual(cmd("ขอดูข้อมูลอันที่สอง"), { id: "open_no", no: 2 });
   assert.deepEqual(cmd("ขอดูรายละเอียดหน่อย"), { id: "details" });
   assert.equal(cmd("รายละเอียดน้ำปลา"), null);
+  // Demo fun zone: every game is reachable by voice
+  for (const [t, want] of [
+    ["หมุนวงล้อ", "spin"], ["หมุนอีกรอบ", "spin"], ["ลุ้นโชคครับ", "spin"],
+    ["ลองเล่น", "play"], ["มีภารกิจอะไรบ้าง", "play"], ["ซ่อนภารกิจ", "play_off"],
+    ["ดูของที่เกี่ยวข้อง", "related"], ["มีอะไรใกล้เคียงอีกไหม", "related"],
+  ] as const) assert.equal(id(t), want, t);
+  assert.deepEqual(cmd("เทียบเบอร์ 2 กับ 5"), { id: "duel", no: 2, no2: 5 });
+  assert.deepEqual(cmd("ดวลเบอร์หนึ่งกับเบอร์สามอันไหนคุ้มกว่า"), { id: "duel", no: 1, no2: 3 });
+  assert.equal(cmd("เทียบเบอร์ 2 กับ 2"), null);
+  assert.equal(cmd("น้ำปลาใกล้เคียง"), null);
+  const { parseBudget } = await import("../lib/voice-commands.ts");
+  const { parseThaiNumber: thaiNum } = await import("../lib/numbered-order.ts");
+  for (const [t, want] of [
+    ["งบ 500 บาท", "500"], ["ตั้งงบห้าร้อยบาทครับ", "500"], ["มีงบ 1,500", "1500"],
+    ["งบไม่เกินสองพันบาท", "2000"], ["ยกเลิกงบ", "0"], ["น้ำปลาขวดละเท่าไหร่", null],
+  ] as const) assert.equal(parseBudget(t, thaiNum), want, t);
+
+  // Coupons: Decimal discount, minSpend, cap, idempotent, never below ฿0, spoken commands
+  const promo = await import("../lib/promotions.ts");
+  const base = { subtotal: "1234.55", grandTotal: "1234.55", grandTotalFormatted: "฿1,234.55" };
+  const d10 = promo.applyCoupon(base, "demo10");
+  assert.equal(d10.discount, "123.46", "10% HALF_UP once");
+  assert.equal(d10.grandTotal, "1111.09");
+  assert.equal(promo.applyCoupon(d10, "DEMO10").grandTotal, "1111.09", "re-applying does not stack");
+  assert.equal(promo.applyCoupon({ ...base, subtotal: "5000.00" }, "DEMO10").discount, "200.00", "cap 200");
+  const s50 = promo.applyCoupon({ ...base, subtotal: "499.99" }, "SAVE50");
+  assert.equal(s50.coupon?.applied, false);
+  assert.equal(s50.grandTotal, "499.99");
+  assert.match(s50.coupon?.note ?? "", /0\.01/);
+  assert.equal(promo.applyCoupon({ ...base, subtotal: "500.00" }, "SAVE50").grandTotal, "450.00");
+  assert.equal(promo.applyCoupon(base, "NOPE").discount, "0.00");
+  assert.equal(promo.bestPromotion("3500.00").code, "BIG300");
+  assert.equal(promo.bestPromotion("100.00").code, "DEMO10");
+  assert.deepEqual(promo.parseCouponCommand("ใช้คูปองหน่อยครับ"), { action: "apply", code: null });
+  assert.deepEqual(promo.parseCouponCommand("ขอใช้คูปอง SAVE50"), { action: "apply", code: "SAVE50" });
+  assert.deepEqual(promo.parseCouponCommand("ใช้โค้ดสิบเปอร์เซ็นต์"), { action: "apply", code: "DEMO10" });
+  assert.deepEqual(promo.parseCouponCommand("ยกเลิกคูปอง"), { action: "remove" });
+  assert.deepEqual(promo.parseCouponCommand("วันนี้มีโปรอะไรบ้าง"), { action: "list" });
+  assert.equal(promo.parseCouponCommand("ขอดูโปรตีนบาร์"), null, "โปรตีน is a product");
   assert.equal(id("ปิด"), null, "bare close only when a popup is open");
   assert.equal(id("ปิด", true), "close");
   for (const t of ["เอาเบอร์ 3", "เอาเบอร์ 5 10 ชิ้น", "เบอร์ 3 ราคาเท่าไหร่", "กลับไปดูน้ำปลา", "ลบเบอร์ 2 ออกจากตะกร้า", "ขอดูบะหมี่"])

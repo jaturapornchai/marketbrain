@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Decimal from "decimal.js";
 import { formatThaiBaht, parseDecimal, toMoneyString } from "./decimal-money";
+import { applyCoupon, type AppliedCoupon } from "./promotions";
 import type { BrainProductItem } from "./product-source";
 import { getProductBySlug, searchProductsDetailed } from "./vault";
 
@@ -33,6 +34,10 @@ export type CartSummary = {
   subtotalFormatted: string;
   grandTotal: string;
   grandTotalFormatted: string;
+  /** Coupon discount (Decimal string); grandTotal = subtotal - discount. Absent on orders made before coupons. */
+  discount?: string;
+  discountFormatted?: string;
+  coupon?: AppliedCoupon | null;
 };
 
 export type PaymentMethod = "promptpay" | "cod" | "transfer";
@@ -56,7 +61,10 @@ export type SalesOrder = {
 
 const ORDERS_PATH = path.join(process.cwd(), ".data", "orders.jsonl");
 
-export function recalculateCart(rawItems: Array<Partial<CartItem> & { slug: string; qty: number }>): CartSummary {
+export function recalculateCart(
+  rawItems: Array<Partial<CartItem> & { slug: string; qty: number }>,
+  couponCode?: string | null,
+): CartSummary {
   const merged = new Map<string, CartItem>();
 
   for (const raw of rawItems) {
@@ -123,7 +131,7 @@ export function recalculateCart(rawItems: Array<Partial<CartItem> & { slug: stri
   }
 
   const totalStr = sumDec.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2);
-  return {
+  return applyCoupon({
     items,
     itemCount: items.length,
     totalPieces,
@@ -131,7 +139,7 @@ export function recalculateCart(rawItems: Array<Partial<CartItem> & { slug: stri
     subtotalFormatted: formatThaiBaht(totalStr),
     grandTotal: totalStr,
     grandTotalFormatted: formatThaiBaht(totalStr),
-  };
+  }, couponCode);
 }
 
 export function resolveProductForCart(
@@ -177,8 +185,9 @@ function generateOrderNo(): string {
 export function saveSalesOrder(
   cartItems: Array<Partial<CartItem> & { slug: string; qty: number }>,
   customer: Partial<CustomerCheckoutInfo>,
+  couponCode?: string | null,
 ): SalesOrder {
-  const verifiedCart = recalculateCart(cartItems);
+  const verifiedCart = recalculateCart(cartItems, couponCode);
   if (verifiedCart.items.length === 0) {
     throw new Error("ไม่มีสินค้าในตะกร้าสำหรับเปิดคำสั่งซื้อ");
   }

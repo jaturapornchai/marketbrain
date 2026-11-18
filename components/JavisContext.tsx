@@ -1,15 +1,17 @@
 "use client";
 
 import { usePathname, useRouter } from "next/navigation";
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import Decimal from "decimal.js";
 import type { CartItem, CartSummary, CustomerCheckoutInfo } from "@/lib/cart-order";
 import type { JavisProductCard } from "@/lib/product-card";
+import { applyCoupon, findPromotion } from "@/lib/promotions";
 
 Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
 
 const CART_STORAGE_KEY = "mb_nongtee_cart_v1";
 const CUSTOMER_STORAGE_KEY = "mb_nongtee_customer_v1";
+const COUPON_STORAGE_KEY = "mb_nongtee_coupon_v1";
 const DEV_MIC_KEY = "mb.dev.audioinput";
 const DEV_SPK_KEY = "mb.dev.audiooutput";
 const DEV_CAM_KEY = "mb.dev.videoinput";
@@ -80,6 +82,8 @@ const DEFAULT_CUSTOMER: CustomerCheckoutInfo = {
 
 type JavisContextValue = {
   cart: CartSummary;
+  couponCode: string;
+  setCouponCode: (code: string) => void;
   customer: CustomerCheckoutInfo;
   pendingPrompt: string;
   pendingVision: PendingVisionPayload | null;
@@ -107,6 +111,8 @@ type JavisContextValue = {
 
 const JavisContext = createContext<JavisContextValue>({
   cart: EMPTY_CART,
+  couponCode: "",
+  setCouponCode: () => {},
   customer: DEFAULT_CUSTOMER,
   pendingPrompt: "",
   pendingVision: null,
@@ -135,7 +141,18 @@ const JavisContext = createContext<JavisContextValue>({
 export function JavisProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
-  const [cart, setCart] = useState<CartSummary>(EMPTY_CART);
+  const [rawCart, setCart] = useState<CartSummary>(EMPTY_CART);
+  const [couponCode, setCouponState] = useState("");
+  // Coupon is re-applied on every change, so client totals always match what the server will charge.
+  const cart = useMemo(() => applyCoupon(rawCart, couponCode), [rawCart, couponCode]);
+  const setCouponCode = useCallback((code: string) => {
+    const p = findPromotion(code);
+    setCouponState(p ? p.code : "");
+    try {
+      if (p) localStorage.setItem(COUPON_STORAGE_KEY, p.code);
+      else localStorage.removeItem(COUPON_STORAGE_KEY);
+    } catch {}
+  }, []);
   const [customer, setCustomer] = useState<CustomerCheckoutInfo>(DEFAULT_CUSTOMER);
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [pendingVision, setPendingVision] = useState<PendingVisionPayload | null>(null);
@@ -153,6 +170,8 @@ export function JavisProvider({ children }: { children: ReactNode }) {
         const parsed = JSON.parse(rawCart) as CartItem[];
         if (Array.isArray(parsed)) setCart(computeClientCart(parsed));
       }
+      const savedCoupon = findPromotion(localStorage.getItem(COUPON_STORAGE_KEY));
+      if (savedCoupon) setCouponState(savedCoupon.code);
       const rawCust = localStorage.getItem(CUSTOMER_STORAGE_KEY);
       if (rawCust) {
         const pc = JSON.parse(rawCust) as Partial<CustomerCheckoutInfo>;
@@ -322,6 +341,8 @@ export function JavisProvider({ children }: { children: ReactNode }) {
     <JavisContext.Provider
       value={{
         cart,
+        couponCode,
+        setCouponCode,
         customer,
         pendingPrompt,
         pendingVision,

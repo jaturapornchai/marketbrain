@@ -30,6 +30,11 @@ export const SCREEN_COMMAND_IDS = [
   "orders",
   "history",
   "help",
+  "spin",
+  "play",
+  "play_off",
+  "duel",
+  "related",
   "page_search",
   "page_brain",
   "page_notes",
@@ -41,6 +46,8 @@ export type ScreenCommand = {
   id: ScreenCommandId;
   /** Card number for open_no, or how many screens for back/forward. */
   no?: number;
+  /** Second card number (duel: "เทียบเบอร์ 2 กับ 5"). */
+  no2?: number;
 };
 
 type CommandDef = { id: ScreenCommandId; label: string; examples: string[]; core: string; needsModal?: boolean };
@@ -53,6 +60,11 @@ const SEE = "(?:ดู|เปิด|โชว์|แสดง|ไปที่|�
 
 // Order matters: the first match wins ("กลับหน้าแรก" is home, not back).
 const COMMANDS: CommandDef[] = [
+  { id: "spin", label: "หมุนวงล้อนำโชคลุ้นคูปอง", examples: ["หมุนวงล้อ", "ลุ้นโชค"], core: "(?:หมุน|สุ่ม)(?:วงล้อ|ลุ้นโชค|โชค|รางวัล|ชิงโชค)?(?:นำโชค)?(?:อีก)?(?:รอบ|ครั้ง|ที)?|เล่น(?:วงล้อ|ลุ้นโชค|โชค|รางวัล|ชิงโชค)(?:นำโชค)?(?:อีก)?(?:รอบ|ครั้ง|ที)?|วงล้อ(?:นำโชค)?|ลุ้นรางวัล|ลุ้นโชค|ชิงโชค|เสี่ยงโชค" },
+  { id: "play_off", label: "ซ่อนภารกิจ", examples: ["ซ่อนภารกิจ"], core: "(?:ซ่อน|ปิด|เก็บ|ไม่เอา)(?:ภารกิจ|เกม|แผงเกม)" },
+  { id: "play", label: "เปิดภารกิจลองเล่น", examples: ["ลองเล่น", "มีภารกิจอะไร"], core: "เล่น(?:เกม)?(?:อะไรได้บ้าง|อะไรดี|อะไร)?|(?:มี)?ภารกิจ(?:อะไร)?(?:บ้าง)?(?:ทั้งหมด)?|เกม" },
+  { id: "duel", label: "ดวลความคุ้ม 2 เบอร์", examples: ["เทียบเบอร์ 2 กับ 5", "ดวลเบอร์หนึ่งกับสาม"], core: `(?:เทียบ|ดวล|ชน|เปรียบเทียบ|แข่ง)(?:ความคุ้ม|ราคา)?(?:ระหว่าง)?(?:เบอร์|หมายเลข|อันที่|ตัวที่)?${N}(?:กับ|และ|vs|ชน|แข่งกับ)(?:เบอร์|หมายเลข|อันที่|ตัวที่)?${N}(?:อันไหน|ตัวไหน|ไหน)?(?:คุ้มกว่า|ถูกกว่า|ดีกว่า)?(?:กัน)?` },
+  { id: "related", label: "ดูของที่เกี่ยวข้องจากสมอง", examples: ["ดูของที่เกี่ยวข้อง", "มีอะไรใกล้เคียงอีกไหม"], core: "(?:ขอ)?(?:ดู)?(?:มี)?(?:สินค้า|ของ|อะไร)?(?:ที่)?(?:เกี่ยวข้อง|ใกล้เคียง|คล้าย(?:ๆ|กัน)?)(?:กัน)?(?:อีก)?(?:ไหม|บ้าง|มั้ย)?" },
   { id: "help", label: "ดูคำสั่งทั้งหมด", examples: ["สั่งอะไรได้บ้าง", "ช่วยเหลือ"], core: "(?:สั่ง|ใช้|พูด|ทำ)อะไรได้(?:บ้าง)?|มีคำสั่งอะไร(?:บ้าง)?|(?:ดู)?คำสั่ง(?:เสียง)?(?:ทั้งหมด)?|ช่วยเหลือ|วิธีใช้(?:งาน)?|ใช้(?:งาน)?ยังไง|ใช้(?:งาน)?อย่างไร" },
   { id: "home", label: "กลับหน้าแรก", examples: ["กลับหน้าแรก", "หน้าหลัก"], core: "(?:กลับ)?(?:ไป)?(?:ที่)?(?:หน้าแรก|หน้าหลัก|หน้าโฮม|โฮม|จุดเริ่มต้น)" },
   { id: "back", label: "ถอยกลับหน้าที่แล้ว", examples: ["ถอยกลับไป", "หน้าที่แล้ว", "ย้อนกลับ 2 หน้า"], core: `(?:(?:ถอยกลับ|ถอยหลัง|ถอย|ย้อนกลับ|ย้อนหลัง|ย้อน|กลับ)(?:ไป)?(?:หน้า|จอ|อัน)?(?:ที่แล้ว|ก่อนหน้า|ก่อน|เดิม|เก่า|เมื่อกี้|เมื่อกี๊|เมื้อกี้)?|(?:หน้า|จอ)(?:ที่แล้ว|ก่อนหน้า|ก่อน|เดิม|เก่า|เมื่อกี้|เมื่อกี๊))${STEPS}` },
@@ -122,7 +134,8 @@ export function parseScreenCommand(text: string, ctx: { modalOpen?: boolean } = 
     if (c.needsModal && !ctx.modalOpen) continue;
     const m = t.match(c.re);
     if (!m) continue;
-    const no = toNumber(m.slice(1).find((g) => g !== undefined));
+    const [no, no2] = m.slice(1).filter((g) => g !== undefined).map(toNumber);
+    if (c.id === "duel") return no && no2 && no !== no2 ? { id: c.id, no, no2 } : null;
     return no ? { id: c.id, no } : { id: c.id };
   }
   return null;
@@ -131,4 +144,23 @@ export function parseScreenCommand(text: string, ctx: { modalOpen?: boolean } = 
 /** Command list for the on-screen help panel. */
 export function screenCommandHelp(): Array<{ id: ScreenCommandId; label: string; examples: string[] }> {
   return COMMANDS.filter((c) => c.id !== "next").map(({ id, label, examples }) => ({ id, label, examples }));
+}
+
+const BUDGET_RE = new RegExp(
+  `^${PREFIX}(?:ตั้ง|กำหนด|มี|ใช้)?งบ(?:ประมาณ)?(?:ไว้|มี|อยู่|แค่|ไม่เกิน)?(?:ที่)?([\\d,]{1,7}|[ก-๙]{2,30}?)(?:บาท)?(?:ไม่เกินนี้|เท่านั้น)?${SUFFIX}$`,
+  "i",
+);
+
+/**
+ * "งบ 500 บาท" / "ตั้งงบห้าร้อย" -> "500"; "ยกเลิกงบ" -> "0"; anything else -> null.
+ * Returns a whole-baht decimal string (money stays out of binary floats).
+ */
+export function parseBudget(text: string, toNum: (s: string) => number | null): string | null {
+  const t = text.replace(/[\s.!?ๆ"'“”]+/g, "").toLowerCase();
+  if (!t.includes("งบ") || t.length > 40) return null;
+  if (/(?:ยกเลิก|ลบ|ไม่ต้อง|ไม่มี|เอาออก|ปิด)งบ|งบ(?:ออก|ยกเลิก)/.test(t)) return "0";
+  const m = t.match(BUDGET_RE);
+  if (!m) return null;
+  const n = /^[\d,]+$/.test(m[1]) ? Number.parseInt(m[1].replace(/,/g, ""), 10) : toNum(m[1]);
+  return n && n > 0 && n <= 1_000_000 ? String(n) : null;
 }

@@ -52,14 +52,16 @@ export async function POST(req: Request): Promise<Response> {
       action?: "recalc" | "place_order";
       items?: Array<Partial<CartItem> & { slug: string; qty: number }>;
       customer?: Partial<CustomerCheckoutInfo>;
+      couponCode?: unknown;
     };
+    const couponCode = typeof body.couponCode === "string" && body.couponCode.length <= 20 ? body.couponCode : null;
 
     const items = Array.isArray(body.items) ? body.items.slice(0, 100) : [];
     if (body.action === "recalc") {
-      return Response.json({ ok: true, cart: recalculateCart(items) });
+      return Response.json({ ok: true, cart: recalculateCart(items, couponCode) });
     }
 
-    const order = saveSalesOrder(items, body.customer ?? {});
+    const order = saveSalesOrder(items, body.customer ?? {}, couponCode);
     return Response.json({ ok: true, order });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "ไม่สามารถสร้างคำสั่งซื้อได้";

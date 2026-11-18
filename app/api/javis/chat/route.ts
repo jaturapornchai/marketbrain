@@ -20,6 +20,7 @@ export async function POST(req: Request): Promise<Response> {
     visionSummary?: unknown;
     focusSlugs?: unknown;
     pendingSlug?: unknown;
+    couponCode?: unknown;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -74,6 +75,7 @@ export async function POST(req: Request): Promise<Response> {
           visionSlugs,
           visionSummary,
           focusSlugs,
+          couponCode: typeof body.couponCode === "string" && body.couponCode.length <= 20 ? body.couponCode : undefined,
           pendingSlug: typeof body.pendingSlug === "string" && body.pendingSlug.length <= 160 ? body.pendingSlug : undefined,
         })) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(ev)}\n\n`));

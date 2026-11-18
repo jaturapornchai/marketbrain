@@ -103,7 +103,8 @@ function formatCartContext(cart: CartSummary): string {
   const lines = cart.items.map(
     (it, idx) => `${idx + 1}.[${it.slug}] ${it.title} ×${it.qty}${it.unitCode}@${it.unitPriceFormatted}=${it.lineTotalFormatted}`,
   );
-  return `ตะกร้า(${cart.itemCount}รายการ/${cart.totalPieces}หน่วย รวม${cart.grandTotalFormatted}):\n${lines.join("\n")}`;
+  const promo = cart.coupon?.applied ? ` (คูปอง ${cart.coupon.code} ลด${cart.coupon.discountFormatted} จากยอด${cart.subtotalFormatted})` : "";
+  return `ตะกร้า(${cart.itemCount}รายการ/${cart.totalPieces}หน่วย สุทธิ${cart.grandTotalFormatted}${promo}):\n${lines.join("\n")}`;
 }
 
 // ---------- Order by card number ("เอาเบอร์ 5 10 ชิ้น"): exact, instant, 0 LLM tokens ----------
@@ -170,7 +171,7 @@ async function* executeNumberedOrder(
       asked = true;
       continue;
     }
-    cart = recalculateCart([...cart.items, { slug: p.slug, unitCode: unit.unitCode, unitPrice: unit.unitPrice, qty: t.qty }]);
+    cart = recalculateCart([...cart.items, { slug: p.slug, unitCode: unit.unitCode, unitPrice: unit.unitPrice, qty: t.qty }], cart.coupon?.code);
     added++;
     yield { type: "cart", cart, lastChangedSlug: p.slug };
     yield { type: "action", kind: "add", no: t.no, slug: p.slug, text: `${label}× ${t.qty} ${unit.unitCode} เข้าตะกร้าแล้ว` };
@@ -618,6 +619,8 @@ export async function* runNongTeeTurn(opts: {
   focusSlugs?: string[];
   /** Product whose "how many?" box is open on screen, so a bare "10 แพ็ค" answers it. */
   pendingSlug?: string;
+  /** Coupon the customer picked on screen; every cart recalculation keeps it. */
+  couponCode?: string;
 }): AsyncGenerator<JavisStreamEvent> {
   const userText = opts.message.trim();
   const history = (opts.history ?? [])
@@ -634,7 +637,7 @@ export async function* runNongTeeTurn(opts: {
     return;
   }
 
-  let currentCart = recalculateCart(opts.cartItems ?? []);
+  let currentCart = recalculateCart(opts.cartItems ?? [], opts.couponCode);
   let currentCustomer: Partial<CustomerCheckoutInfo> = { ...(opts.customer ?? {}) };
   let jobSeq = 1;
   const cardCollector = new Map<string, JavisProductCard>();
@@ -1053,7 +1056,7 @@ export async function* runNongTeeTurn(opts: {
                 qty,
               },
             ];
-            currentCart = recalculateCart(nextItems);
+            currentCart = recalculateCart(nextItems, opts.couponCode);
             cardCollector.set(resolved.product.slug, toProductCard(resolved.product));
             stageSetExplicitly = true;
             yield { type: "cart", cart: currentCart, lastChangedSlug: resolved.product.slug };
@@ -1103,7 +1106,7 @@ export async function* runNongTeeTurn(opts: {
             okState = "none";
             toolOut = `ไม่พบรายการ "${id}" ในตะกร้าปัจจุบัน\n${formatCartContext(currentCart)}`;
           } else {
-            currentCart = recalculateCart(updated);
+            currentCart = recalculateCart(updated, opts.couponCode);
             stageSetExplicitly = true;
             yield { type: "cart", cart: currentCart };
             yield { type: "stage", mode: "cart", title: "ปรับปรุงจำนวนในตะกร้าแล้ว" };
@@ -1114,7 +1117,7 @@ export async function* runNongTeeTurn(opts: {
           jobLabel = "ลบออกจากตะกร้า";
           const id = String(args.identifier ?? "").trim().toLowerCase();
           if (id === "all" || id === "ทั้งหมด") {
-            currentCart = recalculateCart([]);
+            currentCart = recalculateCart([], opts.couponCode);
             stageSetExplicitly = true;
             yield { type: "cart", cart: currentCart };
             yield { type: "stage", mode: "cart", title: "ล้างตะกร้าสินค้าเรียบร้อย" };
@@ -1134,7 +1137,7 @@ export async function* runNongTeeTurn(opts: {
               okState = "none";
               toolOut = `ไม่พบ "${id}" ในตะกร้าปัจจุบัน\n${formatCartContext(currentCart)}`;
             } else {
-              currentCart = recalculateCart(remaining);
+              currentCart = recalculateCart(remaining, opts.couponCode);
               stageSetExplicitly = true;
               yield { type: "cart", cart: currentCart };
               yield { type: "stage", mode: "cart", title: "ลบรายการออกจากตะกร้าแล้ว" };
@@ -1185,8 +1188,8 @@ export async function* runNongTeeTurn(opts: {
             okState = "none";
             toolOut = "ไม่สามารถออกใบสั่งซื้อได้เพราะตะกร้ายังว่างอยู่ (0 รายการ)";
           } else {
-            const order = saveSalesOrder(currentCart.items, currentCustomer);
-            currentCart = recalculateCart([]);
+            const order = saveSalesOrder(currentCart.items, currentCustomer, opts.couponCode);
+            currentCart = recalculateCart([], opts.couponCode);
             stageSetExplicitly = true;
             yield { type: "order", order };
             yield { type: "cart", cart: currentCart };
