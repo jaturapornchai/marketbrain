@@ -91,6 +91,24 @@ assert.ok(!html.includes("<script"), "Rendered HTML is safe");
 const trav = traverseGraph({ slug: topNote!.slug, depth: 2, audience: "user", limit: 15 });
 assert.ok(trav.neighbors.length > 0, "Product note has connected synapses (category/brand/unit/trait)");
 
+// 5b. Sales-chat search: the named product must lead, and follow-up sentences must not trigger a product search
+const fishSauce = searchProductsDetailed({ q: "มีน้ำปลาอะไรบ้าง", pageSize: 6 });
+assert.ok(
+  fishSauce.items.length === 6 && fishSauce.items.every((p) => p.nameTh.includes("น้ำปลา")),
+  "Top hits for a spoken 'น้ำปลา' question are all น้ำปลา (synonyms never outrank the named product)",
+);
+const cheapFishSauce = searchProductsDetailed({ q: "น้ำปลา", sort: "price_asc", pageSize: 6 });
+assert.ok(
+  cheapFishSauce.items.every((p) => p.nameTh.includes("น้ำปลา")) && cheapFishSauce.total < fishSauce.total,
+  "Price sort keeps only real 'น้ำปลา' matches, not synonym-only ones",
+);
+const { productQueryOf } = await import("@/lib/nong-tee");
+for (const followUp of ["อันไหนถูกที่สุด", "เอาอันนั้น 2 ขวดใส่ตะกร้า", "แล้วมีขนาดใหญ่กว่านี้ไหม", "รวมเป็นเงินเท่าไหร่", "ตัวแรกเลยครับ"]) {
+  assert.equal(productQueryOf(followUp), "", `Follow-up "${followUp}" names no product`);
+}
+assert.equal(productQueryOf("เอาน้ำปลาทิพรส 2 ขวดใส่ตะกร้า"), "เอาน้ำปลาทิพรส 2 ขวด", "Product words survive cart phrasing");
+assert.ok(productQueryOf("มีถุงขยะไหม"), "Unit-like word inside a product name still counts as a product query");
+
 // 6. 3D Brain Graph Generation Performance & Structure
 const g = graph("all");
 assert.ok(g.nodes.length > 200 && g.nodes.length <= 2000, `Curated 3D graph node count (${g.nodes.length}) is mobile-friendly`);

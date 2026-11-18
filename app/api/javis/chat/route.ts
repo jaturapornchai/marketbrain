@@ -18,6 +18,7 @@ export async function POST(req: Request): Promise<Response> {
     customer?: unknown;
     visionSlugs?: unknown;
     visionSummary?: unknown;
+    focusSlugs?: unknown;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -56,6 +57,10 @@ export async function POST(req: Request): Promise<Response> {
     : undefined;
   const visionSummary = typeof body.visionSummary === "string" ? body.visionSummary.trim().slice(0, 180) : undefined;
 
+  const focusSlugs = Array.isArray(body.focusSlugs)
+    ? body.focusSlugs.filter((x): x is string => typeof x === "string" && x.length <= 160).slice(0, 6)
+    : undefined;
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -67,6 +72,7 @@ export async function POST(req: Request): Promise<Response> {
           customer,
           visionSlugs,
           visionSummary,
+          focusSlugs,
         })) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(ev)}\n\n`));
         }

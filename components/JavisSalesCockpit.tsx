@@ -324,6 +324,9 @@ export default function JavisSalesCockpit({
         { role: "assistant" as const, content: t.spokenText.slice(0, 240) },
       ]);
 
+      // What the customer is looking at right now, so "อันนั้น/ตัวแรก" in the next sentence still means something
+      const focusSlugs = (turns.findLast((t) => t.cards.length > 0)?.cards ?? []).slice(0, 6).map((c) => c.slug);
+
       setTurns((prev) => [
         ...prev,
         {
@@ -352,6 +355,7 @@ export default function JavisSalesCockpit({
             customer,
             visionSlugs: extra?.visionSlugs,
             visionSummary: extra?.visionSummary,
+            focusSlugs,
           }),
           signal: controller.signal,
         });

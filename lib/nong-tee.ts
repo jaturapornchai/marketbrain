@@ -26,6 +26,7 @@ import {
   getProductBySlug,
   search,
   searchProductsDetailed,
+  terms,
   traverseGraph,
 } from "./vault";
 
@@ -107,14 +108,23 @@ const PLANNER_PROMPT = `แปลงคำพูดลูกค้าเป็�
 ถ้าสั่งจัดการตะกร้าหรือปิดบิลล้วนๆ ให้ตอบ CART_ONLY
 แก้คำพ้องเสียงไมค์ เช่น ชูรส->ไม่ใส่ผงชูรส, ฮาราล->ฮาลาล, ฟรีซ->แช่แข็ง, แพค->แพ็ก`;
 
-const NONG_TEE_SYSTEM_PROMPT = `คุณคือ "น้องตี๋" เลขาขายสินค้าของ MarketBrain แทนตัวเองว่า "ตี๋" หรือ "ผม" ลงท้าย "ครับ/นะครับ" สุภาพ กระชับ
-ห้ามเอ่ยชื่อห้างค้าส่ง ค้าปลีก หรือแพลตฟอร์มอีคอมเมิร์ซภายนอกเด็ดขาด และห้ามแต่งราคา/สินค้าที่ไม่มีในข้อมูลสมอง
+const NONG_TEE_SYSTEM_PROMPT = `คุณคือ "น้องตี๋" พนักงานขายมือโปรของ MarketBrain แทนตัวเองว่า "ตี๋" หรือ "ผม" ลงท้าย "ครับ/นะครับ" สุภาพ กระตือรือร้น กระชับ เป้าหมายคือช่วยลูกค้าเลือกของให้ได้และปิดการขาย
+ห้ามเอ่ยชื่อห้างค้าส่ง ค้าปลีก หรือแพลตฟอร์มอีคอมเมิร์ซภายนอกเด็ดขาด และห้ามแต่งราคา/สินค้า/โปรโมชั่น/ส่วนลด/ของแถม/สต็อกที่ไม่มีในข้อมูลสมอง
+
+วิธีขาย:
+- อย่าแค่ไล่รายการ ให้เชียร์ตัวเด่น 1 ตัวจากข้อมูล พร้อมเหตุผลสั้นๆ ด้วยตัวเลขจริง (ราคา ขนาด หรือราคาเฉลี่ยต่อหน่วย)
+- ถ้ามีแพ็ก/ยกลังที่เฉลี่ยต่อหน่วยถูกกว่า ให้ชวนซื้อแบบคุ้มกว่า
+- ใส่ตะกร้าสำเร็จแล้ว ให้ชวนต่อ 1 อย่าง: ของที่ใช้คู่กัน หรือชวนปิดบิล
+- ประโยคสุดท้ายของคำพูดต้องเป็นคำถามปิดการขาย 1 ข้อเสมอ เช่น "รับกี่ขวดดีครับ" "ใส่ตะกร้าเลยไหมครับ" "รับอะไรเพิ่มหรือให้ตี๋คิดเงินเลยดีครับ" ลูกค้าปฏิเสธแล้วไม่ตื๊อซ้ำ
+- ลูกค้าพูดต่อ เช่น "อันนั้น" "ตัวแรก" "ถูกสุด" "ใหญ่กว่านี้" หมายถึงสินค้าที่คุยค้างหรืออยู่บนจอ ให้ใช้ slug ใน [ ] ของรายการนั้นเรียกเครื่องมือได้เลย
+- ห้ามบอกว่าใส่ตะกร้าแล้วถ้า cart_add ยังไม่สำเร็จ และไม่ต้องขอโทษถ้าไม่ได้ทำผิด
 
 กติกาเครื่องมือ:
 - ลูกค้าสั่งซื้อระบุจำนวนชัด -> เรียก \`cart_add\` ทันที | สนใจแต่ยังไม่บอกจำนวน -> เรียก \`ask_cart_qty\`
 - เปลี่ยนจำนวน -> \`cart_update\` | ลบของ -> \`cart_remove\` | ขอดูตะกร้า -> \`cart_view\`
 - ลูกค้าขอคิดเงิน/เช็กบิลแต่ยังขาดชื่อ/เบอร์/วิธีจ่าย -> \`checkout_prepare\` แล้วถามสั้นๆ | แจ้งข้อมูลหรือยืนยันสั่งซื้อแล้ว -> \`place_order\` ทันที
 - คิดเลขเพิ่มต้องกด \`calc\` เสมอ
+- ถ้าจะเรียกเครื่องมือ ให้เรียกเลยโดยยังไม่ต้องพูด แล้วค่อยพูดสรุปทีเดียวหลังได้ผล
 
 รูปแบบคำตอบ (คั่นด้วยบรรทัด \`[จอ]\` เสมอ):
 ส่วนแรกก่อน \`[จอ]\`: คำพูดออกเสียงสั้นกระชับ 1–3 ประโยค ธรรมชาติ ห้ามใส่ตารางหรือดอกจัน
@@ -292,6 +302,22 @@ function getDeepSeekConfig() {
 
 const CART_OR_ORDER_DIRECT_RE =
   /^(?:ดูตะกร้า|เปิดตะกร้า|เช็กตะกร้า|ในตะกร้ามีอะไรบ้าง|ล้างตะกร้า|เคลียร์ตะกร้า|คิดเงิน|คิดตังค์|เช็กบิล|ปิดบิล|ปิดการขาย|ยืนยันสั่งซื้อ|ยืนยันปิดการขาย|สั่งซื้อเลย|เปลี่ยนจำนวน|แก้จำนวน|ลบรายการ|ลบสินค้า)/i;
+
+// Spoken follow-ups ("อันไหนถูกที่สุด", "เอาอันนั้น 2 ขวดใส่ตะกร้า") name no product, so searching them only pulls random goods onto the screen
+const CHAT_PHRASE_RE =
+  /(?:ใส่|ลง|เข้า|ใน|ดู|เปิด|เช็ก|เช็ค|ล้าง|เคลียร์)ตะกร้า|คิดเงิน|เช็กบิล|เช็คบิล|จ่ายเงิน|ชำระเงิน|สั่งซื้อ|เท่าไหร่|เท่าไร|กี่บาท|ที่สุด|อันแรก|ตัวแรก|อันที่|ตัวที่|ใส่/g;
+const CHAT_FILLER = new Set(
+  "ไหน นี้ นั้น นี่ นั่น กว่า สุด ถูก แพง ราคา ขนาด ใหญ่ เล็ก รวม เงิน บาท เท่า ไหร่ ทั้งหมด เพิ่ม อีก ด้วย เลย ก็ ล่ะ อยาก ต้องการ สนใจ รับ ซื้อ สั่ง แนะนำ เทียบ เปรียบเทียบ ต่าง กัน ดี คุ้ม ชิ้น ขวด แพ็ค แพ็ก ลัง กล่อง ถุง ซอง ห่อ โหล แรก สอง สาม ตกลง โอเค ใช่ ครับผม จ้า อื่น เหมือน เดิม ยี่ห้อ รุ่น".split(
+    " ",
+  ),
+);
+
+/** Product words of a spoken sentence, or "" when the customer is only following up on what is already on screen. */
+export function productQueryOf(userText: string): string {
+  const stripped = userText.replace(CHAT_PHRASE_RE, " ").replace(/\s+/g, " ").trim();
+  const hasProductWord = terms(stripped).some((t) => !CHAT_FILLER.has(t) && !/^[\d.,]+$/.test(t));
+  return hasProductWord ? stripped : "";
+}
 
 async function planSwarmQueries(
   userMessage: string,
@@ -475,6 +501,8 @@ export async function* runNongTeeTurn(opts: {
   customer?: Partial<CustomerCheckoutInfo>;
   visionSlugs?: string[];
   visionSummary?: string;
+  /** Products shown on the customer's screen from the previous turn, so "อันนั้น/ตัวแรก" can be resolved. */
+  focusSlugs?: string[];
 }): AsyncGenerator<JavisStreamEvent> {
   const userText = opts.message.trim();
   const history = (opts.history ?? [])
@@ -550,10 +578,39 @@ export async function* runNongTeeTurn(opts: {
   }
 
   let angles: string[] = [];
-  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !CART_OR_ORDER_DIRECT_RE.test(userText)) {
+  let prefetchLabel = "สินค้าที่พบ";
+  const productQuery = productQueryOf(userText);
+  const focusItems = (opts.focusSlugs ?? [])
+    .slice(0, 6)
+    .map((s) => getProductBySlug(String(s).trim()))
+    .filter((p): p is BrainProductItem => Boolean(p));
+  const isDirectCartOrOrder = CART_OR_ORDER_DIRECT_RE.test(userText);
+
+  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && !productQuery && focusItems.length > 0) {
+    // Follow-up turn: keep talking about what is on screen (0 search, 0 planner tokens)
+    prefetchLabel = "สินค้าบนจอที่ลูกค้ากำลังพูดต่อ (เรียงตามลำดับบนจอ)";
+    for (const p of focusItems) {
+      cardCollector.set(p.slug, toProductCard(p));
+      prefetchBlocks.push(summarizeProductForLlm(p));
+    }
+    yield {
+      type: "team",
+      job: {
+        id: jobSeq++,
+        worker: "brain",
+        label: "จำบริบทบนจอ",
+        task: `คุยต่อจากสินค้า ${focusItems.length} รายการ`,
+        state: "done",
+        ms: 1,
+        count: focusItems.length,
+      },
+    };
+    yield { type: "cards", cards: [...cardCollector.values()] };
+  } else if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder) {
     const tLocal = performance.now();
-    const localDirect = searchProductsDetailed({ q: userText, pageSize: 6 });
-    if (localDirect.items.length >= 2 || (localDirect.items.length === 1 && userText.length <= 28)) {
+    const searchText = productQuery || userText;
+    const localDirect = searchProductsDetailed({ q: searchText, pageSize: 6 });
+    if (localDirect.items.length >= 2 || (localDirect.items.length === 1 && searchText.length <= 28)) {
       const localMs = Math.max(1, Math.round(performance.now() - tLocal));
       for (const p of localDirect.items) {
         if (cardCollector.size < 12) cardCollector.set(p.slug, toProductCard(p));
@@ -562,7 +619,7 @@ export async function* runNongTeeTurn(opts: {
       emitMcpEvent({
         tool: "ask_brain",
         audience: "user",
-        rawArg: userText,
+        rawArg: searchText,
         hits: localDirect.items.slice(0, 4).map((p) => ({ slug: p.slug, title: p.nameTh, folder: "product" })),
         totalHits: localDirect.total,
         ms: localMs,
@@ -573,7 +630,7 @@ export async function* runNongTeeTurn(opts: {
           id: jobSeq++,
           worker: "product",
           label: "ค้นสมองด่วน",
-          task: userText.slice(0, 50),
+          task: searchText.slice(0, 50),
           state: "done",
           ms: localMs,
           count: localDirect.total,
@@ -586,7 +643,7 @@ export async function* runNongTeeTurn(opts: {
           type: "stage",
           mode: cardsArr.length === 1 ? "spotlight" : "showcase",
           spotlight: cardsArr[0] ?? null,
-          title: `สินค้าตามบริบท: "${userText.slice(0, 40)}"`,
+          title: `สินค้าตามบริบท: "${searchText.slice(0, 40)}"`,
         };
       }
     } else {
@@ -688,8 +745,9 @@ export async function* runNongTeeTurn(opts: {
     formatCartContext(currentCart),
     customerSummary ? `ผู้รับ: ${customerSummary}` : "ผู้รับ: (ยังไม่ระบุ)",
     prefetchBlocks.length
-      ? `สินค้าที่พบ:\n${prefetchBlocks.join("\n")}`
+      ? `${prefetchLabel}:\n${prefetchBlocks.join("\n")}`
       : `คลังมี ${st.totalProducts} สินค้า (กด search_products ได้)`,
+    "จบคำพูดด้วยคำถามปิดการขาย 1 ข้อ",
   ].join("\n");
 
   const llmMessages: Array<Record<string, unknown>> = [
@@ -749,7 +807,7 @@ export async function* runNongTeeTurn(opts: {
             ...history.map((m) => ({ role: m.role, content: m.content })),
             {
               role: "user",
-              content: `${userText}\n\nสถานะล่าสุดหลังดำเนินการ:\n${formatCartContext(currentCart)}\n\n${extraToolLogs.join("\n\n")}\n\n${prefetchBlocks.slice(0, 6).join("\n\n")}\n\n(ระบบ: ดำเนินการเครื่องมือครบแล้ว ไม่มีเครื่องมือให้เรียกอีก ตอบสรุปให้ลูกค้าฟังอย่างเป็นธรรมชาติและใส่รายละเอียดหลังบรรทัด [จอ] ทันที)`,
+              content: `${userText}\n\nสถานะล่าสุดหลังดำเนินการ:\n${formatCartContext(currentCart)}\n\n${extraToolLogs.join("\n\n")}\n\n${prefetchBlocks.slice(0, 6).join("\n\n")}\n\n(ระบบ: ดำเนินการเครื่องมือครบแล้ว ไม่มีเครื่องมือให้เรียกอีก ยึดสถานะตะกร้าข้างบนเป็นความจริงเท่านั้น ถ้าของที่ลูกค้าสั่งยังไม่อยู่ในตะกร้า ห้ามบอกว่าใส่แล้ว ให้บอกตรงๆ แล้วถามยืนยันสินค้า ตอบสรุปให้ลูกค้าฟังอย่างเป็นธรรมชาติและใส่รายละเอียดหลังบรรทัด [จอ] ทันที)`,
             },
           ]
         : llmMessages;
@@ -757,6 +815,11 @@ export async function* runNongTeeTurn(opts: {
       let roundText = "";
       let inScreen = spokenAcc.length > 0 && screenAcc.length > 0;
       let pendingBuf = "";
+      // Speech from an earlier round must not run straight into this round's first word
+      if (round > 0 && !inScreen && spokenAcc && !/\s$/.test(spokenAcc)) {
+        spokenAcc += " ";
+        yield { type: "delta", section: "speech", text: " " };
+      }
 
       for await (const tok of streamDeepSeekRound(roundMessages, !isLast, cfg, calls)) {
         roundText += tok;
@@ -765,7 +828,8 @@ export async function* runNongTeeTurn(opts: {
           yield { type: "delta", section: "screen", text: tok };
           continue;
         }
-        pendingBuf += tok;
+        // Spoken text goes to the voice engine, which would read markdown asterisks aloud
+        pendingBuf += tok.replace(/\*/g, "");
         const markIdx = pendingBuf.indexOf(SCREEN_MARK);
         if (markIdx !== -1) {
           const before = pendingBuf.slice(0, markIdx);

@@ -1808,6 +1808,8 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
 
   // Score candidate products if query `q` is provided
   let scores: Float64Array | null = null;
+  let strictMatch: Uint8Array | null = null;
+  let strictCount = 0;
   if (q) {
     scores = new Float64Array(b.productsList.length);
     const matchedCount = new Int32Array(b.productsList.length);
@@ -1828,26 +1830,43 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
         }
       }
     }
+    // Synonyms only widen recall: count the single best synonym hit, never a sum that could outrank a real term match
+    const synBest = new Float64Array(b.productsList.length);
     for (const st of synTerms) {
       const post = b.productPostings.get(st);
       if (post) {
-        const idf = Math.log(1 + b.productsList.length / (1 + post.length));
+        const synScore = 4.5 * Math.log(1 + b.productsList.length / (1 + post.length));
         for (let k = 0; k < post.length; k++) {
-          scores[post[k]] += 4.5 * idf;
+          if (synScore > synBest[post[k]]) synBest[post[k]] = synScore;
         }
       }
     }
+    strictMatch = new Uint8Array(b.productsList.length);
 
     // Substring fallback on normalized title/brand/barcode so partial Thai/code queries always find matches
     for (let i = 0; i < b.productsList.length; i++) {
       const p = b.productsList[i];
-      if (qTerms.length > 1 && matchedCount[i] === qTerms.length) {
+      scores[i] += synBest[i];
+      const allTerms = qTerms.length > 0 && matchedCount[i] === qTerms.length;
+      if (qTerms.length > 1 && allTerms) {
         scores[i] *= 1.6;
       }
+      let phraseHit = false;
       if (normPhrase.length >= 2) {
         const hayTitle = normalizeText(`${p.nameTh} ${p.nameEn} ${p.brandTh} ${p.brandEn} ${p.productCode}`);
-        if (hayTitle.includes(normPhrase)) scores[i] += 35;
-        else if (p.barcodes.some((bc) => bc.includes(q))) scores[i] += 80;
+        // A term that is in the product name itself says far more than one buried in the description
+        for (const t of qTerms) if (hayTitle.includes(t)) scores[i] += 18;
+        if (hayTitle.includes(normPhrase)) {
+          scores[i] += 35;
+          phraseHit = true;
+        } else if (p.barcodes.some((bc) => bc.includes(q))) {
+          scores[i] += 80;
+          phraseHit = true;
+        }
+      }
+      if (allTerms || phraseHit || p === exact) {
+        strictMatch[i] = 1;
+        strictCount++;
       }
     }
   }
@@ -1862,9 +1881,12 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
   const srcCounts = new Map<string, { label: string; count: number }>();
 
   const matchedIndices: number[] = [];
+  // Sorting by price/pack throws relevance away, so loose (synonym / partial) matches must not reach the top
+  const strictOnly = sort !== "relevance" && strictCount > 0 ? strictMatch : null;
 
   for (let i = 0; i < b.productsList.length; i++) {
     if (scores && scores[i] <= 0) continue;
+    if (strictOnly && !strictOnly[i]) continue;
     const p = b.productsList[i];
 
     if (multiUnitOnly && p.unitConversions.length <= 1 && p.packQty <= 1) continue;
