@@ -36,6 +36,13 @@ type HudState = "idle" | "listening" | "searching" | "thinking" | "speaking" | "
 const GREETING_TEXT =
   "สวัสดีครับ ผมน้องตี๋ เลขาช่วยหาสินค้าและรับออเดอร์ครับ อยากดูสินค้าตัวไหน พูด ส่องกล้องรูปสินค้า หรือพิมพ์บอกตี๋ได้เลยนะครับ";
 
+// Speaker-echo guard for the live mic loop (one mic frame = 4096 samples @16 kHz = 256 ms)
+const ECHO_CALIB_FRAMES = 3; // frames of Nong Tee's own voice used to learn the echo level
+const BARGE_MIN_RMS = 0.045; // customer must be at least this loud to interrupt
+const BARGE_OVER_ECHO = 2; // ...and this many times louder than the learned echo
+const BARGE_FRAMES = 2; // ...for this many frames in a row (~0.5 s)
+const ECHO_TAIL_MS = 400; // ignore the mic briefly after he stops speaking
+
 const QUICK_SCENARIOS = [
   { icon: "🌶️", label: "น้ำจิ้ม/ซอส ไม่ใส่ผงชูรส", prompt: "ตี๋ หาน้ำจิ้มไก่หรือซอสที่ไม่ใส่ผงชูรสให้หน่อยครับ" },
   { icon: "☪️", label: "สินค้าฮาลาลขายดี", prompt: "ตี๋ ขอดูสินค้าที่ได้เครื่องหมายฮาลาลในหมวดเครื่องปรุงหน่อยครับ" },
@@ -578,6 +585,15 @@ export default function JavisSalesCockpit({
         return out;
       };
 
+      // Echo guard: the speaker's own sound must never be heard as the customer.
+      // echoPeak = mic level of Nong Tee's voice leaking back (learned while he speaks, kept for the whole call).
+      let wasPlaying = false;
+      let echoPeak = 0;
+      let calibFrames = 0;
+      let loudRun = 0;
+      let preroll: Float32Array[] = [];
+      let echoTailUntil = 0;
+
       proc.onaudioprocess = (ev) => {
         if (!callActiveRef.current || micMutedRef.current) return;
         const inputData = ev.inputBuffer.getChannelData(0);
@@ -586,22 +602,59 @@ export default function JavisSalesCockpit({
         const rms = Math.sqrt(sumSq / inputData.length);
         const now = performance.now();
 
-        const threshold = isPlayingLoopRef.current ? 0.032 : 0.014;
+        const playing = isPlayingLoopRef.current;
+        if (playing !== wasPlaying) {
+          wasPlaying = playing;
+          loudRun = 0;
+          preroll = [];
+          if (playing) {
+            pcmChunksRef.current = [];
+            speakingDetectedRef.current = false;
+            setLiveUserHeard("");
+          } else {
+            echoTailUntil = now + ECHO_TAIL_MS; // room reverb + output latency after he stops
+          }
+        }
 
-        if (rms > threshold) {
+        if (playing) {
+          const sounding = !!playingAudioRef.current && !playingAudioRef.current.paused;
+          if (sounding && calibFrames < ECHO_CALIB_FRAMES) {
+            calibFrames++;
+            echoPeak = Math.max(echoPeak, rms);
+            return;
+          }
+          const isCustomer = calibFrames >= ECHO_CALIB_FRAMES && rms > Math.max(BARGE_MIN_RMS, echoPeak * BARGE_OVER_ECHO);
+          if (!isCustomer) {
+            echoPeak = Math.max(rms, echoPeak * 0.995);
+            loudRun = 0;
+            preroll = [];
+            return;
+          }
+          preroll.push(new Float32Array(inputData));
+          if (++loudRun < BARGE_FRAMES) return;
+
+          // Barge-in: customer clearly louder than the echo for ~0.5s -> stop talking and listen.
+          stopAllAudioPlayback();
+          wasPlaying = false;
+          setHudState("listening");
+          setStatusText("น้องตี๋หยุดฟังคุณพูดแทรกครับ…");
+          speakingDetectedRef.current = true;
+          speechStartMsRef.current = now;
+          lastVoiceMsRef.current = now;
+          pcmChunksRef.current = preroll;
+          preroll = [];
+          loudRun = 0;
+          return;
+        }
+        if (now < echoTailUntil) return;
+
+        if (rms > 0.014) {
           if (!speakingDetectedRef.current) {
             speakingDetectedRef.current = true;
             speechStartMsRef.current = now;
           }
           lastVoiceMsRef.current = now;
           pcmChunksRef.current.push(new Float32Array(inputData));
-
-          // Barge-in: if user speaks continuously > 450ms while Nong Tee is talking, cut audio immediately!
-          if (isPlayingLoopRef.current && now - speechStartMsRef.current > 450) {
-            stopAllAudioPlayback();
-            setHudState("listening");
-            setStatusText("น้องตี๋หยุดฟังคุณพูดแทรกครับ…");
-          }
 
           // Incremental live partial transcription every ~650ms
           if (!sendingSttRef.current && now - lastPartialMsRef.current > 650 && pcmChunksRef.current.length >= 3) {
