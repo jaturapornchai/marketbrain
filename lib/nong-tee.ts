@@ -21,6 +21,7 @@ import {
   type JavisTeamJob,
   type UnitOptionCard,
 } from "./product-card";
+import { mentionsCardNumber, parseBareQuantity, parseNumberedOrder, type NumberedPick } from "./numbered-order";
 import {
   brainStats,
   getProductBySlug,
@@ -104,6 +105,99 @@ function formatCartContext(cart: CartSummary): string {
   return `ตะกร้า(${cart.itemCount}รายการ/${cart.totalPieces}หน่วย รวม${cart.grandTotalFormatted}):\n${lines.join("\n")}`;
 }
 
+// ---------- Order by card number ("เอาเบอร์ 5 10 ชิ้น"): exact, instant, 0 LLM tokens ----------
+const COMMON_UNIT_RE =
+  /^(ลัง|แพ็ค|โหล|ขวด|กระป๋อง|ถุง|ซอง|กล่อง|ห่อ|แผ่น|ก้อน|กิโล|กก|ลิตร|ม้วน|แท่ง|หลอด|ถัง|แกลลอน|ถ้วย|มัด|ใบ|ฟอง|คู่|ชุด|เส้น|ด้าม|กระสอบ|แผง|ขีด)/;
+const normUnit = (s: string) => s.trim().toLowerCase().replace(/แพ[็]?[คก]/g, "แพ็ค");
+const bahtSpoken = (formatted: string) => formatted.replace("฿", "").replace(/[.]00$/, "") + " บาท";
+
+/** Unit + price for what the customer said after the quantity; null = not sure, ask instead of guessing. */
+function resolveSpokenUnit(p: BrainProductItem, afterQty: string): { unitCode: string; unitPrice: string } | null {
+  if (!p.bestPrice) return null;
+  const said = normUnit(afterQty);
+  const named = p.unitConversions
+    .filter((c) => c.pricePerUnit)
+    .flatMap((c) => [c.unitNameTh, c.unitCode].filter(Boolean).map((n) => ({ name: normUnit(n), conv: c })))
+    .sort((a, b) => b.name.length - a.name.length)
+    .find((x) => said.startsWith(x.name));
+  if (named) return { unitCode: named.conv.unitNameTh || named.conv.unitCode, unitPrice: named.conv.pricePerUnit ?? p.bestPrice };
+  if (said.startsWith(normUnit(p.unitCode))) return { unitCode: p.unitCode, unitPrice: p.bestPrice };
+  // "10 ชิ้น" of a 4-piece pack could mean 10 packs or 10 pieces; a unit this product is not sold in -> ask.
+  if (p.packQty > 1 && said.startsWith(normUnit(p.baseUnitCode))) return null;
+  if (COMMON_UNIT_RE.test(said)) return null;
+  return { unitCode: p.unitCode, unitPrice: p.bestPrice };
+}
+
+type NumberedTarget = NumberedPick & { product: BrainProductItem | null };
+
+async function* executeNumberedOrder(
+  targets: NumberedTarget[],
+  focusItems: BrainProductItem[],
+  startCart: CartSummary,
+): AsyncGenerator<JavisStreamEvent> {
+  const t0 = performance.now();
+  let cart = startCart;
+  let added = 0;
+  let asked = false;
+  const say: string[] = [];
+  if (focusItems.length > 0) yield { type: "cards", cards: focusItems.map(toProductCard) };
+
+  for (const t of targets) {
+    const label = t.no > 0 ? `เบอร์ ${t.no} ` : "";
+    const p = t.product;
+    if (!p) {
+      yield { type: "action", kind: "unknown", no: t.no, text: `ไม่มีเบอร์ ${t.no} บนจอ` };
+      say.push(
+        focusItems.length > 0
+          ? `บนจอตอนนี้มีเบอร์ 1 ถึง ${focusItems.length} ครับ ไม่มีเบอร์ ${t.no} ต้องการเบอร์ไหนครับ`
+          : "ตอนนี้บนจอยังไม่มีสินค้าให้เลือกตามเบอร์ครับ อยากได้สินค้าอะไร บอกตี๋ได้เลยครับ",
+      );
+      asked = true;
+      continue;
+    }
+    if (!p.bestPrice) {
+      yield { type: "action", kind: "unknown", no: t.no, slug: p.slug, text: `${label}ยังไม่มีราคา` };
+      say.push(`${label}${p.nameTh} ยังไม่มีราคาในระบบ ตี๋ยังใส่ตะกร้าให้ไม่ได้ครับ`);
+      asked = true;
+      continue;
+    }
+    const unit = t.qty === null ? null : resolveSpokenUnit(p, t.afterQty);
+    if (t.qty === null || !unit) {
+      if (!asked) yield { type: "ask_qty", product: toProductCard(p) };
+      yield { type: "action", kind: "ask", no: t.no, slug: p.slug, text: `${label}รับกี่${p.unitCode}ครับ?` };
+      say.push(`${label}${p.nameTh} ขายเป็น${p.unitCode} ${bahtSpoken(formatThaiBaht(p.bestPrice))} รับกี่${p.unitCode}ดีครับ`);
+      asked = true;
+      continue;
+    }
+    cart = recalculateCart([...cart.items, { slug: p.slug, unitCode: unit.unitCode, unitPrice: unit.unitPrice, qty: t.qty }]);
+    added++;
+    yield { type: "cart", cart, lastChangedSlug: p.slug };
+    yield { type: "action", kind: "add", no: t.no, slug: p.slug, text: `${label}× ${t.qty} ${unit.unitCode} เข้าตะกร้าแล้ว` };
+    say.push(`ใส่${label}${p.nameTh} ${t.qty} ${unit.unitCode} ลงตะกร้าแล้วครับ`);
+  }
+  if (added > 0 && !asked) {
+    say.push(`ยอดรวมตอนนี้ ${bahtSpoken(cart.grandTotalFormatted)} รับอะไรเพิ่มไหมครับ หรือให้ตี๋คิดเงินเลยครับ`);
+  }
+
+  yield {
+    type: "team",
+    job: {
+      id: 1,
+      worker: "cart",
+      label: "ทำตามคำสั่งเบอร์",
+      task: targets.map((t) => (t.no > 0 ? `เบอร์ ${t.no}` : "จำนวน") + (t.qty ? ` ×${t.qty}` : "")).join(", "),
+      state: added > 0 ? "done" : "none",
+      ms: Math.max(1, Math.round(performance.now() - t0)),
+      count: added,
+    },
+  };
+  for (const s of say) {
+    yield { type: "delta", section: "speech", text: s + " " };
+    yield { type: "sentence", text: s };
+  }
+  yield { type: "done", spokenText: say.join(" "), screenMarkdown: "", model: "คำสั่งตรง (ไม่ใช้ AI)" };
+}
+
 const PLANNER_PROMPT = `แปลงคำพูดลูกค้าเป็นคำค้นสินค้าสั้นๆ 1-2 มุม คั่นด้วย ; บรรทัดเดียว ห้ามอธิบาย ห้ามลงท้ายครับ/ค่ะ
 ถ้าสั่งจัดการตะกร้าหรือปิดบิลล้วนๆ ให้ตอบ CART_ONLY
 แก้คำพ้องเสียงไมค์ เช่น ชูรส->ไม่ใส่ผงชูรส, ฮาราล->ฮาลาล, ฟรีซ->แช่แข็ง, แพค->แพ็ก`;
@@ -117,6 +211,8 @@ const NONG_TEE_SYSTEM_PROMPT = `คุณคือ "น้องตี๋" พ�
 - ใส่ตะกร้าสำเร็จแล้ว ให้ชวนต่อ 1 อย่าง: ของที่ใช้คู่กัน หรือชวนปิดบิล
 - ประโยคสุดท้ายของคำพูดต้องเป็นคำถามปิดการขาย 1 ข้อเสมอ เช่น "รับกี่ขวดดีครับ" "ใส่ตะกร้าเลยไหมครับ" "รับอะไรเพิ่มหรือให้ตี๋คิดเงินเลยดีครับ" ลูกค้าปฏิเสธแล้วไม่ตื๊อซ้ำ
 - ลูกค้าพูดต่อ เช่น "อันนั้น" "ตัวแรก" "ถูกสุด" "ใหญ่กว่านี้" หมายถึงสินค้าที่คุยค้างหรืออยู่บนจอ ให้ใช้ slug ใน [ ] ของรายการนั้นเรียกเครื่องมือได้เลย
+- สินค้าบนจอมีเบอร์กำกับทุกใบ (เบอร์ 1, 2, 3…) ให้เรียกสินค้าด้วยเบอร์เสมอ เช่น "เบอร์ 2 คุ้มสุดครับ" และเมื่อลูกค้าพูดเบอร์ให้ถือเป็นสินค้าเบอร์นั้น
+- ลูกค้าสั่งให้ทำอะไรให้ลงมือทำด้วยเครื่องมือทันที ไม่ใช่แค่ค้นให้ดู ถ้าไม่แน่ใจว่าหมายถึงตัวไหนหรือจำนวนเท่าไร ให้ถามก่อน ห้ามเดา
 - ห้ามบอกว่าใส่ตะกร้าแล้วถ้า cart_add ยังไม่สำเร็จ และไม่ต้องขอโทษถ้าไม่ได้ทำผิด
 
 กติกาเครื่องมือ:
@@ -503,6 +599,8 @@ export async function* runNongTeeTurn(opts: {
   visionSummary?: string;
   /** Products shown on the customer's screen from the previous turn, so "อันนั้น/ตัวแรก" can be resolved. */
   focusSlugs?: string[];
+  /** Product whose "how many?" box is open on screen, so a bare "10 แพ็ค" answers it. */
+  pendingSlug?: string;
 }): AsyncGenerator<JavisStreamEvent> {
   const userText = opts.message.trim();
   const history = (opts.history ?? [])
@@ -581,17 +679,33 @@ export async function* runNongTeeTurn(opts: {
   let prefetchLabel = "สินค้าที่พบ";
   const productQuery = productQueryOf(userText);
   const focusItems = (opts.focusSlugs ?? [])
-    .slice(0, 6)
+    .slice(0, 12)
     .map((s) => getProductBySlug(String(s).trim()))
     .filter((p): p is BrainProductItem => Boolean(p));
   const isDirectCartOrOrder = CART_OR_ORDER_DIRECT_RE.test(userText);
 
-  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && !productQuery && focusItems.length > 0) {
+  if (visionSlugs.length === 0) {
+    const pendingProduct = opts.pendingSlug ? getProductBySlug(opts.pendingSlug) : null;
+    const bareQty = pendingProduct ? parseBareQuantity(userText) : null;
+    const picks = bareQty ? null : parseNumberedOrder(userText, focusItems.length);
+    const targets: NumberedTarget[] | null =
+      bareQty && pendingProduct
+        ? [{ ...bareQty, no: focusItems.findIndex((p) => p.slug === pendingProduct.slug) + 1, product: pendingProduct }]
+        : picks
+          ? picks.map((pk) => ({ ...pk, product: focusItems[pk.no - 1] ?? null }))
+          : null;
+    if (targets) {
+      yield* executeNumberedOrder(targets, focusItems, currentCart);
+      return;
+    }
+  }
+
+  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && focusItems.length > 0 && (!productQuery || mentionsCardNumber(userText, focusItems.length))) {
     // Follow-up turn: keep talking about what is on screen (0 search, 0 planner tokens)
     prefetchLabel = "สินค้าบนจอที่ลูกค้ากำลังพูดต่อ (เรียงตามลำดับบนจอ)";
     for (const p of focusItems) {
       cardCollector.set(p.slug, toProductCard(p));
-      prefetchBlocks.push(summarizeProductForLlm(p));
+      if (prefetchBlocks.length < 6) prefetchBlocks.push(summarizeProductForLlm(p));
     }
     yield {
       type: "team",
@@ -741,11 +855,18 @@ export async function* runNongTeeTurn(opts: {
     .filter(Boolean)
     .join(" | ");
 
+  // Every card on screen has a number; tell the model the same numbers the customer sees.
+  const withCardNo = (block: string) => {
+    const slug = block.startsWith("• [") ? block.slice(3, block.indexOf("|")) : "";
+    const no = slug ? [...cardCollector.keys()].indexOf(slug) + 1 : 0;
+    return no > 0 ? "• เบอร์ " + no + " " + block.slice(2) : block;
+  };
+
   const contextBlock = [
     formatCartContext(currentCart),
     customerSummary ? `ผู้รับ: ${customerSummary}` : "ผู้รับ: (ยังไม่ระบุ)",
     prefetchBlocks.length
-      ? `${prefetchLabel}:\n${prefetchBlocks.join("\n")}`
+      ? `${prefetchLabel}:\n${prefetchBlocks.map(withCardNo).join("\n")}`
       : `คลังมี ${st.totalProducts} สินค้า (กด search_products ได้)`,
     "จบคำพูดด้วยคำถามปิดการขาย 1 ข้อ",
   ].join("\n");
@@ -1070,7 +1191,7 @@ export async function* runNongTeeTurn(opts: {
             }
             yield { type: "cards", cards: [...cardCollector.values()] };
             const rp = resolved.product;
-            toolOut = `${summarizeProductForLlm(rp)}${rp.ingredients ? ` | ส่วนประกอบ:${rp.ingredients.slice(0, 140)}` : ""}`;
+            toolOut = `${withCardNo(summarizeProductForLlm(rp))}${rp.ingredients ? ` | ส่วนประกอบ:${rp.ingredients.slice(0, 140)}` : ""}`;
           } else {
             okState = "none";
             toolOut = `ไม่พบสินค้า "${id}"`;
@@ -1131,7 +1252,7 @@ export async function* runNongTeeTurn(opts: {
                 title: q ? `ผลการค้นหา: "${q}"` : "สินค้าที่คัดเลือก",
               };
             }
-            toolOut = `พบ ${res.total} รายการ:\n${res.items.map(summarizeProductForLlm).join("\n\n")}`;
+            toolOut = `พบ ${res.total} รายการ:\n${res.items.map((it) => withCardNo(summarizeProductForLlm(it))).join("\n\n")}`;
           } else {
             okState = "none";
             toolOut = `ไม่พบสินค้าตามเงื่อนไข "${q}"`;

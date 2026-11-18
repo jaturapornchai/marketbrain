@@ -11,6 +11,7 @@ import type {
   JavisStreamEvent,
   JavisTeamJob,
 } from "@/lib/product-card";
+import { BARGE_FRAMES, EchoGuard, playedLevel, wavEnvelope } from "@/lib/echo-guard";
 import DevicePickerPopover from "./DevicePickerPopover";
 import { useJavis } from "./JavisContext";
 import ProductVisionScanner, { identifyProductFromFile, type VisionLookupResult } from "./ProductVisionScanner";
@@ -36,12 +37,12 @@ type HudState = "idle" | "listening" | "searching" | "thinking" | "speaking" | "
 const GREETING_TEXT =
   "สวัสดีครับ ผมน้องตี๋ เลขาช่วยหาสินค้าและรับออเดอร์ครับ อยากดูสินค้าตัวไหน พูด ส่องกล้องรูปสินค้า หรือพิมพ์บอกตี๋ได้เลยนะครับ";
 
-// Speaker-echo guard for the live mic loop (one mic frame = 4096 samples @16 kHz = 256 ms)
-const ECHO_CALIB_FRAMES = 3; // frames of Nong Tee's own voice used to learn the echo level
-const BARGE_MIN_RMS = 0.045; // customer must be at least this loud to interrupt
-const BARGE_OVER_ECHO = 2; // ...and this many times louder than the learned echo
-const BARGE_FRAMES = 2; // ...for this many frames in a row (~0.5 s)
-const ECHO_TAIL_MS = 400; // ignore the mic briefly after he stops speaking
+const ECHO_TAIL_MS = 400; // room reverb + output latency after Nong Tee stops speaking
+
+const ACTION_FX_MS = 3600; // how long the "what I just did" banner stays
+const ACTION_PICK_MS = 1300; // time to show the picked card before switching to the cart
+
+type ActionFx = { id: string; kind: "add" | "ask" | "unknown"; slug?: string; text: string };
 
 const QUICK_SCENARIOS = [
   { icon: "🌶️", label: "น้ำจิ้ม/ซอส ไม่ใส่ผงชูรส", prompt: "ตี๋ หาน้ำจิ้มไก่หรือซอสที่ไม่ใส่ผงชูรสให้หน่อยครับ" },
@@ -73,6 +74,8 @@ export default function JavisSalesCockpit({
     clearPendingPrompt,
     clearPendingVision,
     promptAddToCart,
+    qtyModalProduct,
+    closeQtyModal,
     updateCartQty,
     removeFromCart,
     clearCart,
@@ -84,6 +87,13 @@ export default function JavisSalesCockpit({
   const [stageTitle, setStageTitle] = useState("สินค้าแนะนำพร้อมขายในสมอง");
   const [stageCards, setStageCards] = useState<JavisProductCard[]>(featuredProducts);
   const [spotlight, setSpotlight] = useState<JavisProductCard | null>(featuredProducts[0] ?? null);
+  // What the system just did for a spoken order ("เบอร์ 5 × 10 เข้าตะกร้าแล้ว"), shown as a banner + card highlight
+  const [actionFx, setActionFx] = useState<ActionFx[]>([]);
+  const actionFxTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
+  const stageCardsRef = useRef(stageCards);
+  stageCardsRef.current = stageCards;
+  const qtyModalSlugRef = useRef("");
+  qtyModalSlugRef.current = qtyModalProduct?.slug ?? "";
   const [lastChangedSlug, setLastChangedSlug] = useState<string>("");
   const [confirmedOrder, setConfirmedOrder] = useState<SalesOrder | null>(null);
   const [recentOrders, setRecentOrders] = useState<SalesOrder[]>([]);
@@ -119,6 +129,7 @@ export default function JavisSalesCockpit({
   const audioQueueRef = useRef<Array<{ text: string; promise: Promise<{ url: string; dur: number } | null> }>>([]);
   const playingAudioRef = useRef<SinkableAudio | null>(null);
   const isPlayingLoopRef = useRef(false);
+  const playingEnvRef = useRef<Float32Array | null>(null); // loudness envelope of the sentence being played
   const ttsEnabledRef = useRef(ttsEnabled);
   ttsEnabledRef.current = ttsEnabled;
   const speakerDeviceIdRef = useRef(speakerDeviceId);
@@ -191,6 +202,13 @@ export default function JavisSalesCockpit({
         await new Promise<void>((resolve) => {
           const audio = new Audio(resolved.url) as SinkableAudio;
           playingAudioRef.current = audio;
+          playingEnvRef.current = null;
+          void fetch(resolved.url)
+            .then((r) => r.arrayBuffer())
+            .then((b) => {
+              if (playingAudioRef.current === audio) playingEnvRef.current = wavEnvelope(b);
+            })
+            .catch(() => {});
           const durMs = Math.max(400, resolved.dur * 1000);
           let tStart = performance.now();
           let anim: ReturnType<typeof setInterval> | null = null;
@@ -332,7 +350,8 @@ export default function JavisSalesCockpit({
       ]);
 
       // What the customer is looking at right now, so "อันนั้น/ตัวแรก" in the next sentence still means something
-      const focusSlugs = (turns.findLast((t) => t.cards.length > 0)?.cards ?? []).slice(0, 6).map((c) => c.slug);
+      // Card numbers the customer sees = position in this list, so "เบอร์ 5" means focusSlugs[4].
+      const focusSlugs = stageCardsRef.current.slice(0, 12).map((c) => c.slug);
 
       setTurns((prev) => [
         ...prev,
@@ -363,6 +382,7 @@ export default function JavisSalesCockpit({
             visionSlugs: extra?.visionSlugs,
             visionSummary: extra?.visionSummary,
             focusSlugs,
+            pendingSlug: qtyModalSlugRef.current || undefined,
           }),
           signal: controller.signal,
         });
@@ -422,6 +442,30 @@ export default function JavisSalesCockpit({
               if (ev.lastChangedSlug) setLastChangedSlug(ev.lastChangedSlug);
             } else if (ev.type === "ask_qty") {
               promptAddToCart(ev.product);
+            } else if (ev.type === "action") {
+              const fx: ActionFx = { id: `${turnId}-${ev.no}-${ev.kind}-${performance.now()}`, kind: ev.kind, slug: ev.slug, text: ev.text };
+              setActionFx((prev) => [...prev.slice(-2), fx]);
+              actionFxTimersRef.current.push(
+                setTimeout(() => setActionFx((prev) => prev.filter((x) => x.id !== fx.id)), ACTION_FX_MS),
+              );
+              // Always show the numbered cards so the customer sees which one the system means.
+              setStageMode("showcase");
+              actionFxTimersRef.current.push(
+                setTimeout(
+                  () => document.querySelector(`.st-card.fx-${ev.kind}`)?.scrollIntoView({ block: "center", behavior: "smooth" }),
+                  80,
+                ),
+              );
+              if (ev.kind === "add") {
+                // Show which numbered card was picked first, then move to the cart.
+                closeQtyModal();
+                actionFxTimersRef.current.push(
+                  setTimeout(() => {
+                    setStageMode("cart");
+                    setStageTitle("อัปเดตตะกร้าสินค้าแล้ว");
+                  }, ACTION_PICK_MS),
+                );
+              }
             } else if (ev.type === "customer") {
               updateCustomer(ev.customer);
             } else if (ev.type === "order") {
@@ -478,7 +522,7 @@ export default function JavisSalesCockpit({
         }
       }
     },
-    [cart.items, customer, enqueueOmniVoiceSentence, promptAddToCart, replaceServerCart, stopAllAudioPlayback, turns, updateCustomer],
+    [cart.items, closeQtyModal, customer, enqueueOmniVoiceSentence, promptAddToCart, replaceServerCart, stopAllAudioPlayback, turns, updateCustomer],
   );
 
   // Consume external text prompt sent from /search or /n/[slug]
@@ -585,14 +629,13 @@ export default function JavisSalesCockpit({
         return out;
       };
 
-      // Echo guard: the speaker's own sound must never be heard as the customer.
-      // echoPeak = mic level of Nong Tee's voice leaking back (learned while he speaks, kept for the whole call).
+      // Echo guard: the speaker's own sound must never be heard as the customer (see lib/echo-guard.ts).
+      const echoGuard = new EchoGuard();
       let wasPlaying = false;
-      let echoPeak = 0;
-      let calibFrames = 0;
-      let loudRun = 0;
       let preroll: Float32Array[] = [];
       let echoTailUntil = 0;
+      let lastPlayed = 0;
+      let lastSoundingMs = 0;
 
       proc.onaudioprocess = (ev) => {
         if (!callActiveRef.current || micMutedRef.current) return;
@@ -605,7 +648,7 @@ export default function JavisSalesCockpit({
         const playing = isPlayingLoopRef.current;
         if (playing !== wasPlaying) {
           wasPlaying = playing;
-          loudRun = 0;
+          echoGuard.resetRun();
           preroll = [];
           if (playing) {
             pcmChunksRef.current = [];
@@ -617,21 +660,21 @@ export default function JavisSalesCockpit({
         }
 
         if (playing) {
-          const sounding = !!playingAudioRef.current && !playingAudioRef.current.paused;
-          if (sounding && calibFrames < ECHO_CALIB_FRAMES) {
-            calibFrames++;
-            echoPeak = Math.max(echoPeak, rms);
-            return;
+          const audio = playingAudioRef.current;
+          let played = 0;
+          if (audio && !audio.paused) {
+            played = lastPlayed = playedLevel(playingEnvRef.current, audio.currentTime);
+            lastSoundingMs = now;
+          } else if (now - lastSoundingMs < ECHO_TAIL_MS) {
+            played = lastPlayed;
           }
-          const isCustomer = calibFrames >= ECHO_CALIB_FRAMES && rms > Math.max(BARGE_MIN_RMS, echoPeak * BARGE_OVER_ECHO);
-          if (!isCustomer) {
-            echoPeak = Math.max(rms, echoPeak * 0.995);
-            loudRun = 0;
+          const customerFrames = echoGuard.hear(rms, played);
+          if (customerFrames === 0) {
             preroll = [];
             return;
           }
           preroll.push(new Float32Array(inputData));
-          if (++loudRun < BARGE_FRAMES) return;
+          if (customerFrames < BARGE_FRAMES) return;
 
           // Barge-in: customer clearly louder than the echo for ~0.5s -> stop talking and listen.
           stopAllAudioPlayback();
@@ -643,7 +686,7 @@ export default function JavisSalesCockpit({
           lastVoiceMsRef.current = now;
           pcmChunksRef.current = preroll;
           preroll = [];
-          loudRun = 0;
+          echoGuard.resetRun();
           return;
         }
         if (now < echoTailUntil) return;
@@ -1284,6 +1327,17 @@ export default function JavisSalesCockpit({
           </div>
 
           <div className="jc-stage-body">
+            {actionFx.length > 0 && (
+              <div className="jc-action-fx" role="status" aria-live="polite">
+                {actionFx.map((fx) => (
+                  <div key={fx.id} className={`jc-action-chip ${fx.kind}`}>
+                    <span className="jc-action-icon">{fx.kind === "add" ? "✅" : fx.kind === "ask" ? "❓" : "⚠️"}</span>
+                    <span>{fx.text}</span>
+                    {fx.kind === "add" && <span className="jc-action-cart">🛒</span>}
+                  </div>
+                ))}
+              </div>
+            )}
             {stageMode === "camera" && (
               <ProductVisionScanner
                 onProductFound={handleVisionResult}
@@ -1313,8 +1367,11 @@ export default function JavisSalesCockpit({
                 </div>
 
                 <div className="st-cards-grid">
-                  {stageCards.map((c) => (
-                    <article key={c.slug} className="st-card">
+                  {stageCards.map((c, cardIdx) => (
+                    <article
+                      key={c.slug}
+                      className={`st-card${actionFx.some((fx) => fx.slug === c.slug) ? ` fx-${actionFx.findLast((fx) => fx.slug === c.slug)!.kind}` : ""}`}
+                    >
                       <button
                         type="button"
                         className="st-img-btn"
@@ -1324,6 +1381,9 @@ export default function JavisSalesCockpit({
                         }}
                       >
                         {c.imageUrl ? <img src={c.imageUrl} alt={c.title} loading="lazy" /> : <span>📦</span>}
+                        <span className="p-no-badge" aria-label={`เบอร์ ${cardIdx + 1}`}>
+                          {cardIdx + 1}
+                        </span>
                         {c.unitOptions.length > 1 && (
                           <span className="p-multi-badge">{c.unitOptions.length} หน่วยนับ</span>
                         )}
@@ -1504,9 +1564,10 @@ export default function JavisSalesCockpit({
                   <div className="cmp-quick-buy">
                     <h3>เลือกกดใส่ตะกร้าจากรายการที่เปรียบเทียบ:</h3>
                     <div className="jc-ans-products">
-                      {stageCards.slice(0, 8).map((c) => (
+                      {stageCards.slice(0, 8).map((c, cardIdx) => (
                         <div key={c.slug} className="jc-ans-item">
                           <div className="jc-ans-pick">
+                            <span className="p-no-badge inline">{cardIdx + 1}</span>
                             {c.imageUrl ? <img src={c.imageUrl} alt="" /> : <span>📦</span>}
                             <span className="jc-ans-name">{c.title}</span>
                             <strong className="jc-ans-price">{c.priceLabel}/{c.unitCode}</strong>

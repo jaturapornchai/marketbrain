@@ -19,6 +19,7 @@ export async function POST(req: Request): Promise<Response> {
     visionSlugs?: unknown;
     visionSummary?: unknown;
     focusSlugs?: unknown;
+    pendingSlug?: unknown;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -58,7 +59,7 @@ export async function POST(req: Request): Promise<Response> {
   const visionSummary = typeof body.visionSummary === "string" ? body.visionSummary.trim().slice(0, 180) : undefined;
 
   const focusSlugs = Array.isArray(body.focusSlugs)
-    ? body.focusSlugs.filter((x): x is string => typeof x === "string" && x.length <= 160).slice(0, 6)
+    ? body.focusSlugs.filter((x): x is string => typeof x === "string" && x.length <= 160).slice(0, 12)
     : undefined;
 
   const encoder = new TextEncoder();
@@ -73,6 +74,7 @@ export async function POST(req: Request): Promise<Response> {
           visionSlugs,
           visionSummary,
           focusSlugs,
+          pendingSlug: typeof body.pendingSlug === "string" && body.pendingSlug.length <= 160 ? body.pendingSlug : undefined,
         })) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(ev)}\n\n`));
         }

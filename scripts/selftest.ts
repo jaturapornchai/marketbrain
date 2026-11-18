@@ -127,4 +127,67 @@ const testOrder = saveSalesOrder(cartCalc.items, {
 assert.ok(testOrder.orderNo.startsWith("MB-"), "Generated order number starts with MB-");
 assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal matches verified Decimal cart");
 
+// ---------- Echo guard: speaker echo is never the customer, but the customer can still barge in ----------
+{
+  const { EchoGuard, BARGE_FRAMES, playedLevel, wavEnvelope } = await import("../lib/echo-guard.ts");
+  // Speech-like played level: loud syllables, soft syllables and pauses (one value per 256 ms mic frame).
+  const played = Array.from({ length: 240 }, (_, i) => (i % 9 >= 7 ? 0 : 0.1 + 0.2 * Math.abs(Math.sin(i * 1.7))));
+  for (const coupling of [0.02, 0.1, 0.5]) {
+    const guard = new EchoGuard();
+    const jitter = (i: number) => 0.75 + 0.5 * Math.abs(Math.sin(i * 12.9898)); // echo strength varies ±25%
+    let falseBarge = 0;
+    played.forEach((lvl, i) => {
+      if (guard.hear(lvl * coupling * jitter(i), lvl) >= BARGE_FRAMES) falseBarge++;
+    });
+    assert.equal(falseBarge, 0, `echo only (coupling ${coupling}) must never barge in`);
+    // Customer starts softly then speaks up: must barge in within ~1.5 s.
+    let bargedAt = -1;
+    for (let i = 0; i < 12 && bargedAt < 0; i++) {
+      const lvl = played[i];
+      const voice = Math.min(0.2, 0.04 * (i + 1));
+      if (guard.hear(Math.hypot(lvl * coupling * jitter(i), voice), lvl) >= BARGE_FRAMES) bargedAt = i;
+    }
+    if (coupling <= 0.1) assert.ok(bargedAt >= 0 && bargedAt <= 6, `customer barges in over echo (coupling ${coupling}, frame ${bargedAt})`);
+  }
+  const wav = new ArrayBuffer(44 + 2 * 24000);
+  const dv = new DataView(wav);
+  dv.setUint32(0, 0x52494646, false); dv.setUint32(8, 0x57415645, false); dv.setUint32(12, 0x666d7420, false);
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, 24000, true);
+  dv.setUint16(34, 16, true); dv.setUint32(36, 0x64617461, false); dv.setUint32(40, 2 * 24000, true);
+  for (let i = 12000; i < 24000; i++) dv.setInt16(44 + i * 2, i % 2 ? 16384 : -16384, true); // 0.5 s silence + 0.5 s at 0.5
+  const env = wavEnvelope(wav)!;
+  assert.ok(playedLevel(env, 0.3) < 0.01 && Math.abs(playedLevel(env, 0.9) - 0.5) < 0.01, "WAV envelope follows the played level");
+  assert.equal(playedLevel(null, 1), 0.25, "unknown envelope assumes full voice");
+}
+
+// ---------- Order by card number: "เอาเบอร์ 5 10 ชิ้น" is done exactly, anything unclear is asked ----------
+{
+  const { parseNumberedOrder, parseBareQuantity, parseThaiNumber } = await import("../lib/numbered-order.ts");
+  assert.equal(parseThaiNumber("ยี่สิบเอ็ด"), 21);
+  assert.equal(parseThaiNumber("สิบสอง"), 12);
+  assert.equal(parseThaiNumber("ร้อยห้าสิบ"), 150);
+  assert.deepEqual(parseNumberedOrder("เอาเบอร์ 5 10 ชิ้น", 6), [{ no: 5, qty: 10, afterQty: "ชิ้น" }]);
+  assert.deepEqual(parseNumberedOrder("เบอร์ห้าสิบชิ้น", 6), [{ no: 5, qty: 10, afterQty: "ชิ้น" }], "spoken words: card 5 x 10, not card 50");
+  assert.deepEqual(parseNumberedOrder("เอาเบอร์สามสองแพ็คครับ", 6)?.[0], { no: 3, qty: 2, afterQty: "แพ็คครับ" });
+  assert.deepEqual(
+    parseNumberedOrder("เบอร์ 1 สองลัง เบอร์ 4 หนึ่งแพ็ค", 6)?.map((x) => [x.no, x.qty]),
+    [[1, 2], [4, 1]],
+    "several cards in one sentence",
+  );
+  assert.deepEqual(parseNumberedOrder("ขอ 2 แพ็ค เบอร์ 3", 6)?.[0], { no: 3, qty: 2, afterQty: "แพ็ค" });
+  assert.deepEqual(parseNumberedOrder("เอาเบอร์ 2", 6), [{ no: 2, qty: null, afterQty: "" }], "no quantity -> must ask");
+  assert.equal(parseNumberedOrder("เบอร์ 5 ราคาเท่าไหร่", 6), null, "a question is not an order");
+  assert.equal(parseNumberedOrder("เอาเบอร์ 5 ออก", 6), null, "removal is not an add");
+  assert.equal(parseNumberedOrder("เบอร์ 3", 6), null, "a bare number without order words is left to the conversation");
+  assert.equal(parseNumberedOrder("เอาฟูซิลี่เบอร์ 309 2 ถุง", 6), null, "product-name numbers are not card numbers");
+  assert.equal(parseNumberedOrder("เบอร์โทร 0812345678", 6), null, "phone numbers are not card numbers");
+  assert.deepEqual(parseBareQuantity("สิบแพ็คครับ"), { qty: 10, afterQty: "แพ็คครับ" });
+  assert.deepEqual(parseBareQuantity("เอา 3"), { qty: 3, afterQty: "" });
+  assert.equal(parseBareQuantity("มีน้ำปลาไหม"), null);
+  const { mentionsCardNumber } = await import("../lib/numbered-order.ts");
+  assert.equal(mentionsCardNumber("เบอร์ 2 กับเบอร์ 3 ต่างกันยังไง", 6), true, "talking about on-screen numbers keeps the screen");
+  assert.equal(mentionsCardNumber("เบอร์ 9 ราคาเท่าไหร่", 6), false);
+  assert.equal(mentionsCardNumber("มีฟูซิลี่เบอร์ 309 ไหม", 6), false);
+}
+
 console.log(`✓ MarketBrain selftest passed (${stats.totalProducts} products, ${stats.totalNotes} notes, ${stats.totalSynapses} synapses, order=${testOrder.orderNo})`);

@@ -2615,3 +2615,135 @@ select {
   align-items: center;
   gap: 8px;
 }
+
+/* ---------- Card numbers ("เบอร์ 5") + spoken-order action animation ---------- */
+.p-no-badge {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-crimson));
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(234, 88, 12, 0.35);
+  border: 2px solid #ffffff;
+}
+.p-no-badge.inline {
+  position: static;
+  flex: none;
+  min-width: 24px;
+  height: 24px;
+  font-size: 12.5px;
+  border-width: 0;
+}
+.st-card.fx-add,
+.st-card.fx-ask {
+  position: relative;
+  z-index: 2;
+}
+.st-card.fx-add {
+  border-color: #16a34a;
+  animation: fx-card-pick 1.3s ease both;
+}
+.st-card.fx-ask {
+  border-color: var(--accent);
+  animation: fx-card-ask 0.9s ease 2 both;
+}
+.st-card.fx-add .p-no-badge {
+  background: linear-gradient(135deg, #16a34a, #15803d);
+  animation: fx-badge-pop 0.6s ease both;
+}
+.st-card.fx-add::after {
+  content: "🛒";
+  position: absolute;
+  right: 10px;
+  top: 12px;
+  font-size: 26px;
+  pointer-events: none;
+  animation: fx-fly-cart 1.2s ease-in 0.15s both;
+}
+.jc-action-fx {
+  position: sticky;
+  top: 8px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  height: 0;
+  pointer-events: none;
+}
+.jc-action-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: 999px;
+  background: #0f172a;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.32);
+  animation: fx-chip-in 0.35s cubic-bezier(0.2, 1.4, 0.4, 1) both, fx-chip-out 0.4s ease 3.2s both;
+}
+.jc-action-chip.add {
+  background: linear-gradient(135deg, #15803d, #16a34a);
+}
+.jc-action-chip.ask {
+  background: linear-gradient(135deg, var(--accent), var(--accent-crimson));
+}
+.jc-action-cart {
+  animation: fx-cart-bump 0.5s ease 0.35s 2 both;
+}
+@keyframes fx-card-pick {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.55); }
+  30% { transform: scale(1.045); box-shadow: 0 0 0 10px rgba(22, 163, 74, 0.22); }
+  100% { transform: scale(1); box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.35); }
+}
+@keyframes fx-card-ask {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.5); }
+  50% { box-shadow: 0 0 0 9px rgba(234, 88, 12, 0.18); }
+}
+@keyframes fx-badge-pop {
+  0% { transform: scale(1); }
+  45% { transform: scale(1.7); }
+  100% { transform: scale(1.15); }
+}
+@keyframes fx-fly-cart {
+  0% { opacity: 0; transform: translate(0, 40px) scale(0.6); }
+  25% { opacity: 1; transform: translate(0, 0) scale(1.25); }
+  100% { opacity: 0; transform: translate(40px, -150px) scale(0.5); }
+}
+@keyframes fx-chip-in {
+  from { opacity: 0; transform: translateY(-18px) scale(0.9); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes fx-chip-out {
+  to { opacity: 0; transform: translateY(-10px); }
+}
+@keyframes fx-cart-bump {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.45); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .st-card.fx-add,
+  .st-card.fx-ask,
+  .st-card.fx-add .p-no-badge,
+  .jc-action-chip,
+  .jc-action-cart {
+    animation: none;
+  }
+  .st-card.fx-add::after {
+    display: none;
+  }
+}
