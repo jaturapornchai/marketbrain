@@ -2,7 +2,8 @@
 
 Uses the exact same local models and voice cloning setup as d:/bctest01 (javis01):
 - TTS: hotdogs/omnivoice-thai on CUDA fp16 cloned from ref_audio.wav (step=16, cfg=2.0, speed=0.9, RMS=0.16)
-- STT: iapp/OpenThai2.0-ASR-Streaming-ONNX on CPU ONNX Runtime + Silero VAD
+- STT (live partial captions + fallback): iapp/OpenThai2.0-ASR-Streaming-ONNX on CPU ONNX Runtime + Silero VAD
+- STT (final transcript): typhoon-ai/typhoon-whisper-turbo (CTranslate2) on CUDA; falls back to OpenThai if it cannot load
 """
 import io
 import os
@@ -20,6 +21,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from faster_whisper import WhisperModel
 from faster_whisper.vad import VadOptions, get_speech_timestamps
 from pythainlp.util import num_to_thaiword
 from scipy.ndimage import maximum_filter1d, uniform_filter1d
@@ -40,6 +42,9 @@ REF_AUDIO_PATH = os.path.join(HERE, "ref_audio.wav")
 REF_TEXT = "สวัสดีครับทุกคน วันนี้ผมมีอะไรน่าสนใจมาแนะนำเยอะมาก ตามมาดูกันเลยครับ"
 TTS_MODEL_ID = os.environ.get("TTS_MODEL", "hotdogs/omnivoice-thai")
 STT_MODEL_DIR = os.environ.get("STT_MODEL_DIR", r"d:\bctest01\models\openthai2_asr_fp32")
+STT_FINAL_MODEL_DIR = os.environ.get(
+    "STT_FINAL_MODEL_DIR", os.path.join(os.path.dirname(HERE), ".data", "models", "typhoon-whisper-turbo-ct2")
+)
 TTS_SAMPLE_RATE = 24000
 TTS_STEP = 16
 TTS_CFG = 2.0
@@ -137,6 +142,41 @@ except Exception:
 
 voice_prompt = tts_model.create_voice_clone_prompt(ref_audio=REF_AUDIO_PATH, ref_text=REF_TEXT)
 tts_lock = threading.Lock()
+
+
+def load_final_stt():
+    """Typhoon Whisper Turbo on GPU for the final transcript; None -> OpenThai handles everything."""
+    if not has_cuda or not os.path.isdir(STT_FINAL_MODEL_DIR):
+        print("[voice_service] Final STT model/GPU not available; using OpenThai only", flush=True)
+        return None
+    # CTranslate2 needs cuBLAS/cuDNN DLLs; reuse the ones bundled with torch instead of installing anything.
+    os.environ["PATH"] = os.path.join(os.path.dirname(torch.__file__), "lib") + os.pathsep + os.environ.get("PATH", "")
+    try:
+        print("[voice_service] Loading Typhoon Whisper Turbo (CUDA int8_float16)...", flush=True)
+        model = WhisperModel(STT_FINAL_MODEL_DIR, device="cuda", compute_type="int8_float16")
+        list(model.transcribe(np.zeros(16000, dtype=np.float32), language="th", beam_size=1)[0])  # warm-up
+        return model
+    except Exception as exc:
+        print(f"[voice_service] Final STT load failed ({exc}); using OpenThai only", flush=True)
+        return None
+
+
+# Loaded after TTS so the voice keeps VRAM priority when the GPU is nearly full.
+final_stt = load_final_stt()
+final_stt_lock = threading.Lock()
+
+
+def transcribe_final(pcm: np.ndarray) -> str:
+    if final_stt is not None:
+        try:
+            with final_stt_lock:
+                segments, _ = final_stt.transcribe(
+                    pcm, language="th", beam_size=5, condition_on_previous_text=False, without_timestamps=True
+                )
+                return "".join(seg.text for seg in segments).strip()
+        except Exception as exc:
+            print(f"[voice_service] Final STT failed ({exc}); falling back to OpenThai", flush=True)
+    return stt_engine.transcribe(pcm).strip()
 audio_cache: "OrderedDict[str, tuple[bytes, float]]" = OrderedDict()
 
 
@@ -207,7 +247,8 @@ def health():
         "persona": "น้องตี๋",
         "ttsModel": TTS_MODEL_ID,
         "device": "cuda:0" if has_cuda else "cpu",
-        "sttModel": "OpenThai2.0-ASR-Streaming-ONNX",
+        "sttModel": "typhoon-whisper-turbo" if final_stt is not None else "OpenThai2.0-ASR-Streaming-ONNX",
+        "sttPartialModel": "OpenThai2.0-ASR-Streaming-ONNX",
         "greetText": GREET_TEXT,
         "greetDur": GREET_DUR,
     }
@@ -274,7 +315,7 @@ async def stt_endpoint(req: Request):
     else:
         voiced_pcm = pcm
 
-    text = stt_engine.transcribe(voiced_pcm).strip()
+    text = stt_engine.transcribe(voiced_pcm).strip() if is_partial else transcribe_final(voiced_pcm)
     if text == "เสียงดนตรี":
         text = ""
     return {"text": text, "voiced": bool(text)}
