@@ -64,7 +64,7 @@ flowchart LR
 | --- | --- |
 | `MONGODB_URI` | URI เชื่อมต่อฐานข้อมูลสินค้าต้นทางแบบ Read-Only |
 | `MONGODB_DB` | ชื่อฐานข้อมูลสินค้า (ค่าเริ่มต้น `bcscanproduct`) |
-| `DEEPSEEK_API_KEY` | API Key สำหรับเรียกโมเดล `deepseek-flash` / `deepseek-v4-pro` |
+| `DEEPSEEK_API_KEY` | API Key สำหรับเรียกโมเดล `deepseek-flash` (ระบบล็อกใช้ Flash อย่างเดียวและเปิดโหมดประหยัด Token อัตโนมัติ) |
 | `DEEPSEEK_BASE_URL` | Endpoint ของ DeepSeek API (ค่าเริ่มต้น `https://api.deepseek.com`) |
 | `LOCAL_VOICE_URL` | URL ของบริการเสียงในเครื่อง (ค่าเริ่มต้น `http://127.0.0.1:3091`) |
 | `OLLAMA_BASE_URL` | URL ของ Local Ollama สำหรับส่องรูปสินค้า (ค่าเริ่มต้น `http://127.0.0.1:11434`) |

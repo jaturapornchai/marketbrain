@@ -14,7 +14,6 @@ export async function POST(req: Request): Promise<Response> {
   let body: {
     message?: unknown;
     history?: unknown;
-    model?: unknown;
     cartItems?: unknown;
     customer?: unknown;
     visionSlugs?: unknown;
@@ -26,7 +25,7 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: "รูปแบบข้อมูล JSON ไม่ถูกต้อง" }, { status: 400 });
   }
 
-  const message = typeof body.message === "string" ? body.message.trim().slice(0, 1200) : "";
+  const message = typeof body.message === "string" ? body.message.trim().slice(0, 600) : "";
   if (!message) {
     return Response.json({ error: "กรุณาพิมพ์หรือพูดสิ่งที่ต้องการให้น้องตี๋ช่วยครับ" }, { status: 400 });
   }
@@ -40,8 +39,8 @@ export async function POST(req: Request): Promise<Response> {
         ((m as { role?: unknown }).role === "user" || (m as { role?: unknown }).role === "assistant") &&
         typeof (m as { content?: unknown }).content === "string",
     )
-    .slice(-8)
-    .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
+    .slice(-4)
+    .map((m) => ({ role: m.role, content: m.content.split("[จอ]")[0].trim().slice(0, 240) }));
 
   const cartItems = Array.isArray(body.cartItems)
     ? (body.cartItems as Array<Partial<CartItem> & { slug: string; qty: number }>).slice(0, 100)
@@ -52,11 +51,10 @@ export async function POST(req: Request): Promise<Response> {
       ? (body.customer as Partial<CustomerCheckoutInfo>)
       : {};
 
-  const model = typeof body.model === "string" ? body.model.trim() : undefined;
   const visionSlugs = Array.isArray(body.visionSlugs)
-    ? body.visionSlugs.filter((x): x is string => typeof x === "string").slice(0, 12)
+    ? body.visionSlugs.filter((x): x is string => typeof x === "string").slice(0, 8)
     : undefined;
-  const visionSummary = typeof body.visionSummary === "string" ? body.visionSummary.trim().slice(0, 240) : undefined;
+  const visionSummary = typeof body.visionSummary === "string" ? body.visionSummary.trim().slice(0, 180) : undefined;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -65,7 +63,6 @@ export async function POST(req: Request): Promise<Response> {
         for await (const ev of runNongTeeTurn({
           message,
           history,
-          model,
           cartItems,
           customer,
           visionSlugs,

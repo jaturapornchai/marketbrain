@@ -295,13 +295,14 @@ await step("UAT-04", "Visual Product Search E2E (/api/vision/identify) — Barco
 await step("UAT-05", "Multi-Turn Nong Tee Sales Closer E2E (Vision Turn -> Add Cart -> Update Qty -> Place Order)", async () => {
   const history: Array<{ role: "user" | "assistant"; content: string }> = [];
 
-  // Turn 1: Present Scanned Product from Vision
+  // Turn 1: Present Scanned Product from Vision (also verify model override is ignored and locked to deepseek-flash!)
   const t1Events = await collectSseEvents(
     await fetch(`${BASE_URL}/api/javis/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: `ลูกค้าส่งรูปสินค้า (${scannedSummary}) ช่วยแนะนำชื่อ ราคา และถามจำนวนใส่ตะกร้าเลยครับ`,
+        model: "deepseek-v4-pro",
         history,
         visionSlugs: [scannedProductSlug],
         visionSummary: scannedSummary,
@@ -309,8 +310,9 @@ await step("UAT-05", "Multi-Turn Nong Tee Sales Closer E2E (Vision Turn -> Add C
       }),
     }),
   );
-  const t1Done = t1Events.find((e) => e.type === "done") as { spokenText?: string } | undefined;
+  const t1Done = t1Events.find((e) => e.type === "done") as { spokenText?: string; model?: string } | undefined;
   assert.ok(t1Done?.spokenText, "Turn 1 must complete with spoken Thai response");
+  assert.equal(t1Done?.model, "deepseek-flash", "Model must be strictly locked to deepseek-flash ONLY");
   assert.ok(t1Events.some((e) => e.type === "cards"), "Turn 1 must emit product cards to visual stage");
   history.push(
     { role: "user", content: `ส่งรูปสินค้า ${scannedSummary}` },

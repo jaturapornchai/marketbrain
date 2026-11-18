@@ -93,7 +93,6 @@ export default function JavisSalesCockpit({
   const [visionUploading, setVisionUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [activeMicStreamState, setActiveMicStreamState] = useState<MediaStream | null>(null);
-  const [model, setModel] = useState<"deepseek-flash" | "deepseek-v4-pro">("deepseek-flash");
 
   const [input, setInput] = useState("");
   const [liveUserHeard, setLiveUserHeard] = useState("");
@@ -319,12 +318,10 @@ export default function JavisSalesCockpit({
       );
 
       const turnId = `turn-${Date.now()}`;
-      const historyPayload: JavisChatMessage[] = turns.slice(-4).flatMap((t) => [
-        { role: "user" as const, content: t.userText },
-        {
-          role: "assistant" as const,
-          content: t.screenMarkdown ? `${t.spokenText}\n[จอ]\n${t.screenMarkdown}` : t.spokenText,
-        },
+      // Token-Saver Mode: send only last 2 turns' spoken text (never send large [จอ] markdown tables)
+      const historyPayload: JavisChatMessage[] = turns.slice(-2).flatMap((t) => [
+        { role: "user" as const, content: t.userText.slice(0, 200) },
+        { role: "assistant" as const, content: t.spokenText.slice(0, 240) },
       ]);
 
       setTurns((prev) => [
@@ -337,7 +334,7 @@ export default function JavisSalesCockpit({
           screenMarkdown: "",
           cards: [],
           jobs: [],
-          model,
+          model: "deepseek-flash",
         },
       ]);
 
@@ -351,7 +348,6 @@ export default function JavisSalesCockpit({
           body: JSON.stringify({
             message: q,
             history: historyPayload,
-            model,
             cartItems: cart.items,
             customer,
             visionSlugs: extra?.visionSlugs,
@@ -471,7 +467,7 @@ export default function JavisSalesCockpit({
         }
       }
     },
-    [cart.items, customer, enqueueOmniVoiceSentence, model, promptAddToCart, replaceServerCart, stopAllAudioPlayback, turns, updateCustomer],
+    [cart.items, customer, enqueueOmniVoiceSentence, promptAddToCart, replaceServerCart, stopAllAudioPlayback, turns, updateCustomer],
   );
 
   // Consume external text prompt sent from /search or /n/[slug]
@@ -993,16 +989,6 @@ export default function JavisSalesCockpit({
               onOpenCameraScanner={() => setStageMode("camera")}
               onSelectPhotoFile={(f) => void handleQuickPhotoFile(f)}
             />
-
-            <select
-              className="jc-model-sel"
-              value={model}
-              onChange={(e) => setModel(e.target.value as "deepseek-flash" | "deepseek-v4-pro")}
-              aria-label="เลือกโมเดล DeepSeek"
-            >
-              <option value="deepseek-flash">Flash</option>
-              <option value="deepseek-v4-pro">Pro</option>
-            </select>
           </div>
 
           {(liveKaraokeText || liveUserHeard) && (

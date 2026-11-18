@@ -23,7 +23,6 @@ import {
 } from "./product-card";
 import {
   brainStats,
-  getNote,
   getProductBySlug,
   search,
   searchProductsDetailed,
@@ -80,71 +79,58 @@ function parseDsmlCalls(markup: string): ParsedToolCall[] {
   return calls;
 }
 
+export const LOCKED_FLASH_MODEL = "deepseek-flash" as const;
+
 function summarizeProductForLlm(p: BrainProductItem): string {
   const convTxt =
     p.unitConversions.length > 0
       ? p.unitConversions
-          .map((u) => `${u.unitNameTh}(${u.ratioText || `${u.standValue}:${u.divideValue}`})=${formatThaiBaht(u.pricePerUnit)}`)
-          .join(", ")
-      : `${p.unitCode}`;
-  const traitTxt = [...new Set(p.traits.map((t) => t.fullLabelTh))].join(", ") || "-";
-  return [
-    `• [${p.productCode}] ${p.nameTh} (slug: ${p.slug})`,
-    `  แบรนด์: ${p.brandTh || p.brandEn || "-"} | หมวด: ${p.categoryPathTh}`,
-    `  ราคาขาย: ${formatThaiBaht(p.bestPrice)} / ${p.unitCode}${p.packQty > 1 ? ` (บรรจุ ${p.packQty} ${p.baseUnitCode}, เฉลี่ย ${formatThaiBaht(p.pricePerBaseUnit)}/${p.baseUnitCode})` : ""}`,
-    `  บาร์โค้ด: ${p.primaryBarcode ?? "-"}${p.isThaiGs1 ? " (GS1 ไทย 885)" : ""} | หน่วยนับที่มี: ${convTxt}`,
-    `  คุณลักษณะ: ${traitTxt}`,
-    p.features ? `  จุดเด่น: ${p.features.replace(/\s+/g, " ").slice(0, 150)}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+          .slice(0, 4)
+          .map((u) => `${u.unitNameTh}${u.ratioText ? `(${u.ratioText})` : ""}=${formatThaiBaht(u.pricePerUnit)}`)
+          .join(",")
+      : p.unitCode;
+  const traitTxt = [...new Set(p.traits.map((t) => t.valueTh))].slice(0, 4).join(",");
+  const packInfo =
+    p.packQty > 1 ? ` บรรจุ${p.packQty}${p.baseUnitCode}(เฉลี่ย${formatThaiBaht(p.pricePerBaseUnit)})` : "";
+  return `• [${p.slug}|${p.productCode}] ${p.nameTh} | แบรนด์:${p.brandTh || p.brandEn || "-"} | ${formatThaiBaht(p.bestPrice)}/${p.unitCode}${packInfo} | หน่วย:${convTxt}${traitTxt ? ` | เด่น:${traitTxt}` : ""}`;
 }
 
 function formatCartContext(cart: CartSummary): string {
-  if (!cart.items.length) return "ตะกร้าสินค้าปัจจุบัน: (ยังว่างอยู่ 0 รายการ)";
+  if (!cart.items.length) return "ตะกร้า: ว่าง(0)";
   const lines = cart.items.map(
-    (it, idx) =>
-      `${idx + 1}. [${it.productCode}] ${it.title} (slug: ${it.slug}) — จำนวน ${it.qty} ${it.unitCode} × ${it.unitPriceFormatted} = ${it.lineTotalFormatted}`,
+    (it, idx) => `${idx + 1}.[${it.slug}] ${it.title} ×${it.qty}${it.unitCode}@${it.unitPriceFormatted}=${it.lineTotalFormatted}`,
   );
-  return `ตะกร้าสินค้าปัจจุบัน (${cart.itemCount} รายการ, รวม ${cart.totalPieces} หน่วย, ยอดสุทธิ ${cart.grandTotalFormatted}):\n${lines.join("\n")}`;
+  return `ตะกร้า(${cart.itemCount}รายการ/${cart.totalPieces}หน่วย รวม${cart.grandTotalFormatted}):\n${lines.join("\n")}`;
 }
 
-const PLANNER_PROMPT = `คุณคือตัววางแผนคำค้นสมองสินค้าของ "น้องตี๋" (Javis)
-แปลงคำพูดล่าสุดของลูกค้าให้เป็นคำค้นสินค้าในคลังสมอง 1 ถึง 3 แง่มุม คั่นด้วย ; บรรทัดเดียวเท่านั้น ห้ามอธิบาย ห้ามลงท้ายครับ/ค่ะ
-- ถ้าลูกค้าสั่งจัดการตะกร้าหรือปิดการขายโดยตรง (เช่น "ดูตะกร้าหน่อย", "ลบตัวแรกออก", "คิดเงินเลย", "เอา 3 ขวด") ให้ดึงชื่อสินค้าที่เพิ่งคุยกันมาเป็นคำค้นสั้นๆ หรือถ้าไม่มีชื่อสินค้าให้ตอบคำว่า CART_ONLY
-- แก้คำที่ได้ยินเพี้ยนจากเสียงไมค์ (เช่น ชูรส -> ไม่ใส่ผงชูรส, ฮาราล -> ฮาลาล, ฟรีซ -> แช่แข็ง, แพค -> แพ็ก)`;
+const PLANNER_PROMPT = `แปลงคำพูดลูกค้าเป็นคำค้นสินค้าสั้นๆ 1-2 มุม คั่นด้วย ; บรรทัดเดียว ห้ามอธิบาย ห้ามลงท้ายครับ/ค่ะ
+ถ้าสั่งจัดการตะกร้าหรือปิดบิลล้วนๆ ให้ตอบ CART_ONLY
+แก้คำพ้องเสียงไมค์ เช่น ชูรส->ไม่ใส่ผงชูรส, ฮาราล->ฮาลาล, ฟรีซ->แช่แข็ง, แพค->แพ็ก`;
 
-const NONG_TEE_SYSTEM_PROMPT = `คุณคือ "น้องตี๋" (Javis เลขาส่วนตัวและพนักงานขายมืออาชีพประจำระบบสมองสินค้า MarketBrain)
-ผู้ชายหนุ่มอารมณ์ดี คล่องแคล่ว สุภาพ เป็นกันเอง แทนตัวเองว่า "ตี๋" หรือ "ผม" และลงท้ายด้วย "ครับ" หรือ "นะครับ" เสมอ
-กฎเหล็กสำคัญ: ห้ามเอ่ยชื่อห้างค้าส่ง ห้างค้าปลีก หรือแพลตฟอร์มอีคอมเมิร์ซภายนอกทุกชนิดในคำพูดและข้อความบนจอเด็ดขาด!
+const NONG_TEE_SYSTEM_PROMPT = `คุณคือ "น้องตี๋" เลขาขายสินค้าของ MarketBrain แทนตัวเองว่า "ตี๋" หรือ "ผม" ลงท้าย "ครับ/นะครับ" สุภาพ กระชับ
+ห้ามเอ่ยชื่อห้างค้าส่ง ค้าปลีก หรือแพลตฟอร์มอีคอมเมิร์ซภายนอกเด็ดขาด และห้ามแต่งราคา/สินค้าที่ไม่มีในข้อมูลสมอง
 
-ภารกิจหลักของน้องตี๋:
-1. ช่วยลูกค้าหาสินค้า เปรียบเทียบขนาดบรรจุ/แพ็ค/ยกลัง ดูคุณลักษณะ (ไม่ใส่ผงชูรส, ฮาลาล, แช่แข็ง, บรรจุภัณฑ์, ส่วนผสม) จากข้อมูลจริงในสมองเท่านั้น (ห้ามเดาหรือแต่งตัวเลขราคา บาร์โค้ด หรือสินค้าที่ไม่มีในผลค้นเด็ดขาด!)
-2. ช่วยจัดการตะกร้าสินค้าแบบสดๆ ระหว่างคุย:
-   - เมื่อลูกค้าบอกว่าจะเอาสินค้าพร้อมระบุจำนวนชัดเจน (เช่น "เอาไฮคิว 5 กล่อง", "เพิ่มมาม่า 2 แพ็ค") -> ต้องเรียกเครื่องมือ \`cart_add\` ทันที!
-   - เมื่อลูกค้าบอกว่าจะเอาสินค้าแต่ยังไม่ระบุจำนวน (เช่น "เอาตัวนี้ใส่ตะกร้าหน่อย") -> ให้เรียก \`ask_cart_qty\` เพื่อให้หน้าจอเด้งปุ่มเลือกจำนวนให้ลูกค้ากดสะดวกๆ พร้อมถามลูกค้าว่า "รับกี่หน่วยดีครับ?"
-   - เมื่อลูกค้าสั่งเปลี่ยนจำนวน -> เรียก \`cart_update\` | สั่งลบของ -> เรียก \`cart_remove\` | ขอดูตะกร้า/เช็กยอด -> เรียก \`cart_view\`
-3. ช่วยแนะนำความคุ้มค่าและปิดการขาย (Sales Closer):
-   - หากมีขนาดแพ็คหรือยกลังที่ราคาเฉลี่ยต่อชิ้นคุ้มกว่า แนะนำลูกค้าสั้นๆ อย่างเป็นธรรมชาติ
-   - เมื่อลูกค้าพอใจสินค้าในตะกร้าหรือบอก "พอแค่นี้ / คิดเงินเลย / ปิดบิลเลย / สั่งซื้อเลย":
-     - ขั้นแรก หากยังไม่มีชื่อผู้รับ เบอร์โทร หรือวิธีชำระเงิน ให้เรียก \`checkout_prepare\` เพื่อเปิดหน้าสรุปบิลและชำระเงินบนจอ พร้อมถามชื่อ เบอร์โทร ที่อยู่จัดส่ง และวิธีชำระเงิน (พร้อมเพย์ QR / เก็บเงินปลายทาง COD / โอนบัญชี) สั้นๆ
-     - เมื่อลูกค้าแจ้งข้อมูลจัดส่งหรือยืนยันสั่งซื้อ ("ยืนยันสั่งซื้อเลย / เก็บเงินปลายทาง ส่งร้านลุงจืด 089...") -> เรียก \`place_order\` เพื่อออกใบสั่งซื้อและปิดการขายทันที!
-4. ทุกการคำนวณตัวเลขเพิ่มเติมนอกเหนือจากตะกร้า ต้องกดเครื่องมือ \`calc\` เสมอ ห้ามคิดเลขในใจ
-5. รูปแบบคำตอบต้องแบ่งเป็น 2 ส่วนคั่นด้วยบรรทัด \`[จอ]\` เสมอ:
-   - ส่วนแรก (ก่อนบรรทัด \`[จอ]\`): เป็นคำพูดที่น้องตี๋พูดออกลำโพงด้วยเสียงจริง สรุปสั้นกระชับ 2–4 ประโยค ฟังเข้าใจง่ายเป็นธรรมชาติ (ห้ามใส่ตาราง โค้ด หรือเครื่องหมายดอกจันยาวๆ ในส่วนคำพูด)
-   - ส่วนที่สอง (ขึ้นบรรทัดใหม่เขียน \`[จอ]\` บรรทัดเดียว แล้วตามด้วย Markdown): สรุปตารางเปรียบเทียบสินค้า หรือสรุปรายการในตะกร้า/ใบสั่งซื้อให้อ่านง่ายบนหน้าจอ`;
+กติกาเครื่องมือ:
+- ลูกค้าสั่งซื้อระบุจำนวนชัด -> เรียก \`cart_add\` ทันที | สนใจแต่ยังไม่บอกจำนวน -> เรียก \`ask_cart_qty\`
+- เปลี่ยนจำนวน -> \`cart_update\` | ลบของ -> \`cart_remove\` | ขอดูตะกร้า -> \`cart_view\`
+- ลูกค้าขอคิดเงิน/เช็กบิลแต่ยังขาดชื่อ/เบอร์/วิธีจ่าย -> \`checkout_prepare\` แล้วถามสั้นๆ | แจ้งข้อมูลหรือยืนยันสั่งซื้อแล้ว -> \`place_order\` ทันที
+- คิดเลขเพิ่มต้องกด \`calc\` เสมอ
+
+รูปแบบคำตอบ (คั่นด้วยบรรทัด \`[จอ]\` เสมอ):
+ส่วนแรกก่อน \`[จอ]\`: คำพูดออกเสียงสั้นกระชับ 1–3 ประโยค ธรรมชาติ ห้ามใส่ตารางหรือดอกจัน
+ส่วนหลังบรรทัด \`[จอ]\`: สรุปรายการ/ตารางสั้นกระชับบนจอ`;
 
 const TOOL_SPECS = [
   {
     type: "function",
     function: {
       name: "search_products",
-      description: "ค้นหาสินค้าในสมองเพื่อแสดงภาพแกลเลอรีสินค้าบนหน้าจอตามบริบทที่คุย",
+      description: "ค้นสินค้าแสดงแกลเลอรีบนจอ",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "คำค้นสินค้า คุณลักษณะ แบรนด์ หรือบาร์โค้ด" },
-          unit: { type: "string", description: "กรองหน่วยนับ เช่น ชิ้น, ขวด, ซอง, กล่อง, แพ็ค, โหล, ลัง" },
+          query: { type: "string" },
+          unit: { type: "string" },
           minPrice: { type: "string" },
           maxPrice: { type: "string" },
           multiUnitOnly: { type: "boolean" },
@@ -159,12 +145,10 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "inspect_product",
-      description: "เจาะลึกสินค้า 1 รายการและเปลี่ยนภาพบนหน้าจอเป็นโหมด Spotlight ของสินค้านั้นขนาดใหญ่",
+      description: "เปิดดูสินค้าเด่น 1 รายการบนจอ",
       parameters: {
         type: "object",
-        properties: {
-          identifier: { type: "string", description: "slug, รหัสสินค้า (BCS...), บาร์โค้ด หรือชื่อสินค้า" },
-        },
+        properties: { identifier: { type: "string" } },
         required: ["identifier"],
       },
     },
@@ -173,13 +157,10 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "traverse_synapses",
-      description: "เดินไซแนปส์ในสมองเพื่อหาขนาดแพ็ค/ยกลังคู่เทียบ หรือสินค้าในหมวด/คุณลักษณะเดียวกัน",
+      description: "หาแพ็ค/ยกลังคู่เทียบหรือสินค้าเชื่อมโยง",
       parameters: {
         type: "object",
-        properties: {
-          slug: { type: "string" },
-          relation: { type: "string" },
-        },
+        properties: { slug: { type: "string" }, relation: { type: "string" } },
         required: ["slug"],
       },
     },
@@ -188,13 +169,13 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "cart_add",
-      description: "เพิ่มสินค้าเข้าตะกร้าตามจำนวนที่ลูกค้าสั่ง แล้วสลับภาพหน้าจอไปแสดงตะกร้าสด",
+      description: "เพิ่มสินค้าลงตะกร้าตามจำนวน",
       parameters: {
         type: "object",
         properties: {
-          identifier: { type: "string", description: "slug (เช่น prod-bcs...), รหัสสินค้า, บาร์โค้ด หรือชื่อสินค้า" },
-          qty: { type: "integer", description: "จำนวนที่ต้องการเพิ่ม (เช่น 1, 2, 5, 12)" },
-          unitCode: { type: "string", description: "หน่วยนับที่ต้องการ (ถ้าไม่ระบุจะใช้หน่วยหลักของสินค้า)" },
+          identifier: { type: "string" },
+          qty: { type: "integer" },
+          unitCode: { type: "string" },
         },
         required: ["identifier", "qty"],
       },
@@ -204,12 +185,10 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "ask_cart_qty",
-      description: "เด้งกล่องถามจำนวนและหน่วยนับของสินค้าบนหน้าจอ เมื่อลูกค้าสนใจจะใส่ตะกร้าแต่ยังไม่บอกจำนวน",
+      description: "เด้งถามจำนวน/หน่วยเมื่อลูกค้ายังไม่ระบุจำนวน",
       parameters: {
         type: "object",
-        properties: {
-          identifier: { type: "string", description: "slug, รหัสสินค้า หรือชื่อสินค้า" },
-        },
+        properties: { identifier: { type: "string" } },
         required: ["identifier"],
       },
     },
@@ -218,13 +197,10 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "cart_update",
-      description: "แก้ไขจำนวนรวมของสินค้าที่มีอยู่ในตะกร้า (ถ้าระบุ qty เป็น 0 จะลบออก)",
+      description: "แก้จำนวนสินค้าในตะกร้า (0=ลบ)",
       parameters: {
         type: "object",
-        properties: {
-          identifier: { type: "string", description: "slug, รหัสสินค้า หรือชื่อสินค้าในตะกร้า" },
-          qty: { type: "integer", description: "จำนวนใหม่ที่ต้องการตั้ง" },
-        },
+        properties: { identifier: { type: "string" }, qty: { type: "integer" } },
         required: ["identifier", "qty"],
       },
     },
@@ -233,12 +209,10 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "cart_remove",
-      description: "ลบสินค้าออกจากตะกร้า (ส่ง identifier='all' หากลูกค้าสั่งล้างตะกร้าทั้งหมด)",
+      description: "ลบสินค้าจากตะกร้า ('all'=ล้างทั้งหมด)",
       parameters: {
         type: "object",
-        properties: {
-          identifier: { type: "string", description: "slug, รหัสสินค้า, ชื่อสินค้า หรือ 'all'" },
-        },
+        properties: { identifier: { type: "string" } },
         required: ["identifier"],
       },
     },
@@ -247,27 +221,24 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "cart_view",
-      description: "เปิดดูรายการในตะกร้าสินค้าบนหน้าจอหลักพร้อมสรุปยอดรวมสุทธิ",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
+      description: "แสดงตะกร้าสินค้าบนจอ",
+      parameters: { type: "object", properties: {} },
     },
   },
   {
     type: "function",
     function: {
       name: "checkout_prepare",
-      description: "สลับหน้าจอไปโหมดสรุปปิดการขาย/ชำระเงิน พร้อมบันทึกข้อมูลผู้รับเท่าที่ลูกค้าบอกมาแล้ว",
+      description: "เปิดหน้าชำระเงิน/บันทึกข้อมูลจัดส่งเบื้องต้น",
       parameters: {
         type: "object",
         properties: {
-          customerName: { type: "string", description: "ชื่อผู้สั่งซื้อ" },
-          shopName: { type: "string", description: "ชื่อร้านค้าหรือบริษัท" },
-          phone: { type: "string", description: "เบอร์โทรศัพท์" },
-          address: { type: "string", description: "ที่อยู่จัดส่ง" },
-          paymentMethod: { type: "string", enum: ["promptpay", "cod", "transfer"], description: "วิธีชำระเงิน" },
-          note: { type: "string", description: "หมายเหตุเพิ่มเติม" },
+          customerName: { type: "string" },
+          shopName: { type: "string" },
+          phone: { type: "string" },
+          address: { type: "string" },
+          paymentMethod: { type: "string", enum: ["promptpay", "cod", "transfer"] },
+          note: { type: "string" },
         },
       },
     },
@@ -276,7 +247,7 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "place_order",
-      description: "ยืนยันปิดการขายและออกใบสั่งซื้อทันที เมื่อมีสินค้าในตะกร้าและลูกค้ายืนยันสั่งซื้อแล้ว",
+      description: "ยืนยันออกใบสั่งซื้อปิดการขายทันที",
       parameters: {
         type: "object",
         properties: {
@@ -294,12 +265,10 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "calc",
-      description: "เครื่องคิดเลข Decimal (ROUND_HALF_UP 2 ตำแหน่ง) ส่งบรรทัดละ 1 สูตร 'หัวข้อ: สูตร'",
+      description: "คิดเลข Decimal บรรทัดละสูตร 'หัวข้อ: สูตร'",
       parameters: {
         type: "object",
-        properties: {
-          expressions: { type: "string" },
-        },
+        properties: { expressions: { type: "string" } },
         required: ["expressions"],
       },
     },
@@ -308,22 +277,21 @@ const TOOL_SPECS = [
     type: "function",
     function: {
       name: "brain_overview",
-      description: "ดูภาพรวมสถิติคลังสมองสินค้า หมวดหมู่ แบรนด์ และหน่วยนับ",
+      description: "ดูสถิติรวมคลังสมอง",
       parameters: { type: "object", properties: {} },
     },
   },
 ];
 
-function getDeepSeekConfig(requestedModel?: string) {
+function getDeepSeekConfig() {
   const apiKey = process.env.DEEPSEEK_API_KEY?.trim() || "";
   const baseUrl = (process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com").replace(/\/$/, "");
-  const defaultModel = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-flash";
-  const proModel = process.env.DEEPSEEK_PRO_MODEL?.trim() || "deepseek-v4-pro";
-  const model = requestedModel === proModel || requestedModel === "deepseek-v4-pro" ? proModel : defaultModel;
-  return { apiKey, baseUrl, model };
+  // Strictly locked to deepseek-flash ONLY per system policy (never switch to Pro/Reasoner)
+  return { apiKey, baseUrl, model: LOCKED_FLASH_MODEL };
 }
 
-const CART_INTENT_ONLY = /^(?:ดูตะกร้า|เปิดตะกร้า|เช็กตะกร้า|ในตะกร้ามีอะไรบ้าง|ล้างตะกร้า|เคลียร์ตะกร้า|คิดเงิน|คิดตังค์|เช็กบิล|ปิดบิล|ปิดการขาย|ยืนยันสั่งซื้อ|สั่งซื้อเลย)(?:\s*(?:ครับ|ค่ะ|หน่อย|เลย))*$/i;
+const CART_OR_ORDER_DIRECT_RE =
+  /^(?:ดูตะกร้า|เปิดตะกร้า|เช็กตะกร้า|ในตะกร้ามีอะไรบ้าง|ล้างตะกร้า|เคลียร์ตะกร้า|คิดเงิน|คิดตังค์|เช็กบิล|ปิดบิล|ปิดการขาย|ยืนยันสั่งซื้อ|ยืนยันปิดการขาย|สั่งซื้อเลย|เปลี่ยนจำนวน|แก้จำนวน|ลบรายการ|ลบสินค้า)/i;
 
 async function planSwarmQueries(
   userMessage: string,
@@ -331,16 +299,16 @@ async function planSwarmQueries(
   cfg: { apiKey: string; baseUrl: string; model: string },
 ): Promise<string[]> {
   const trimmed = userMessage.trim();
-  if (CART_INTENT_ONLY.test(trimmed)) return [];
+  if (CART_OR_ORDER_DIRECT_RE.test(trimmed)) return [];
   if (!cfg.apiKey || trimmed.length < 3) return [trimmed];
 
   const recentTalk = history
-    .slice(-4)
-    .map((m) => `${m.role === "user" ? "ลูกค้า" : "น้องตี๋"}: ${m.content.split(SCREEN_MARK)[0].trim().slice(0, 140)}`);
+    .slice(-2)
+    .map((m) => `${m.role === "user" ? "ล" : "ต"}: ${m.content.split(SCREEN_MARK)[0].trim().slice(0, 90)}`);
 
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
+    const timer = setTimeout(() => controller.abort(), 4000);
     const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -348,14 +316,14 @@ async function planSwarmQueries(
         Authorization: `Bearer ${cfg.apiKey}`,
       },
       body: JSON.stringify({
-        model: "deepseek-flash",
+        model: LOCKED_FLASH_MODEL,
         messages: [
           { role: "system", content: PLANNER_PROMPT },
-          { role: "user", content: [...recentTalk, `ลูกค้า (ล่าสุด): ${trimmed}`].join("\n") },
+          { role: "user", content: [...recentTalk, `ล่าสุด: ${trimmed.slice(0, 160)}`].join("\n") },
         ],
         stream: false,
-        temperature: 0.15,
-        max_tokens: 90,
+        temperature: 0.1,
+        max_tokens: 48,
         thinking: { type: "disabled" },
       }),
       signal: controller.signal,
@@ -369,9 +337,9 @@ async function planSwarmQueries(
     if (!firstLine || /(?:ครับ|ค่ะ|คะ)[\s.!?]*$/.test(firstLine)) return [trimmed];
     const angles = firstLine
       .split(/[;|]/)
-      .map((s) => s.trim().slice(0, 100))
+      .map((s) => s.trim().slice(0, 80))
       .filter((s) => s && s !== "CART_ONLY");
-    return [...new Set([...angles, trimmed])].slice(0, 3);
+    return [...new Set([...angles, trimmed])].slice(0, 2);
   } catch {
     return [trimmed];
   }
@@ -384,10 +352,11 @@ async function* streamDeepSeekRound(
   collectedCalls: ParsedToolCall[],
 ): AsyncGenerator<string> {
   const body: Record<string, unknown> = {
-    model: cfg.model,
+    model: LOCKED_FLASH_MODEL,
     messages,
     stream: true,
-    temperature: 0.2,
+    temperature: 0.15,
+    max_tokens: 420,
     thinking: { type: "disabled" },
   };
   if (offerTools) body.tools = TOOL_SPECS;
@@ -502,15 +471,17 @@ async function* streamDeepSeekRound(
 export async function* runNongTeeTurn(opts: {
   message: string;
   history?: JavisChatMessage[];
-  model?: string;
   cartItems?: Array<Partial<CartItem> & { slug: string; qty: number }>;
   customer?: Partial<CustomerCheckoutInfo>;
   visionSlugs?: string[];
   visionSummary?: string;
 }): AsyncGenerator<JavisStreamEvent> {
   const userText = opts.message.trim();
-  const history = (opts.history ?? []).slice(-8);
-  const cfg = getDeepSeekConfig(opts.model);
+  const history = (opts.history ?? [])
+    .slice(-4)
+    .map((m) => ({ role: m.role, content: m.content.split(SCREEN_MARK)[0].trim().slice(0, 220) }))
+    .filter((m) => m.content.length > 0);
+  const cfg = getDeepSeekConfig();
 
   if (!cfg.apiKey) {
     yield {
@@ -527,7 +498,7 @@ export async function* runNongTeeTurn(opts: {
   let stageSetExplicitly = false;
   const prefetchBlocks: string[] = [];
 
-  const visionSlugs = (opts.visionSlugs ?? []).map((s) => String(s).trim()).filter(Boolean).slice(0, 12);
+  const visionSlugs = (opts.visionSlugs ?? []).map((s) => String(s).trim()).filter(Boolean).slice(0, 8);
   if (visionSlugs.length > 0) {
     const vJobId = jobSeq++;
     const visionItems: BrainProductItem[] = [];
@@ -536,7 +507,7 @@ export async function* runNongTeeTurn(opts: {
       if (p) {
         visionItems.push(p);
         cardCollector.set(p.slug, toProductCard(p));
-        prefetchBlocks.push(summarizeProductForLlm(p));
+        if (prefetchBlocks.length < 6) prefetchBlocks.push(summarizeProductForLlm(p));
       }
     }
     yield {
@@ -564,10 +535,64 @@ export async function* runNongTeeTurn(opts: {
     }
   }
 
-  yield { type: "status", state: "searching", text: "น้องตี๋กำลังวิเคราะห์บริบทคำถาม…" };
+  yield { type: "status", state: "searching", text: "น้องตี๋กำลังค้นข้อมูลสินค้า…" };
 
-  // Step 1: Multi-Angle Swarm Planner (skipped when vision already resolved products)
-  const angles = visionSlugs.length > 0 ? [] : await planSwarmQueries(userText, history, cfg);
+  // Token-Saver Fast-Path:
+  // 1) If message references explicit product slug(s) (prod-...) or direct cart/order action -> 0 planner LLM tokens!
+  // 2) Try local in-memory BM25 + synonym search first (2ms, 0 LLM tokens). Only call LLM planner when local search gets 0 hits!
+  const explicitSlugMatches = [...userText.matchAll(/\b(prod-[a-z0-9-]+)\b/gi)].map((m) => m[1].toLowerCase());
+  for (const s of explicitSlugMatches) {
+    const p = getProductBySlug(s);
+    if (p) {
+      cardCollector.set(p.slug, toProductCard(p));
+      if (prefetchBlocks.length < 6) prefetchBlocks.push(summarizeProductForLlm(p));
+    }
+  }
+
+  let angles: string[] = [];
+  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !CART_OR_ORDER_DIRECT_RE.test(userText)) {
+    const tLocal = performance.now();
+    const localDirect = searchProductsDetailed({ q: userText, pageSize: 6 });
+    if (localDirect.items.length >= 2 || (localDirect.items.length === 1 && userText.length <= 28)) {
+      const localMs = Math.max(1, Math.round(performance.now() - tLocal));
+      for (const p of localDirect.items) {
+        if (cardCollector.size < 12) cardCollector.set(p.slug, toProductCard(p));
+        if (prefetchBlocks.length < 6) prefetchBlocks.push(summarizeProductForLlm(p));
+      }
+      emitMcpEvent({
+        tool: "ask_brain",
+        audience: "user",
+        rawArg: userText,
+        hits: localDirect.items.slice(0, 4).map((p) => ({ slug: p.slug, title: p.nameTh, folder: "product" })),
+        totalHits: localDirect.total,
+        ms: localMs,
+      });
+      yield {
+        type: "team",
+        job: {
+          id: jobSeq++,
+          worker: "product",
+          label: "ค้นสมองด่วน",
+          task: userText.slice(0, 50),
+          state: "done",
+          ms: localMs,
+          count: localDirect.total,
+        },
+      };
+      if (cardCollector.size > 0) {
+        const cardsArr = [...cardCollector.values()];
+        yield { type: "cards", cards: cardsArr };
+        yield {
+          type: "stage",
+          mode: cardsArr.length === 1 ? "spotlight" : "showcase",
+          spotlight: cardsArr[0] ?? null,
+          title: `สินค้าตามบริบท: "${userText.slice(0, 40)}"`,
+        };
+      }
+    } else {
+      angles = await planSwarmQueries(userText, history, cfg);
+    }
+  }
 
   if (angles.length > 0) {
     const planId = jobSeq++;
@@ -596,8 +621,8 @@ export async function* runNongTeeTurn(opts: {
     const tSwarm = performance.now();
     const angleResults = await Promise.all(
       swarmJobs.map(async (sj) => {
-        const prodRes = searchProductsDetailed({ q: sj.angle, pageSize: 8 });
-        const brainHits = search(sj.angle, 4, "all").filter((h) => h.folder !== "product");
+        const prodRes = searchProductsDetailed({ q: sj.angle, pageSize: 6 });
+        const brainHits = search(sj.angle, 2, "all").filter((h) => h.folder !== "product");
         return { sj, prodRes, brainHits, ms: Math.max(1, Math.round(performance.now() - tSwarm)) };
       }),
     );
@@ -605,14 +630,14 @@ export async function* runNongTeeTurn(opts: {
     const seenSlugs = new Set<string>();
     for (const ar of angleResults) {
       for (const p of ar.prodRes.items) {
-        if (cardCollector.size < 16) cardCollector.set(p.slug, toProductCard(p));
-        if (!seenSlugs.has(p.slug) && seenSlugs.size < 10) {
+        if (cardCollector.size < 12) cardCollector.set(p.slug, toProductCard(p));
+        if (!seenSlugs.has(p.slug) && seenSlugs.size < 6) {
           seenSlugs.add(p.slug);
           prefetchBlocks.push(summarizeProductForLlm(p));
         }
       }
-      for (const bh of ar.brainHits.slice(0, 2)) {
-        prefetchBlocks.push(`• [โหนดสมอง ${bh.folder}] ${bh.title} (${bh.slug}) — ${bh.snippet}`);
+      for (const bh of ar.brainHits.slice(0, 1)) {
+        prefetchBlocks.push(`• [${bh.folder}] ${bh.title} (${bh.slug})`);
       }
       emitMcpEvent({
         tool: "ask_brain",
@@ -661,22 +686,22 @@ export async function* runNongTeeTurn(opts: {
 
   const contextBlock = [
     formatCartContext(currentCart),
-    customerSummary ? `ข้อมูลผู้สั่งซื้อที่บันทึกไว้แล้ว: ${customerSummary}` : "ข้อมูลผู้สั่งซื้อ: (ยังไม่ได้ระบุ)",
+    customerSummary ? `ผู้รับ: ${customerSummary}` : "ผู้รับ: (ยังไม่ระบุ)",
     prefetchBlocks.length
-      ? `ผลค้นสมองสินค้า (${st.totalProducts} สินค้าในคลัง):\n${prefetchBlocks.join("\n\n")}`
-      : `คลังสมองมีทั้งหมด ${st.totalProducts} สินค้า สามารถเรียก search_products เพิ่มเติมได้หากต้องการ`,
-  ].join("\n\n");
+      ? `สินค้าที่พบ:\n${prefetchBlocks.join("\n")}`
+      : `คลังมี ${st.totalProducts} สินค้า (กด search_products ได้)`,
+  ].join("\n");
 
   const llmMessages: Array<Record<string, unknown>> = [
     { role: "system", content: NONG_TEE_SYSTEM_PROMPT },
-    ...history.map((m) => ({ role: m.role, content: m.content })),
+    ...history,
     {
       role: "user",
-      content: `${userText}\n\n(สถานะระบบปัจจุบัน:\n${contextBlock}\nหมายเหตุ: ใช้ราคาและข้อมูลจริงจากสมองเท่านั้น หากลูกค้าสั่งเพิ่ม/ลด/ลบ/ดูตะกร้า หรือปิดการขาย ต้องเรียก tool ที่เกี่ยวข้องก่อนตอบเสมอ และคั่นคำพูดกับรายละเอียดบนจอด้วยบรรทัด [จอ])`,
+      content: `${userText}\n\n[${contextBlock}]`,
     },
   ];
 
-  const MAX_ROUNDS = 3;
+  const MAX_ROUNDS = 2;
   let spokenAcc = "";
   let screenAcc = "";
   let speechSentenceBuf = "";
@@ -980,8 +1005,8 @@ export async function* runNongTeeTurn(opts: {
               yield { type: "stage", mode: "spotlight", spotlight: pCard, title: pCard.title };
             }
             yield { type: "cards", cards: [...cardCollector.values()] };
-            const note = getNote(resolved.product.slug);
-            toolOut = note ? note.body.slice(0, 4000) : summarizeProductForLlm(resolved.product);
+            const rp = resolved.product;
+            toolOut = `${summarizeProductForLlm(rp)}${rp.ingredients ? ` | ส่วนประกอบ:${rp.ingredients.slice(0, 140)}` : ""}`;
           } else {
             okState = "none";
             toolOut = `ไม่พบสินค้า "${id}"`;
