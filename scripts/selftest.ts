@@ -184,7 +184,8 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   assert.deepEqual(parseBareQuantity("สิบแพ็คครับ"), { qty: 10, afterQty: "แพ็คครับ" });
   assert.deepEqual(parseBareQuantity("เอา 3"), { qty: 3, afterQty: "" });
   assert.equal(parseBareQuantity("มีน้ำปลาไหม"), null);
-  const { mentionsCardNumber } = await import("../lib/numbered-order.ts");
+  const { mentionsCardNumber, cardNumbersIn } = await import("../lib/numbered-order.ts");
+  assert.deepEqual(cardNumbersIn("ขอดูรายละเอียดเบอร์ 9 กับเบอร์ 2", 12), [9, 2], "numbered cards beyond 6 are found");
   assert.equal(mentionsCardNumber("เบอร์ 2 กับเบอร์ 3 ต่างกันยังไง", 6), true, "talking about on-screen numbers keeps the screen");
   assert.equal(mentionsCardNumber("เบอร์ 9 ราคาเท่าไหร่", 6), false);
   assert.equal(mentionsCardNumber("มีฟูซิลี่เบอร์ 309 ไหม", 6), false);
@@ -203,6 +204,12 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   ] as const) assert.equal(id(t), want, t);
   assert.deepEqual(cmd("ย้อนกลับสองหน้าครับ"), { id: "back", no: 2 });
   assert.deepEqual(cmd("ขยายเบอร์ 12 ให้ดูหน่อย"), { id: "open_no", no: 12 });
+  // "ขอดูรายละเอียด" must open the card the customer said, never an AI guess
+  assert.deepEqual(cmd("ขอดูรายละเอียดเบอร์ 8"), { id: "open_no", no: 8 });
+  assert.deepEqual(cmd("ดูรายละเอียดเบอร์สามครับ"), { id: "open_no", no: 3 });
+  assert.deepEqual(cmd("ขอดูข้อมูลอันที่สอง"), { id: "open_no", no: 2 });
+  assert.deepEqual(cmd("ขอดูรายละเอียดหน่อย"), { id: "details" });
+  assert.equal(cmd("รายละเอียดน้ำปลา"), null);
   assert.equal(id("ปิด"), null, "bare close only when a popup is open");
   assert.equal(id("ปิด", true), "close");
   for (const t of ["เอาเบอร์ 3", "เอาเบอร์ 5 10 ชิ้น", "เบอร์ 3 ราคาเท่าไหร่", "กลับไปดูน้ำปลา", "ลบเบอร์ 2 ออกจากตะกร้า", "ขอดูบะหมี่"])

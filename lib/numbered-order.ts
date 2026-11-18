@@ -97,12 +97,15 @@ export function parseNumberedOrder(text: string, cardsOnScreen: number): Numbere
   return isOrder ? picks : null;
 }
 
-/** True when the sentence points at a numbered card that is on screen ("เบอร์ 2 กับเบอร์ 3 ต่างกันยังไง"). */
+/** On-screen card numbers the sentence points at ("เบอร์ 2 กับเบอร์ 3 ต่างกันยังไง" -> [2, 3]). */
+export function cardNumbersIn(text: string, cardsOnScreen: number): number[] {
+  const nos = [...text.matchAll(PICK_RE)].map((m) => parseThaiNumber(m[1]) ?? 0);
+  return [...new Set(nos.filter((no) => no >= 1 && no <= cardsOnScreen))];
+}
+
+/** True when the sentence points at a numbered card that is on screen. */
 export function mentionsCardNumber(text: string, cardsOnScreen: number): boolean {
-  return [...text.matchAll(PICK_RE)].some((m) => {
-    const no = parseThaiNumber(m[1]) ?? 0;
-    return no >= 1 && no <= cardsOnScreen;
-  });
+  return cardNumbersIn(text, cardsOnScreen).length > 0;
 }
 
 /** Answer to "รับกี่แพ็คดีครับ": "10", "สิบแพ็คครับ", "เอา 2 ลัง". */

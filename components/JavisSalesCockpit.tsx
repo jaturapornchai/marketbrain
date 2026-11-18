@@ -1142,6 +1142,14 @@ export default function JavisSalesCockpit({
       case "open_no":
         if (!showCard((cmd.no ?? 0) - 1)) reply = `บนจอมีเบอร์ 1 ถึง ${cards.length} ครับ ไม่มีเบอร์ ${cmd.no}`;
         break;
+      case "details": {
+        // Never guess: open the product already in spotlight, or the only card, else ask for the number.
+        const cur = stageMode === "spotlight" ? spotIdx() : -1;
+        if (cur >= 0) showCard(cur);
+        else if (cards.length === 1) showCard(0);
+        else reply = cards.length > 1 ? `ดูรายละเอียดเบอร์ไหนครับ บนจอมีเบอร์ 1 ถึง ${cards.length}` : "ยังไม่มีสินค้าบนจอครับ บอกชื่อสินค้าที่อยากดูได้เลยครับ";
+        break;
+      }
       case "compare":
         if (latestTurn?.screenMarkdown) {
           setStageMode("compare");

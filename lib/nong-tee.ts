@@ -22,7 +22,7 @@ import {
   type UnitOptionCard,
 } from "./product-card";
 import { SCREEN_COMMAND_IDS } from "./voice-commands";
-import { mentionsCardNumber, parseBareQuantity, parseNumberedOrder, type NumberedPick } from "./numbered-order";
+import { cardNumbersIn, mentionsCardNumber, parseBareQuantity, parseNumberedOrder, type NumberedPick } from "./numbered-order";
 import {
   brainStats,
   getProductBySlug,
@@ -720,9 +720,12 @@ export async function* runNongTeeTurn(opts: {
   if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && focusItems.length > 0 && (!productQuery || mentionsCardNumber(userText, focusItems.length))) {
     // Follow-up turn: keep talking about what is on screen (0 search, 0 planner tokens)
     prefetchLabel = "สินค้าบนจอที่ลูกค้ากำลังพูดต่อ (เรียงตามลำดับบนจอ)";
-    for (const p of focusItems) {
-      cardCollector.set(p.slug, toProductCard(p));
-      if (prefetchBlocks.length < 6) prefetchBlocks.push(summarizeProductForLlm(p));
+    for (const p of focusItems) cardCollector.set(p.slug, toProductCard(p));
+    // Cards the customer names by number go first, so "รายละเอียดเบอร์ 9" is never cut by the 6-block cap.
+    const pickedNos = cardNumbersIn(userText, focusItems.length);
+    const picked = pickedNos.map((no) => focusItems[no - 1]);
+    for (const p of [...picked, ...focusItems.filter((p) => !picked.includes(p))]) {
+      if (prefetchBlocks.length < Math.max(6, picked.length)) prefetchBlocks.push(summarizeProductForLlm(p));
     }
     yield {
       type: "team",
@@ -945,7 +948,7 @@ export async function* runNongTeeTurn(opts: {
             ...history.map((m) => ({ role: m.role, content: m.content })),
             {
               role: "user",
-              content: `${userText}\n\nสถานะล่าสุดหลังดำเนินการ:\n${formatCartContext(currentCart)}\n\n${extraToolLogs.join("\n\n")}\n\n${prefetchBlocks.slice(0, 6).join("\n\n")}\n\n(ระบบ: ดำเนินการเครื่องมือครบแล้ว ไม่มีเครื่องมือให้เรียกอีก ยึดสถานะตะกร้าข้างบนเป็นความจริงเท่านั้น ถ้าของที่ลูกค้าสั่งยังไม่อยู่ในตะกร้า ห้ามบอกว่าใส่แล้ว ให้บอกตรงๆ แล้วถามยืนยันสินค้า ตอบสรุปให้ลูกค้าฟังอย่างเป็นธรรมชาติและใส่รายละเอียดหลังบรรทัด [จอ] ทันที)`,
+              content: `${userText}\n\nสถานะล่าสุดหลังดำเนินการ:\n${formatCartContext(currentCart)}\n\n${extraToolLogs.join("\n\n")}\n\n${prefetchBlocks.slice(0, 6).map(withCardNo).join("\n\n")}\n\n(ระบบ: ดำเนินการเครื่องมือครบแล้ว ไม่มีเครื่องมือให้เรียกอีก ยึดสถานะตะกร้าข้างบนเป็นความจริงเท่านั้น ถ้าของที่ลูกค้าสั่งยังไม่อยู่ในตะกร้า ห้ามบอกว่าใส่แล้ว ให้บอกตรงๆ แล้วถามยืนยันสินค้า ตอบสรุปให้ลูกค้าฟังอย่างเป็นธรรมชาติและใส่รายละเอียดหลังบรรทัด [จอ] ทันที)`,
             },
           ]
         : llmMessages;
