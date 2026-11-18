@@ -190,4 +190,23 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   assert.equal(mentionsCardNumber("มีฟูซิลี่เบอร์ 309 ไหม", 6), false);
 }
 
+// ---------- Hands-free screen control: whole-sentence commands only, everything else goes to the AI ----------
+{
+  const { parseScreenCommand: cmd } = await import("../lib/voice-commands.ts");
+  const id = (t: string, modalOpen = false) => cmd(t, { modalOpen })?.id ?? null;
+  for (const [t, want] of [
+    ["ถอยกลับไป", "back"], ["หน้าที่แล้ว", "back"], ["น้องตี๋ช่วยย้อนกลับหน่อยครับ", "back"],
+    ["เดินหน้า", "forward"], ["หน้าถัดไป", "forward"], ["กลับหน้าแรก", "home"],
+    ["ดูเบอร์ 3", "open_no"], ["ตัวถัดไป", "next_item"], ["ดูตระกร้า", "cart"], ["เช็คบิล", "checkout"],
+    ["เปิดกล้อง", "camera"], ["เลื่อนลง", "scroll_down"], ["หยุด", "stop_talk"], ["พูดอีกที", "repeat"],
+    ["ปิดไมค์", "mic_off"], ["สั่งอะไรได้บ้าง", "help"],
+  ] as const) assert.equal(id(t), want, t);
+  assert.deepEqual(cmd("ย้อนกลับสองหน้าครับ"), { id: "back", no: 2 });
+  assert.deepEqual(cmd("ขยายเบอร์ 12 ให้ดูหน่อย"), { id: "open_no", no: 12 });
+  assert.equal(id("ปิด"), null, "bare close only when a popup is open");
+  assert.equal(id("ปิด", true), "close");
+  for (const t of ["เอาเบอร์ 3", "เอาเบอร์ 5 10 ชิ้น", "เบอร์ 3 ราคาเท่าไหร่", "กลับไปดูน้ำปลา", "ลบเบอร์ 2 ออกจากตะกร้า", "ขอดูบะหมี่"])
+    assert.equal(id(t), null, `not a screen command: ${t}`);
+}
+
 console.log(`✓ MarketBrain selftest passed (${stats.totalProducts} products, ${stats.totalNotes} notes, ${stats.totalSynapses} synapses, order=${testOrder.orderNo})`);

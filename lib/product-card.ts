@@ -38,6 +38,8 @@ export type JavisProductCard = {
   unitOptions: UnitOptionCard[];
 };
 
+import type { ScreenCommand } from "./voice-commands";
+
 export type JavisStageMode =
   | "welcome"
   | "showcase"
@@ -79,6 +81,7 @@ export type JavisStreamEvent =
   | { type: "ask_qty"; product: JavisProductCard }
   /** Something the system just did (or needs to ask) for a spoken order by card number; drives the on-screen animation. */
   | { type: "action"; kind: "add" | "ask" | "unknown"; no: number; slug?: string; text: string }
+  | { type: "ui"; command: ScreenCommand }
   | { type: "customer"; customer: Partial<CustomerCheckoutInfo> }
   | { type: "order"; order: SalesOrder }
   | { type: "delta"; section: "speech" | "screen"; text: string }

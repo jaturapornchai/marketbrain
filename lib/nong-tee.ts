@@ -21,6 +21,7 @@ import {
   type JavisTeamJob,
   type UnitOptionCard,
 } from "./product-card";
+import { SCREEN_COMMAND_IDS } from "./voice-commands";
 import { mentionsCardNumber, parseBareQuantity, parseNumberedOrder, type NumberedPick } from "./numbered-order";
 import {
   brainStats,
@@ -220,6 +221,7 @@ const NONG_TEE_SYSTEM_PROMPT = `คุณคือ "น้องตี๋" พ�
 - เปลี่ยนจำนวน -> \`cart_update\` | ลบของ -> \`cart_remove\` | ขอดูตะกร้า -> \`cart_view\`
 - ลูกค้าขอคิดเงิน/เช็กบิลแต่ยังขาดชื่อ/เบอร์/วิธีจ่าย -> \`checkout_prepare\` แล้วถามสั้นๆ | แจ้งข้อมูลหรือยืนยันสั่งซื้อแล้ว -> \`place_order\` ทันที
 - คิดเลขเพิ่มต้องกด \`calc\` เสมอ
+- ลูกค้าสั่งควบคุมหน้าจอ (ถอยกลับ เดินหน้า เปิดดูเบอร์ไหน เลื่อนจอ เปิดกล้อง หยุดพูด ฯลฯ) -> \`screen_control\` ทันที แล้วตอบสั้นๆ ว่าทำแล้ว
 - ถ้าจะเรียกเครื่องมือ ให้เรียกเลยโดยยังไม่ต้องพูด แล้วค่อยพูดสรุปทีเดียวหลังได้ผล
 
 รูปแบบคำตอบ (คั่นด้วยบรรทัด \`[จอ]\` เสมอ):
@@ -376,6 +378,21 @@ const TOOL_SPECS = [
         type: "object",
         properties: { expressions: { type: "string" } },
         required: ["expressions"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "screen_control",
+      description: "ควบคุมหน้าจอแทนการแตะเมาส์ (back=ถอยกลับ forward=เดินหน้า open_no=เปิดดูเบอร์ no ฯลฯ)",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", enum: [...SCREEN_COMMAND_IDS] },
+          no: { type: "integer", description: "เบอร์สินค้า หรือจำนวนหน้าที่ถอย/เดินหน้า" },
+        },
+        required: ["command"],
       },
     },
   },
@@ -1215,6 +1232,19 @@ export async function* runNongTeeTurn(opts: {
           } else {
             okState = "none";
             toolOut = `ไม่พบโหนด "${slug}"`;
+          }
+        } else if (c.name === "screen_control") {
+          workerKind = "planner";
+          jobLabel = "ควบคุมหน้าจอ";
+          const id = SCREEN_COMMAND_IDS.find((x) => x === args.command);
+          const no = Number.isInteger(args.no) && Number(args.no) > 0 && Number(args.no) <= 99 ? Number(args.no) : undefined;
+          if (id) {
+            stageSetExplicitly = true;
+            yield { type: "ui", command: no ? { id, no } : { id } };
+            toolOut = "ทำบนหน้าจอแล้ว";
+          } else {
+            okState = "none";
+            toolOut = "ไม่รู้จักคำสั่งหน้าจอนี้";
           }
         } else if (c.name === "brain_overview") {
           workerKind = "brain";

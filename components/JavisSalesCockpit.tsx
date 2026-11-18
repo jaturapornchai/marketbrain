@@ -12,6 +12,8 @@ import type {
   JavisTeamJob,
 } from "@/lib/product-card";
 import { BARGE_FRAMES, EchoGuard, playedLevel, wavEnvelope } from "@/lib/echo-guard";
+import { parseScreenCommand, screenCommandHelp, type ScreenCommand } from "@/lib/voice-commands";
+import { useRouter } from "next/navigation";
 import DevicePickerPopover from "./DevicePickerPopover";
 import { useJavis } from "./JavisContext";
 import ProductVisionScanner, { identifyProductFromFile, type VisionLookupResult } from "./ProductVisionScanner";
@@ -30,6 +32,8 @@ type TurnEntry = {
   jobs: JavisTeamJob[];
   model: string;
   error?: string;
+  /** Screen-control command ("ถอยกลับไป"), kept out of the conversation history sent to the AI. */
+  isCommand?: boolean;
 };
 
 type HudState = "idle" | "listening" | "searching" | "thinking" | "speaking" | "error";
@@ -42,7 +46,47 @@ const ECHO_TAIL_MS = 400; // room reverb + output latency after Nong Tee stops s
 const ACTION_FX_MS = 3600; // how long the "what I just did" banner stays
 const ACTION_PICK_MS = 1300; // time to show the picked card before switching to the cart
 
-type ActionFx = { id: string; kind: "add" | "ask" | "unknown"; slug?: string; text: string };
+type ActionFx = { id: string; kind: "add" | "ask" | "unknown" | "cmd"; slug?: string; text: string };
+
+// One remembered screen, so "ถอยกลับไป" / "เดินหน้า" can move through what the customer has seen.
+type ScreenSnap = {
+  mode: JavisStageMode;
+  cards: JavisProductCard[];
+  spotlight: JavisProductCard | null;
+  title: string;
+};
+const SCREEN_HISTORY_MAX = 40;
+const SCREEN_SETTLE_MS = 700; // a screen counts as "seen" after it stays this long
+
+const MODE_LABEL: Record<JavisStageMode, string> = {
+  welcome: "หน้าแรก",
+  showcase: "ภาพสินค้า",
+  spotlight: "เจาะลึกสินค้า",
+  compare: "ตารางเปรียบเทียบ",
+  camera: "กล้องหาสินค้า",
+  cart: "ตะกร้า",
+  checkout: "หน้าปิดการขาย",
+  order_confirmed: "ใบยืนยันสั่งซื้อ",
+};
+
+function snapKey(x: ScreenSnap): string {
+  const mode = x.mode === "welcome" ? "showcase" : x.mode;
+  const cards = x.cards.slice(0, 12).map((c) => c.slug).join(",");
+  return `${mode}|${mode === "spotlight" ? (x.spotlight?.slug ?? "") : ""}|${cards}`;
+}
+
+function snapLabel(x: ScreenSnap): string {
+  if (x.mode === "spotlight" && x.spotlight) return x.spotlight.title;
+  if (x.mode === "showcase" || x.mode === "welcome") return x.title || MODE_LABEL.showcase;
+  return MODE_LABEL[x.mode];
+}
+
+/** "฿1,234.50" -> "1,234.50 บาท" for the voice. */
+function bahtSpoken(formatted: string): string {
+  return `${formatted.replace(/฿\s*/, "").replace(/\.00$/, "")} บาท`;
+}
+
+const COMMAND_HELP = screenCommandHelp();
 
 const QUICK_SCENARIOS = [
   { icon: "🌶️", label: "น้ำจิ้ม/ซอส ไม่ใส่ผงชูรส", prompt: "ตี๋ หาน้ำจิ้มไก่หรือซอสที่ไม่ใส่ผงชูรสให้หน่อยครับ" },
@@ -92,6 +136,13 @@ export default function JavisSalesCockpit({
   const actionFxTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const stageCardsRef = useRef(stageCards);
   stageCardsRef.current = stageCards;
+  const router = useRouter();
+  const [screenHist, setScreenHist] = useState<{ list: ScreenSnap[]; idx: number }>({ list: [], idx: -1 });
+  const screenHistRef = useRef(screenHist);
+  screenHistRef.current = screenHist;
+  const [helpOpen, setHelpOpen] = useState(false);
+  const modalOpenRef = useRef(false);
+  const runScreenCommandRef = useRef<(cmd: ScreenCommand, heard?: string) => void>(() => {});
   const qtyModalSlugRef = useRef("");
   qtyModalSlugRef.current = qtyModalProduct?.slug ?? "";
   const [lastChangedSlug, setLastChangedSlug] = useState<string>("");
@@ -329,6 +380,17 @@ export default function JavisSalesCockpit({
       },
     ) => {
       const q = rawText.trim();
+      // "ถอยกลับไป", "ดูเบอร์ 3", "เลื่อนลง" ... run on the screen at once (no AI, works even while busy).
+      const screenCmd =
+        q && !extra?.visionSlugs
+          ? parseScreenCommand(q, { modalOpen: Boolean(qtyModalSlugRef.current) || modalOpenRef.current })
+          : null;
+      if (screenCmd) {
+        setInput("");
+        setLiveUserHeard("");
+        runScreenCommandRef.current(screenCmd, q);
+        return;
+      }
       if (!q || busyRef.current) return;
 
       stopAllAudioPlayback();
@@ -345,7 +407,7 @@ export default function JavisSalesCockpit({
 
       const turnId = `turn-${Date.now()}`;
       // Token-Saver Mode: send only last 2 turns' spoken text (never send large [จอ] markdown tables)
-      const historyPayload: JavisChatMessage[] = turns.slice(-2).flatMap((t) => [
+      const historyPayload: JavisChatMessage[] = turns.filter((t) => !t.isCommand).slice(-2).flatMap((t) => [
         { role: "user" as const, content: t.userText.slice(0, 200) },
         { role: "assistant" as const, content: t.spokenText.slice(0, 240) },
       ]);
@@ -443,6 +505,9 @@ export default function JavisSalesCockpit({
               if (ev.lastChangedSlug) setLastChangedSlug(ev.lastChangedSlug);
             } else if (ev.type === "ask_qty") {
               promptAddToCart(ev.product);
+            } else if (ev.type === "ui") {
+              // Nong Tee understood a free-form screen command; he speaks his own reply.
+              runScreenCommandRef.current(ev.command);
             } else if (ev.type === "action") {
               const fx: ActionFx = { id: `${turnId}-${ev.no}-${ev.kind}-${performance.now()}`, kind: ev.kind, slug: ev.slug, text: ev.text };
               setActionFx((prev) => [...prev.slice(-2), fx]);
@@ -978,7 +1043,217 @@ export default function JavisSalesCockpit({
     setStatusText(`คัดลอกสรุปใบสั่งซื้อ #${ord.orderNo} ลงคลิปบอร์ดแล้วครับ`);
   };
 
-  const latestTurn = turns.length ? turns[turns.length - 1] : null;
+  // Remember each screen the customer settles on, so voice "ถอยกลับไป" / "เดินหน้า" can move through them.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const snap: ScreenSnap = { mode: stageMode, cards: stageCards, spotlight, title: stageTitle };
+      setScreenHist((h) => {
+        const cur = h.list[h.idx];
+        if (cur && snapKey(cur) === snapKey(snap)) return h;
+        const list = [...h.list.slice(0, h.idx + 1), snap].slice(-SCREEN_HISTORY_MAX);
+        return { list, idx: list.length - 1 };
+      });
+    }, SCREEN_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [stageMode, stageCards, spotlight, stageTitle]);
+
+  modalOpenRef.current = ordersModalOpen || helpOpen;
+
+  const goScreenHistory = useCallback((delta: number): ScreenSnap | null => {
+    const h = screenHistRef.current;
+    const target = Math.max(0, Math.min(h.list.length - 1, h.idx + delta));
+    if (target === h.idx || !h.list[target]) return null;
+    const snap = h.list[target];
+    setStageCards(snap.cards);
+    setSpotlight(snap.spotlight);
+    setStageMode(snap.mode);
+    setStageTitle(snap.title);
+    setScreenHist({ list: h.list, idx: target });
+    return snap;
+  }, []);
+
+  const scrollStage = useCallback((where: "down" | "up" | "top" | "bottom") => {
+    const body = document.querySelector<HTMLElement>(".jc-stage-body");
+    const inBody = Boolean(body && body.scrollHeight > body.clientHeight + 4);
+    const el: HTMLElement | Window = inBody && body ? body : window;
+    const page = (inBody && body ? body.clientHeight : window.innerHeight) * 0.75;
+    const bottom = inBody && body ? body.scrollHeight : document.documentElement.scrollHeight;
+    if (where === "top") el.scrollTo({ top: 0, behavior: "smooth" });
+    else if (where === "bottom") el.scrollTo({ top: bottom, behavior: "smooth" });
+    else el.scrollBy({ top: where === "down" ? page : -page, behavior: "smooth" });
+  }, []);
+
+  const runScreenCommand = (cmd: ScreenCommand, heard?: string) => {
+    const cards = stageCardsRef.current;
+    let reply = "";
+    let speak = true;
+    const showCard = (idx: number) => {
+      const c = cards[idx];
+      if (!c) return false;
+      setSpotlight(c);
+      setStageMode("spotlight");
+      setStageTitle(c.title);
+      const price = c.bestPrice ? `ราคา ${c.bestPrice.replace(/\.00$/, "")} บาท ต่อ${c.unitLabel}` : "";
+      reply = `เบอร์ ${idx + 1} ${c.title} ${price}ครับ`;
+      return true;
+    };
+    const spotIdx = () => cards.findIndex((c) => c.slug === spotlight?.slug);
+    const moveHistory = (dir: -1 | 1) => {
+      const steps = Math.min(cmd.no ?? 1, 20);
+      const snap = goScreenHistory(dir * steps);
+      if (snap) reply = `${dir < 0 ? "ถอยกลับไป" : "เดินหน้าไป"}ที่ ${snapLabel(snap)} แล้วครับ`;
+      else reply = dir < 0 ? "ถอยกลับไม่ได้แล้วครับ นี่คือหน้าแรกสุดที่ดูมา" : "เดินหน้าไม่ได้แล้วครับ นี่คือหน้าล่าสุด";
+    };
+    const moveItem = (dir: -1 | 1) => {
+      const cur = stageMode === "spotlight" ? spotIdx() : -1;
+      const next = cur < 0 ? 0 : cur + dir;
+      if (!showCard(next)) reply = dir > 0 ? `นี่คือตัวสุดท้ายแล้วครับ บนจอมี ${cards.length} เบอร์` : "นี่คือเบอร์ 1 ตัวแรกแล้วครับ";
+    };
+
+    switch (cmd.id) {
+      case "back":
+        moveHistory(-1);
+        break;
+      case "forward":
+        moveHistory(1);
+        break;
+      case "next":
+        if (stageMode === "spotlight") moveItem(1);
+        else moveHistory(1);
+        break;
+      case "next_item":
+        moveItem(1);
+        break;
+      case "prev_item":
+        moveItem(-1);
+        break;
+      case "home":
+        setStageCards(featuredProducts);
+        setSpotlight(featuredProducts[0] ?? null);
+        setStageMode("showcase");
+        setStageTitle("สินค้าแนะนำพร้อมขายในสมอง");
+        scrollStage("top");
+        reply = "กลับหน้าแรกแล้วครับ";
+        break;
+      case "showcase":
+        setStageMode("showcase");
+        reply = `บนจอมีสินค้า ${cards.length} เบอร์ครับ พูดว่า ดูเบอร์ไหน หรือ เอาเบอร์ไหนกี่ชิ้น ได้เลย`;
+        break;
+      case "open_no":
+        if (!showCard((cmd.no ?? 0) - 1)) reply = `บนจอมีเบอร์ 1 ถึง ${cards.length} ครับ ไม่มีเบอร์ ${cmd.no}`;
+        break;
+      case "compare":
+        if (latestTurn?.screenMarkdown) {
+          setStageMode("compare");
+          reply = "นี่คือตารางเปรียบเทียบครับ";
+        } else reply = "ยังไม่มีตารางเปรียบเทียบครับ ลองพูดว่า เทียบเบอร์ 1 กับเบอร์ 2";
+        break;
+      case "cart":
+        setStageMode("cart");
+        reply = cart.items.length
+          ? `ในตะกร้ามี ${cart.items.length} รายการ ยอดรวม ${bahtSpoken(cart.grandTotalFormatted)}ครับ`
+          : "ตะกร้ายังว่างอยู่ครับ";
+        break;
+      case "checkout":
+        if (!cart.items.length) {
+          setStageMode("cart");
+          reply = "ตะกร้ายังว่างอยู่ครับ เลือกสินค้าก่อนนะครับ";
+        } else {
+          setStageMode("checkout");
+          reply = `ยอดรวม ${bahtSpoken(cart.grandTotalFormatted)}ครับ บอกชื่อ เบอร์โทร และวิธีจ่ายเงินได้เลยครับ`;
+        }
+        break;
+      case "camera":
+        setStageMode("camera");
+        reply = "เปิดกล้องแล้วครับ ยกสินค้าหรือบาร์โค้ดให้กล้องเห็นได้เลย";
+        break;
+      case "camera_close":
+        setStageMode("showcase");
+        reply = "ปิดกล้องแล้วครับ";
+        break;
+      case "scroll_down":
+      case "scroll_up":
+      case "scroll_top":
+      case "scroll_bottom": {
+        const where = cmd.id.slice(7) as "down" | "up" | "top" | "bottom";
+        scrollStage(where);
+        reply = { down: "เลื่อนลง", up: "เลื่อนขึ้น", top: "ขึ้นบนสุด", bottom: "ลงล่างสุด" }[where];
+        speak = false;
+        break;
+      }
+      case "stop_talk":
+        stopAllAudioPlayback();
+        abortRef.current?.abort();
+        reply = "หยุดแล้ว";
+        speak = false;
+        break;
+      case "repeat": {
+        const last = turns.findLast((t) => !t.isCommand && t.spokenText)?.spokenText;
+        reply = last ?? "ยังไม่มีอะไรให้พูดซ้ำครับ";
+        break;
+      }
+      case "mute":
+        stopAllAudioPlayback();
+        setTtsEnabled(false);
+        ttsEnabledRef.current = false;
+        reply = "ปิดเสียงน้องตี๋แล้ว";
+        speak = false;
+        break;
+      case "unmute":
+        setTtsEnabled(true);
+        ttsEnabledRef.current = true;
+        reply = "เปิดเสียงแล้วครับ";
+        break;
+      case "mic_off":
+        stopLiveCall();
+        reply = "ปิดไมค์แล้วครับ กดเปิดไมค์เมื่ออยากคุยต่อนะครับ";
+        break;
+      case "close":
+        closeQtyModal();
+        setOrdersModalOpen(false);
+        setHelpOpen(false);
+        reply = "ปิดแล้วครับ";
+        break;
+      case "orders":
+        void openOrdersHistory();
+        reply = "เปิดบิลขายย้อนหลังให้แล้วครับ";
+        break;
+      case "history": {
+        const h = screenHistRef.current;
+        const recent = h.list.slice(Math.max(0, h.idx - 2), h.idx + 1).map(snapLabel).reverse();
+        document.querySelector(".jc-hist-nav")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        reply = h.list.length
+          ? `ดูมาแล้ว ${h.list.length} หน้าจอครับ ล่าสุดคือ ${recent.join(" ก่อนหน้านั้น ")} พูดว่า ถอยกลับไป เพื่อย้อนดูได้ครับ`
+          : "ยังไม่มีประวัติหน้าจอครับ";
+        break;
+      }
+      case "help":
+        setHelpOpen(true);
+        reply = "นี่คือคำสั่งเสียงทั้งหมดครับ พูดตามตัวอย่างบนจอได้เลย";
+        break;
+      case "page_search":
+      case "page_brain":
+      case "page_notes":
+        router.push({ page_search: "/search", page_brain: "/brain", page_notes: "/n" }[cmd.id]);
+        reply = "กำลังเปิดหน้าให้ครับ";
+        speak = false;
+        break;
+    }
+
+    const fx: ActionFx = { id: `cmd-${performance.now()}`, kind: "cmd", text: reply.replace(/ครับ.*$/, "").trim() || reply };
+    setActionFx((prev) => [...prev.slice(-2), fx]);
+    actionFxTimersRef.current.push(setTimeout(() => setActionFx((prev) => prev.filter((x) => x.id !== fx.id)), ACTION_FX_MS));
+    if (heard === undefined) return; // came from Nong Tee's own reply, he already speaks
+    setTurns((prev) => [
+      ...prev,
+      { id: `cmd-${Date.now()}`, userText: heard, spokenText: reply, screenMarkdown: "", cards: [], jobs: [], model: "คำสั่งเสียง", isCommand: true },
+    ]);
+    if (speak && reply) enqueueOmniVoiceSentence(reply);
+    setHudState(callActiveRef.current ? "listening" : "idle");
+  };
+  runScreenCommandRef.current = runScreenCommand;
+
+  const latestTurn = turns.findLast((t) => !t.isCommand) ?? null;
   const latestJobs = useMemo(() => latestTurn?.jobs ?? [], [latestTurn]);
 
   return (
@@ -1277,6 +1552,32 @@ export default function JavisSalesCockpit({
 
         {/* ==================== CENTER COLUMN: CONTEXT-DRIVEN VISUAL STAGE ==================== */}
         <section className="jc-stage" aria-label="หน้าจอแสดงภาพตามบริบทการสนทนา">
+          <div className="jc-hist-nav" aria-label="ประวัติหน้าจอ">
+            <button
+              type="button"
+              className="jc-hist-btn"
+              disabled={screenHist.idx <= 0}
+              onClick={() => runScreenCommand({ id: "back" })}
+              title='พูดว่า "ถอยกลับไป"'
+            >
+              ◀ ถอยกลับ
+            </button>
+            <span className="jc-hist-pos">
+              หน้าจอ {Math.max(screenHist.idx + 1, 0)}/{screenHist.list.length}
+            </span>
+            <button
+              type="button"
+              className="jc-hist-btn"
+              disabled={screenHist.idx >= screenHist.list.length - 1}
+              onClick={() => runScreenCommand({ id: "forward" })}
+              title='พูดว่า "เดินหน้า"'
+            >
+              เดินหน้า ▶
+            </button>
+            <button type="button" className="jc-hist-btn jc-hist-help" onClick={() => setHelpOpen(true)}>
+              🎙️ คำสั่งเสียง
+            </button>
+          </div>
           <div className="jc-stage-tabs">
             <button
               type="button"
@@ -1330,11 +1631,35 @@ export default function JavisSalesCockpit({
           </div>
 
           <div className="jc-stage-body">
+            {helpOpen && (
+              <div className="jc-help" role="dialog" aria-label="คำสั่งเสียงทั้งหมด">
+                <div className="jc-help-head">
+                  <b>🎙️ พูดสั่งได้เลย ไม่ต้องแตะเมาส์</b>
+                  <button type="button" className="btn" onClick={() => setHelpOpen(false)}>
+                    ปิด
+                  </button>
+                </div>
+                <div className="jc-help-grid">
+                  <div className="jc-help-item">
+                    <b>ใส่ตะกร้าตามเบอร์</b>
+                    <span>“เอาเบอร์ 5 สิบชิ้น” · “เบอร์ 2 สองแพ็ค”</span>
+                  </div>
+                  {COMMAND_HELP.map((c) => (
+                    <div key={c.id} className="jc-help-item">
+                      <b>{c.label}</b>
+                      <span>{c.examples.map((e) => `“${e}”`).join(" · ")}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {actionFx.length > 0 && (
               <div className="jc-action-fx" role="status" aria-live="polite">
                 {actionFx.map((fx) => (
                   <div key={fx.id} className={`jc-action-chip ${fx.kind}`}>
-                    <span className="jc-action-icon">{fx.kind === "add" ? "✅" : fx.kind === "ask" ? "❓" : "⚠️"}</span>
+                    <span className="jc-action-icon">
+                      {fx.kind === "add" ? "✅" : fx.kind === "ask" ? "❓" : fx.kind === "cmd" ? "🤖" : "⚠️"}
+                    </span>
                     <span>{fx.text}</span>
                     {fx.kind === "add" && <span className="jc-action-cart">🛒</span>}
                   </div>
