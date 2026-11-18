@@ -14,7 +14,8 @@
     "sync": "node scripts/sync-brain.ts",
     "test": "node scripts/selftest.ts",
     "uat": "node scripts/uat-e2e.ts",
-    "tunnel": "node deploy/tunnel-supervisor.mjs"
+    "tunnel": "node deploy/tunnel-supervisor.mjs",
+    "redeploy": "powershell -ExecutionPolicy Bypass -File deploy/restart-production.ps1"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
