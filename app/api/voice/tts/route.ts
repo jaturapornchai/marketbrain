@@ -1,3 +1,5 @@
+import { toSpokenThai } from "@/lib/spoken-thai";
+
 export const dynamic = "force-dynamic";
 
 const VOICE_URL = process.env.LOCAL_VOICE_URL || "http://127.0.0.1:3091";
@@ -22,7 +24,8 @@ export async function GET(): Promise<Response> {
 export async function POST(req: Request): Promise<Response> {
   try {
     const body = (await req.json()) as { text?: string };
-    const text = typeof body.text === "string" ? body.text.trim().slice(0, 600) : "";
+    // Say units in full ("155 ก." -> "155 กรัม"); the screen keeps the short form.
+    const text = typeof body.text === "string" ? toSpokenThai(body.text.trim().slice(0, 600)) : "";
     if (!text) return Response.json({ error: "Empty text" }, { status: 400 });
 
     const res = await fetch(`${VOICE_URL}/tts`, {

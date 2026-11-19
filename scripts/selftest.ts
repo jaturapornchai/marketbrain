@@ -228,6 +228,21 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
     ["งบไม่เกินสองพันบาท", "2000"], ["ยกเลิกงบ", "0"], ["น้ำปลาขวดละเท่าไหร่", null],
   ] as const) assert.equal(parseBudget(t, thaiNum), want, t);
 
+  // TTS says units in full, only after a number; brand dots / sizes stay as they are
+  const { toSpokenThai } = await import("../lib/spoken-thai.ts");
+  for (const [t, want] of [
+    ["ปลากระป๋อง 155 ก. x 10 ราคา 275 บาท", "ปลากระป๋อง 155 กรัม แพ็ค 10 ราคา 275 บาท"],
+    ["น้ำจิ้มไก่ 1 กก.", "น้ำจิ้มไก่ 1 กิโลกรัม"],
+    ["นมถั่วเหลือง 300 มล. x 24", "นมถั่วเหลือง 300 มิลลิลิตร แพ็ค 24"],
+    ["อสร. น้ำส้มสายชู 5% 5 ล.", "อสร. น้ำส้มสายชู 5% 5 ลิตร"],
+    ["ดอนเมือง กม.26 แหนม 60 ก.", "ดอนเมือง กม.26 แหนม 60 กรัม"],
+    ["ก.ย. 15 โลชั่น 50 มล.", "ก.ย. 15 โลชั่น 50 มิลลิลิตร"],
+    ["น้ำยาถูพื้น 600 มล. x 3+1", "น้ำยาถูพื้น 600 มิลลิลิตร แพ็ค 3 แถม 1"],
+    ["ขนาด 1.5 ก.ก. ยาว 20 ซม.", "ขนาด 1.5 กิโลกรัม ยาว 20 เซนติเมตร"],
+    ["ถุงขยะ 18x20 นิ้ว", "ถุงขยะ 18x20 นิ้ว"],
+    ["ของแห้ง ฯลฯ", "ของแห้ง และอื่นๆ"],
+  ] as const) assert.equal(toSpokenThai(t), want, t);
+
   // Coupons: Decimal discount, minSpend, cap, idempotent, never below ฿0, spoken commands
   const promo = await import("../lib/promotions.ts");
   const base = { subtotal: "1234.55", grandTotal: "1234.55", grandTotalFormatted: "฿1,234.55" };
