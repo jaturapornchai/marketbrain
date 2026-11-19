@@ -1,7 +1,7 @@
 // Spoken "order by card number" commands, e.g. "เอาเบอร์ 5 10 ชิ้น", "เบอร์สามสองแพ็ค เบอร์ 1 หนึ่งลัง".
 // Pure text parsing (no LLM, no DB) so the action is exact and instant.
 
-const NUM_WORDS = "หนึ่ง|เอ็ด|สอง|ยี่|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ|ร้อย|พัน";
+export const NUM_WORDS = "หนึ่ง|เอ็ด|สอง|ยี่|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ|ร้อย|พัน";
 const NUM = `(\\d{1,4}(?!\\d)|(?:${NUM_WORDS})+)`;
 const NUM_WORD_RE = new RegExp(NUM_WORDS, "g");
 const DIGIT_OF: Record<string, number> = { หนึ่ง: 1, เอ็ด: 1, สอง: 2, ยี่: 2, สาม: 3, สี่: 4, ห้า: 5, หก: 6, เจ็ด: 7, แปด: 8, เก้า: 9 };

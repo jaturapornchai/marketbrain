@@ -14,6 +14,7 @@ import {
   type RelationType,
 } from "./groups";
 import { compareMoney, formatThaiBaht, moneyInRange } from "./decimal-money";
+import { buildHeardVocab, type HeardVocab } from "./heard-fix";
 import { NUTRITION_KEY_THAI, SOURCE_THAI_LABEL, toCleanSlug } from "./trait-dictionary";
 import {
   readCachedBrainSnapshot,
@@ -1307,6 +1308,15 @@ function getBundle(): VaultBundle {
     bundleCache = buildBundleFromSnapshot(ensureSnapshotSync());
   }
   return bundleCache;
+}
+
+let heardVocabCache: { products: BrainProductItem[]; vocab: HeardVocab } | null = null;
+
+/** Brand and product words the listener snaps misheard words to; rebuilt only when the brain is reloaded. */
+export function heardVocab(): HeardVocab {
+  const products = getBundle().productsList;
+  if (heardVocabCache?.products !== products) heardVocabCache = { products, vocab: buildHeardVocab(products) };
+  return heardVocabCache.vocab;
 }
 
 export async function refreshBrainFromDatabase(): Promise<BrainStats> {

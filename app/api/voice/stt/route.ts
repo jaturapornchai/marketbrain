@@ -1,6 +1,18 @@
+import { fixHeard } from "@/lib/heard-fix";
+import { heardVocab } from "@/lib/vault";
+
 export const dynamic = "force-dynamic";
 
 const VOICE_URL = process.env.LOCAL_VOICE_URL || "http://127.0.0.1:3091";
+
+/** Misheard words -> the system's own spelling. A failure here must never lose what the customer said. */
+function correctHeard(text: string): string {
+  try {
+    return fixHeard(text, heardVocab());
+  } catch {
+    return text;
+  }
+}
 
 export async function POST(req: Request): Promise<Response> {
   try {
@@ -26,6 +38,11 @@ export async function POST(req: Request): Promise<Response> {
       return Response.json({ ok: false, text: "", voiced: false, error: `STT ${res.status}` }, { status: 502 });
     }
     const payload = (await res.json()) as Record<string, unknown>;
+    // Final transcripts only: partials are just the live caption and are replaced within a second.
+    if (partial !== "1" && typeof payload.text === "string" && payload.text.trim()) {
+      const text = correctHeard(payload.text);
+      if (text !== payload.text) return Response.json({ ok: true, ...payload, text, heard: payload.text });
+    }
     return Response.json({ ok: true, ...payload });
   } catch {
     return Response.json({ ok: false, text: "", voiced: false, error: "Local OpenThai STT offline" }, { status: 503 });

@@ -21,6 +21,7 @@ import {
   type JavisTeamJob,
   type UnitOptionCard,
 } from "./product-card";
+import { startsWithUnitSound } from "./heard-fix";
 import { SCREEN_COMMAND_IDS } from "./voice-commands";
 import {
   cardNumbersIn,
@@ -117,7 +118,7 @@ function formatCartContext(cart: CartSummary): string {
 
 // ---------- Order by card number ("เอาเบอร์ 5 10 ชิ้น"): exact, instant, 0 LLM tokens ----------
 const COMMON_UNIT_RE =
-  /^(ลัง|แพ็ค|โหล|ขวด|กระป๋อง|ถุง|ซอง|กล่อง|ห่อ|แผ่น|ก้อน|กิโล|กก|ลิตร|ม้วน|แท่ง|หลอด|ถัง|แกลลอน|ถ้วย|มัด|ใบ|ฟอง|คู่|ชุด|เส้น|ด้าม|กระสอบ|แผง|ขีด)/;
+  /^(ลัง|แพ็ค|โหล|ขวด|กระป๋อง|ถุง|ซอง|กล่อง|ห่อ|แผ่น|ก้อน|กิโล|โล|กก|ลิตร|ม้วน|แท่ง|หลอด|ถัง|แกลลอน|ถ้วย|มัด|ใบ|ฟอง|คู่|ชุด|เส้น|ด้าม|กระสอบ|แผง|ขีด)/;
 const normUnit = (s: string) => s.trim().toLowerCase().replace(/แพ[็]?[คก]/g, "แพ็ค");
 const bahtSpoken = (formatted: string) => formatted.replace("฿", "").replace(/[.]00$/, "") + " บาท";
 
@@ -125,13 +126,18 @@ const bahtSpoken = (formatted: string) => formatted.replace("฿", "").replace(/
 function resolveSpokenUnit(p: BrainProductItem, afterQty: string): { unitCode: string; unitPrice: string } | null {
   if (!p.bestPrice) return null;
   const said = normUnit(afterQty);
-  const named = p.unitConversions
+  const units = p.unitConversions
     .filter((c) => c.pricePerUnit)
     .flatMap((c) => [c.unitNameTh, c.unitCode].filter(Boolean).map((n) => ({ name: normUnit(n), conv: c })))
-    .sort((a, b) => b.name.length - a.name.length)
-    .find((x) => said.startsWith(x.name));
-  if (named) return { unitCode: named.conv.unitNameTh || named.conv.unitCode, unitPrice: named.conv.pricePerUnit ?? p.bestPrice };
+    .sort((a, b) => b.name.length - a.name.length);
+  const priced = (x: (typeof units)[number]) => ({ unitCode: x.conv.unitNameTh || x.conv.unitCode, unitPrice: x.conv.pricePerUnit ?? p.bestPrice! });
+  const named = units.find((x) => said.startsWith(x.name));
+  if (named) return priced(named);
   if (said.startsWith(normUnit(p.unitCode))) return { unitCode: p.unitCode, unitPrice: p.bestPrice };
+  // The listener writes a unit the way it sounds ("สองโล" for "สองโหล"): match by sound, but only this product's own units.
+  const sounded = units.find((x) => startsWithUnitSound(said, x.name));
+  if (sounded) return priced(sounded);
+  if (startsWithUnitSound(said, normUnit(p.unitCode))) return { unitCode: p.unitCode, unitPrice: p.bestPrice };
   // "10 ชิ้น" of a 4-piece pack could mean 10 packs or 10 pieces; a unit this product is not sold in -> ask.
   if (p.packQty > 1 && said.startsWith(normUnit(p.baseUnitCode))) return null;
   if (COMMON_UNIT_RE.test(said)) return null;

@@ -284,4 +284,69 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
     assert.equal(id(t), null, `not a screen command: ${t}`);
 }
 
+// ---------- Misheard words are snapped to the system's spelling before anything decides ----------
+{
+  const { soundKey, fixHeard, buildHeardVocab, startsWithUnitSound } = await import("../lib/heard-fix.ts");
+  const { heardVocab } = await import("../lib/vault.ts");
+  for (const [a, b] of [["ซันไลต์", "สันไลด์"], ["แปรง", "แปลง"], ["ปิดไมค์", "ปิดใหม่"], ["คลาสสิค", "คลาสสิก"], ["โหล", "โล"]])
+    assert.equal(soundKey(a), soundKey(b), `${a} and ${b} are said the same way`);
+  assert.notEqual(soundKey("ขวด"), soundKey("ขาด"));
+
+  // Commands: fixed only when the result is something the system acts on.
+  assert.equal(fixHeard("ปิดใหม่"), "ปิดไมค์");
+  assert.equal(fixHeard("หอยกลับไป"), "ถอยกลับไป");
+  assert.equal(fixHeard("ด่วนเบอร์หนึ่งกับสาม"), "ดวลเบอร์หนึ่งกับสาม", "the silent letter of เบอร์ is not cut off");
+  assert.equal(fixHeard("ปิดกล้องปิดกล้อง"), "ปิดกล้อง", "a sentence written twice is said once");
+  assert.equal(fixHeard("เอาเบอร์ห้าหนึ่งรัง"), "เอาเบอร์ห้าหนึ่งลัง");
+  for (const t of ["ดูตะกร้า", "เอาเบอร์สามสองชิ้น", "งบห้าร้อยบาท", "ขอบคุณครับ", "ราคาเท่าไหร่ครับ", "เอาไว้ก่อนครับ"])
+    assert.equal(fixHeard(t), t, `heard right, left alone: ${t}`);
+
+  // Brand and product words, on a tiny catalogue so the rules are tested, not today's data.
+  const v = buildHeardVocab([
+    { nameTh: "บรีส เอกเซล ผงซักฟอก", brandTh: "บรีส", brandEn: "Breeze" },
+    { nameTh: "บรีส เอกเซล น้ำยาซักผ้า", brandTh: "บรีส", brandEn: "Breeze" },
+    { nameTh: "เลย์ คลาสสิค มันฝรั่งทอด", brandTh: "เลย์", brandEn: "Lay's" },
+    { nameTh: "โอเค คลาสสิก ขนมปัง", brandTh: "โอเค", brandEn: "" },
+    { nameTh: "เบบี้ มายด์ สบู่เหลว เบบี้", brandTh: "เบบี้ มายด์", brandEn: "Babi Mild" },
+    { nameTh: "ดาร์ลี่ ยาสีฟัน สูตรใหม่", brandTh: "ดาร์ลี่", brandEn: "Darlie" },
+    { nameTh: "ซิสเท็มมา แปรงสีฟัน+ยาสีฟัน สูตร", brandTh: "ซิสเท็มมา", brandEn: "Systema" },
+    { nameTh: "ซิสเท็มมา แปรงสีฟัน ขนนุ่ม", brandTh: "ซิสเท็มมา", brandEn: "Systema" },
+    { nameTh: "ดาร์ลี่ แปรงสีฟัน เด็ก", brandTh: "ดาร์ลี่", brandEn: "Darlie" },
+    { nameTh: "ดาร์ลี่ แปรงสีฟัน ผู้ใหญ่", brandTh: "ดาร์ลี่", brandEn: "Darlie" },
+    { nameTh: "ฮีโร่ แปรงสีฟัน กล่อง", brandTh: "ฮีโร่", brandEn: "Hero" },
+  ]);
+  assert.equal(fixHeard("ขอดูบริสผงซักฟอก", v), "ขอดูบรีสผงซักฟอก");
+  assert.equal(fixHeard("ขอดูแปลงสีฟัน", v), "ขอดูแปรงสีฟัน", "three real words that are one common catalogue word");
+  assert.equal(fixHeard("ขอดูมันฝลั่งทอด", v), "ขอดูมันฝรั่งทอด", "not a Thai word: snapped to the catalogue word it sounds like");
+  assert.equal(fixHeard("ขอดูเลยคลาสสิก", v), "ขอดูเลย์ คลาสสิค", "short real words that add up to a brand");
+  assert.equal(fixHeard("ขอดู Breeze", v), "ขอดู บรีส", "brand heard in English");
+  for (const t of [
+    "มีสบู่เหลวเบบี้ไหมครับ", // "เบบี้ไหม" must not become "เบบี้ มายด์"
+    "มียาสีฟันสูตรไหมครับ", // nor "สูตรไหม" -> "สูตรใหม่"
+    "ขอดูแปรงสีฟัน+ยาสีฟัน", // punctuation stays
+    "ขอดูโอเค คลาสสิก ขนมปัง", // another product really spells it "คลาสสิก"
+    "ขอดูดาร์ลี่ ยาสีฟัน",
+    "กล้องไม่ติดครับ", // a real Thai word is not bent into "กล่อง"
+    "กรองน้ำให้หน่อย",
+  ])
+    assert.equal(fixHeard(t, v), t, `heard right, left alone: ${t}`);
+
+  // Units are matched by sound only against the units one product is sold in.
+  assert.ok(startsWithUnitSound("โลครับ", "โหล") && startsWithUnitSound("รัง เบอร์สามสองชิ้น", "ลัง"));
+  assert.ok(!startsWithUnitSound("โลชั่น", "โหล") && !startsWithUnitSound("ขวด", "โหล") && !startsWithUnitSound("ชิ้น", ""));
+
+  // Real brain: names spelled the catalogue's way must come back unchanged.
+  const vocab = heardVocab();
+  const thaiWords = (name: string) => name.split(/\s+/).filter((w) => /^[ก-๙]+$/.test(w)).slice(0, 3);
+  const sample = searchProductsDetailed({ q: "", pageSize: 60 })
+    .items.filter((p) => thaiWords(p.nameTh).length)
+    .map((p) => "ขอดู" + thaiWords(p.nameTh).join(" "));
+  const changed = sample.filter((s) => fixHeard(s, vocab).replace(/\s+/g, "") !== s.replace(/\s+/g, ""));
+  assert.ok(sample.length >= 30 && changed.length <= 1, `catalogue names left alone (${changed.length}/${sample.length} changed: ${changed.join(" | ")})`);
+  assert.equal(fixHeard("ขอดู Roll On", vocab), "ขอดู Roll On", "an English phrase is not a brand one letter away");
+  // Everyday Thai that is not in the catalogue but sounds like something in it stays as it was heard.
+  for (const t of ["ขอดูขนมขบเคี้ยว", "กรุณาเลือกสินค้าก่อนครับ", "ลำโพงเสียงเบาไปหน่อย", "คราวหน้าจะมาสั่งใหม่นะครับ", "ซื้อเพิ่มอีกนิดได้ลดเยอะๆ"])
+    assert.equal(fixHeard(t, vocab), t, `everyday Thai left alone: ${t}`);
+}
+
 console.log(`✓ MarketBrain selftest passed (${stats.totalProducts} products, ${stats.totalNotes} notes, ${stats.totalSynapses} synapses, order=${testOrder.orderNo})`);
