@@ -184,6 +184,19 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   assert.deepEqual(parseBareQuantity("สิบแพ็คครับ"), { qty: 10, afterQty: "แพ็คครับ" });
   assert.deepEqual(parseBareQuantity("เอา 3"), { qty: 3, afterQty: "" });
   assert.equal(parseBareQuantity("มีน้ำปลาไหม"), null);
+  assert.equal(parseBareQuantity("สองร้อยบาท"), null, "money is not a quantity");
+
+  // Product page open on screen: "อันนี้" = that product (the customer may have opened it by hand)
+  const { parsePointedOrder, pointsAtOpenProduct } = await import("../lib/numbered-order.ts");
+  assert.deepEqual(parsePointedOrder("เอาอันนี้สองชิ้น"), { qty: 2, afterQty: "ชิ้น" });
+  assert.deepEqual(parsePointedOrder("รับตัวนี้ 3 แพ็คครับ"), { qty: 3, afterQty: "แพ็คครับ" });
+  assert.deepEqual(parsePointedOrder("ใส่ตะกร้าเลยครับ"), { qty: null, afterQty: "" }, "no quantity -> must ask");
+  assert.deepEqual(parsePointedOrder("เอาอันนี้ใส่ตะกร้า 12 ขวด"), { qty: 12, afterQty: "ขวด" });
+  for (const t of ["เอาอันนี้ออก", "อันนี้ราคาเท่าไหร่", "ตัวนี้มีผงชูรสไหม", "เอาน้ำปลา 2 ขวด", "เอาอันนี้ 200 บาท", "ดูตะกร้า"]) {
+    assert.equal(parsePointedOrder(t), null, t);
+  }
+  assert.equal(pointsAtOpenProduct("ตัวนี้มีผงชูรสไหม"), true);
+  assert.equal(pointsAtOpenProduct("มีน้ำปลาอะไรบ้าง"), false);
   const { mentionsCardNumber, cardNumbersIn } = await import("../lib/numbered-order.ts");
   assert.deepEqual(cardNumbersIn("ขอดูรายละเอียดเบอร์ 9 กับเบอร์ 2", 12), [9, 2], "numbered cards beyond 6 are found");
   assert.equal(mentionsCardNumber("เบอร์ 2 กับเบอร์ 3 ต่างกันยังไง", 6), true, "talking about on-screen numbers keeps the screen");

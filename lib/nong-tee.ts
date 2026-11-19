@@ -22,7 +22,15 @@ import {
   type UnitOptionCard,
 } from "./product-card";
 import { SCREEN_COMMAND_IDS } from "./voice-commands";
-import { cardNumbersIn, mentionsCardNumber, parseBareQuantity, parseNumberedOrder, type NumberedPick } from "./numbered-order";
+import {
+  cardNumbersIn,
+  mentionsCardNumber,
+  parseBareQuantity,
+  parseNumberedOrder,
+  parsePointedOrder,
+  pointsAtOpenProduct,
+  type NumberedPick,
+} from "./numbered-order";
 import {
   brainStats,
   getProductBySlug,
@@ -619,6 +627,8 @@ export async function* runNongTeeTurn(opts: {
   focusSlugs?: string[];
   /** Product whose "how many?" box is open on screen, so a bare "10 แพ็ค" answers it. */
   pendingSlug?: string;
+  /** Product page open on the customer's screen (opened by voice or by hand), so "อันนี้" means that product. */
+  viewingSlug?: string;
   /** Coupon the customer picked on screen; every cart recalculation keeps it. */
   couponCode?: string;
 }): AsyncGenerator<JavisStreamEvent> {
@@ -704,15 +714,22 @@ export async function* runNongTeeTurn(opts: {
     .filter((p): p is BrainProductItem => Boolean(p));
   const isDirectCartOrOrder = CART_OR_ORDER_DIRECT_RE.test(userText);
 
+  const viewingProduct = opts.viewingSlug ? getProductBySlug(opts.viewingSlug) : null;
+  const cardNoOf = (p: BrainProductItem) => focusItems.findIndex((f) => f.slug === p.slug) + 1;
+  const viewingNo = viewingProduct ? cardNoOf(viewingProduct) : 0;
+
   if (visionSlugs.length === 0) {
-    const pendingProduct = opts.pendingSlug ? getProductBySlug(opts.pendingSlug) : null;
-    const bareQty = pendingProduct ? parseBareQuantity(userText) : null;
-    const picks = bareQty ? null : parseNumberedOrder(userText, focusItems.length);
-    const targets: NumberedTarget[] | null =
-      bareQty && pendingProduct
-        ? [{ ...bareQty, no: focusItems.findIndex((p) => p.slug === pendingProduct.slug) + 1, product: pendingProduct }]
-        : picks
-          ? picks.map((pk) => ({ ...pk, product: focusItems[pk.no - 1] ?? null }))
+    // A card number always wins; a bare "สองชิ้น" answers the open "how many?" box, else the open product page.
+    const pendingProduct = (opts.pendingSlug ? getProductBySlug(opts.pendingSlug) : null) ?? viewingProduct;
+    const picks = parseNumberedOrder(userText, focusItems.length);
+    const bareQty = !picks && pendingProduct ? parseBareQuantity(userText) : null;
+    const pointed = !picks && !bareQty && viewingProduct ? parsePointedOrder(userText) : null;
+    const targets: NumberedTarget[] | null = picks
+      ? picks.map((pk) => ({ ...pk, product: focusItems[pk.no - 1] ?? null }))
+      : bareQty && pendingProduct
+        ? [{ ...bareQty, no: cardNoOf(pendingProduct), product: pendingProduct }]
+        : pointed && viewingProduct
+          ? [{ ...pointed, no: viewingNo, product: viewingProduct }]
           : null;
     if (targets) {
       yield* executeNumberedOrder(targets, focusItems, currentCart);
@@ -720,13 +737,14 @@ export async function* runNongTeeTurn(opts: {
     }
   }
 
-  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && focusItems.length > 0 && (!productQuery || mentionsCardNumber(userText, focusItems.length))) {
+  if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && focusItems.length > 0 && (!productQuery || mentionsCardNumber(userText, focusItems.length) || (viewingNo > 0 && pointsAtOpenProduct(userText)))) {
     // Follow-up turn: keep talking about what is on screen (0 search, 0 planner tokens)
     prefetchLabel = "สินค้าบนจอที่ลูกค้ากำลังพูดต่อ (เรียงตามลำดับบนจอ)";
+    if (viewingNo > 0) prefetchLabel += ` — ลูกค้าเปิดดูเบอร์ ${viewingNo} อยู่ คำว่า อันนี้/ตัวนี้ คือเบอร์ ${viewingNo}`;
     for (const p of focusItems) cardCollector.set(p.slug, toProductCard(p));
     // Cards the customer names by number go first, so "รายละเอียดเบอร์ 9" is never cut by the 6-block cap.
     const pickedNos = cardNumbersIn(userText, focusItems.length);
-    const picked = pickedNos.map((no) => focusItems[no - 1]);
+    const picked = pickedNos.length ? pickedNos.map((no) => focusItems[no - 1]) : viewingNo > 0 ? [focusItems[viewingNo - 1]] : [];
     for (const p of [...picked, ...focusItems.filter((p) => !picked.includes(p))]) {
       if (prefetchBlocks.length < Math.max(6, picked.length)) prefetchBlocks.push(summarizeProductForLlm(p));
     }

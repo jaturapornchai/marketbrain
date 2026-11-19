@@ -33,13 +33,15 @@ export async function GET(
       return new Response("Upstream image unavailable", { status: 404 });
     }
     const ct = upstream.headers.get("content-type") || "image/jpeg";
-    if (!ct.startsWith("image/") && ct !== "application/octet-stream") {
+    // Some source buckets label real JPEGs "binary/octet-stream" (storage default) instead of an image type.
+    const untyped = ct === "application/octet-stream" || ct === "binary/octet-stream";
+    if (!ct.startsWith("image/") && !untyped) {
       return new Response("Unsupported media type", { status: 415 });
     }
     return new Response(upstream.body, {
       status: 200,
       headers: {
-        "Content-Type": ct === "application/octet-stream" ? "image/jpeg" : ct,
+        "Content-Type": untyped ? "image/jpeg" : ct,
         "Cache-Control": "public, max-age=604800, stale-while-revalidate=86400",
         "X-Content-Type-Options": "nosniff",
       },

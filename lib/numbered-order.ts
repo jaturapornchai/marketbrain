@@ -12,6 +12,13 @@ const QTY_AFTER_RE = new RegExp(`^(?:\\s|นะ|ครับ|ค่ะ|คะ|�
 const QTY_BEFORE_RE = new RegExp(`${NUM}\\s*([^\\d\\s]{0,12})\\s*$`);
 const BARE_QTY_RE = new RegExp(`^(?:เอา|ขอ|รับ|จำนวน|\\s)*${NUM}\\s*(.{0,16})$`);
 const ORDER_VERB_RE = /เอา|ขอ|รับ|สั่ง|ใส่|เพิ่ม|ซื้อ|หยิบ|จัด/;
+// "เอาอันนี้สองชิ้น", "ใส่ตัวนี้ลงตะกร้า", "ใส่ตะกร้าเลย 3 แพ็ค": the product page that is open.
+const POINTED_RE = new RegExp(
+  `^(?:ขอ|ช่วย|งั้น|ก็|\\s)*(?:เอา|ใส่|หยิบ|รับ|สั่ง|ซื้อ|เพิ่ม|จัด)\\s*(?:(?:สินค้า|ของ)?(?:อัน|ตัว|ชิ้น|รายการ)?(?:นี้|นี่)|(?:ลง|ใส่|เข้า)?ตะกร้า)(?:แหละ|เลย|ด้วย|มา|ลงตะกร้า|ใส่ตะกร้า|เข้าตะกร้า|ครับ|ค่ะ|คะ|นะ|\\s)*(?:${NUM}\\s*(.{0,16}))?$`,
+);
+const POINTS_AT_OPEN_RE = /(?:อัน|ตัว|ชิ้น|สินค้า|ของ|รุ่น|ยี่ห้อ|แบบ)(?:นี้|นี่)/;
+// "สองร้อยบาท" is money, never a quantity.
+const MONEY_AFTER_RE = /^(?:บาท|฿|สตางค์|เปอร์เซ็นต์|%)/;
 // Questions, look-ups and removals are not "add to cart" orders -> leave them to the conversation.
 const NOT_ORDER_RE = /ไหม|มั้ย|เท่าไหร่|เท่าไร|กี่|อะไร|ยังไง|อย่างไร|เปล่า|ดู|เทียบ|รายละเอียด|ต่างกัน|ราคา|ออก|ลบ|ไม่เอา|ยกเลิก|เปลี่ยน|ลด/;
 const MAX_CARD_NO = 99; // bigger numbers are product names ("เบอร์ 309"), not card numbers
@@ -113,5 +120,21 @@ export function parseBareQuantity(text: string): { qty: number; afterQty: string
   if (NOT_ORDER_RE.test(text)) return null;
   const m = text.trim().match(BARE_QTY_RE);
   const qty = m ? parseThaiNumber(m[1]) : null;
-  return m && qty && qty > 0 ? { qty: Math.min(qty, 9999), afterQty: m[2].trim() } : null;
+  return m && qty && qty > 0 && !MONEY_AFTER_RE.test(m[2].trim()) ? { qty: Math.min(qty, 9999), afterQty: m[2].trim() } : null;
+}
+
+/** Order for the product page that is open: "เอาอันนี้สองชิ้น" -> qty 2, "ใส่ตะกร้าเลย" -> qty null (ask). */
+export function parsePointedOrder(text: string): { qty: number | null; afterQty: string } | null {
+  if (NOT_ORDER_RE.test(text)) return null;
+  const m = text.trim().match(POINTED_RE);
+  if (!m) return null;
+  const afterQty = (m[2] ?? "").trim();
+  if (MONEY_AFTER_RE.test(afterQty)) return null;
+  const qty = m[1] ? parseThaiNumber(m[1]) : null;
+  return { qty: qty && qty > 0 ? Math.min(qty, 9999) : null, afterQty };
+}
+
+/** True when the sentence points at the thing in front of the customer ("ตัวนี้มีผงชูรสไหม"). */
+export function pointsAtOpenProduct(text: string): boolean {
+  return POINTS_AT_OPEN_RE.test(text);
 }

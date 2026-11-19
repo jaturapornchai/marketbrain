@@ -224,6 +224,9 @@ export default function JavisSalesCockpit({
   const runScreenCommandRef = useRef<(cmd: ScreenCommand, heard?: string) => void>(() => {});
   const qtyModalSlugRef = useRef("");
   qtyModalSlugRef.current = qtyModalProduct?.slug ?? "";
+  // The product page that is open right now (opened by voice or by a tap) = what "อันนี้" means.
+  const viewingSlugRef = useRef("");
+  viewingSlugRef.current = stageMode === "spotlight" && spotlight ? spotlight.slug : "";
   const [lastChangedSlug, setLastChangedSlug] = useState<string>("");
   const [confirmedOrder, setConfirmedOrder] = useState<SalesOrder | null>(null);
   const [recentOrders, setRecentOrders] = useState<SalesOrder[]>([]);
@@ -543,6 +546,7 @@ export default function JavisSalesCockpit({
             visionSummary: extra?.visionSummary,
             focusSlugs,
             pendingSlug: qtyModalSlugRef.current || undefined,
+            viewingSlug: viewingSlugRef.current || undefined,
             couponCode: couponCodeRef.current || undefined,
           }),
           signal: controller.signal,
@@ -593,7 +597,10 @@ export default function JavisSalesCockpit({
             } else if (ev.type === "cards") {
               setStageCards(ev.cards);
               if (ev.cards.length > 0) markMission("search");
-              if (ev.cards[0]) setSpotlight(ev.cards[0]);
+              // The customer moved on to other products: a "how many?" box for an old one must not cover them.
+              if (qtyModalSlugRef.current && !ev.cards.some((c) => c.slug === qtyModalSlugRef.current)) closeQtyModal();
+              // Same cards again (follow-up turn): stay on the product the customer has open.
+              if (ev.cards[0]) setSpotlight((prev) => (prev && ev.cards.some((c) => c.slug === prev.slug) ? prev : ev.cards[0]));
               setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, cards: ev.cards } : t)));
             } else if (ev.type === "stage") {
               setStageMode(ev.mode);
@@ -1216,6 +1223,8 @@ export default function JavisSalesCockpit({
     if (!["spin", "duel", "stop_talk", "mute", "unmute", "repeat", "mic_off", "help"].includes(cmd.id)) {
       setWheelOpen(false);
       setDuel(null);
+      // A "how many?" box somebody left open must not cover the screen the customer just asked for.
+      if (!cmd.id.startsWith("scroll_") && cmd.id !== "take_suggest") closeQtyModal();
     }
     switch (cmd.id) {
       case "back":
