@@ -14,7 +14,7 @@ import type {
 import { BARGE_FRAMES, EchoGuard, playedLevel, wavEnvelope } from "@/lib/echo-guard";
 import { parseBudget, parseScreenCommand, screenCommandHelp, type ScreenCommand } from "@/lib/voice-commands";
 import { parseThaiNumber } from "@/lib/numbered-order";
-import {
+import { RelatedStrip,
   BudgetBar,
   CountUpBaht,
   DuelView,
@@ -189,6 +189,15 @@ export default function JavisSalesCockpit({
   const budgetWarnRef = useRef<"" | "near" | "over">("");
   const prevPiecesRef = useRef<Map<string, number> | null>(null);
   const [related, setRelated] = useState<RelatedSet | null>(null);
+  const [spotRelated, setSpotRelated] = useState<{ slug: string; set: RelatedSet } | null>(null);
+  // Continuous cross-sell: the item Nong Tee offered last ("เอาด้วย" takes it) + everything offered so far.
+  const suggestRef = useRef<{ card: JavisProductCard | null; offered: Set<string> }>({ card: null, offered: new Set() });
+  const nextSuggestion = (cards: JavisProductCard[]) => {
+    const inCart = new Set(cart.items.map((it) => it.slug));
+    const pick = cards.find((c) => !inCart.has(c.slug) && !suggestRef.current.offered.has(c.slug)) ?? null;
+    if (pick) suggestRef.current = { card: pick, offered: suggestRef.current.offered.add(pick.slug) };
+    return pick;
+  };
   const lastOrderNoRef = useRef("");
   const markMission = useCallback((key: MissionKey) => {
     setMissions((prev) => {
@@ -1297,6 +1306,8 @@ export default function JavisSalesCockpit({
         } else {
           setStageMode("checkout");
           reply = `ยอดรวม ${bahtSpoken(cart.grandTotalFormatted)}ครับ บอกชื่อ เบอร์โทร และวิธีจ่ายเงินได้เลยครับ`;
+          const last = related ? nextSuggestion(related.cards) : null;
+          if (last) reply += ` ก่อนจ่าย ตี๋แนะนำ ${last.title} ราคา ${bahtSpoken(last.priceLabel)} รับด้วยไหมครับ พูดว่า เอาด้วย ได้เลยครับ`;
         }
         break;
       case "camera":
@@ -1368,6 +1379,16 @@ export default function JavisSalesCockpit({
       case "related":
         void showRelated(heard);
         return;
+      case "take_suggest": {
+        // The offered item first; with none, "เอาด้วย" on a product page means that product.
+        const c = suggestRef.current.card ?? (stageMode === "spotlight" ? spotlight : null);
+        if (c) {
+          suggestRef.current.card = null;
+          promptAddToCart(c);
+          reply = `ได้เลยครับ ${c.title} รับจำนวนเท่าไหร่ดีครับ`;
+        } else reply = "ตอนนี้ยังไม่มีของที่ตี๋แนะนำครับ บอกชื่อสินค้าหรือเบอร์บนจอได้เลยครับ";
+        break;
+      }
       case "help":
         setHelpOpen(true);
         reply = "นี่คือคำสั่งเสียงทั้งหมดครับ พูดตามตัวอย่างบนจอได้เลย";
@@ -1466,8 +1487,28 @@ export default function JavisSalesCockpit({
     flyToCart(grown.slug);
     playTing("add");
     markMission("add");
-    void fetchRelated([grown.slug]).then((r) => r && r.cards.length > 0 && setRelated(r));
+    // Always suggest one related item after an add (no AI call): picked from brain hubs, spoken once per item.
+    void fetchRelated([grown.slug]).then((r) => {
+      if (!r?.cards.length) return;
+      setRelated(r);
+      const pick = nextSuggestion(r.cards);
+      if (!pick) return;
+      const say = `ตี๋แนะนำ ${pick.title} ราคา ${bahtSpoken(pick.priceLabel)} รับด้วยไหมครับ พูดว่า เอาด้วย ได้เลยครับ`;
+      reportCommand(`🔗 แนะนำ: ${pick.title}`, undefined, false);
+      enqueueOmniVoiceSentence(say);
+    });
   }, [cart.items, markMission]);
+
+  useEffect(() => {
+    if (stageMode !== "spotlight" || !spotlight) return;
+    const slug = spotlight.slug;
+    if (spotRelated?.slug === slug) return;
+    let alive = true;
+    void fetchRelated([slug]).then((r) => alive && r && setSpotRelated({ slug, set: r }));
+    return () => {
+      alive = false;
+    };
+  }, [stageMode, spotlight, spotRelated?.slug]);
 
   // Budget voice warnings, once per level.
   useEffect(() => {
@@ -1489,6 +1530,7 @@ export default function JavisSalesCockpit({
   useEffect(() => {
     if (!confirmedOrder || confirmedOrder.orderNo === lastOrderNoRef.current) return;
     lastOrderNoRef.current = confirmedOrder.orderNo;
+    suggestRef.current = { card: null, offered: new Set() }; // new order, fresh offers
     burstConfetti();
     playTing("win");
     markMission("order");
@@ -2147,6 +2189,16 @@ export default function JavisSalesCockpit({
                   </div>
                 </div>
 
+                {spotRelated?.slug === spotlight.slug && (
+                  <RelatedStrip
+                    cards={spotRelated.set.cards}
+                    reasons={spotRelated.set.reasons}
+                    excludeSlugs={[spotlight.slug]}
+                    onAdd={promptAddToCart}
+                    onShowAll={() => void showRelated(undefined)}
+                  />
+                )}
+
                 {latestTurn?.screenMarkdown && (
                   <div
                     className="jm-screen-md md"
@@ -2298,32 +2350,14 @@ export default function JavisSalesCockpit({
                   </>
                 )}
 
-                {related && related.cards.some((c) => !cart.items.some((it) => it.slug === c.slug)) && (
-                  <div className="fz-related">
-                    <div className="fz-related-head">
-                      <b>🔗 สมองแนะนำของที่เกี่ยวข้อง</b>
-                      <button type="button" className="btn-reset-sm" onClick={() => void showRelated(undefined)}>
-                        ดูบนจอทั้งหมด
-                      </button>
-                    </div>
-                    <p className="fz-play-tip">พูดว่า “ดูของที่เกี่ยวข้อง” แล้วสั่งตามเบอร์ได้เลย</p>
-                    <div className="fz-related-row">
-                      {related.cards
-                        .filter((c) => !cart.items.some((it) => it.slug === c.slug))
-                        .slice(0, 6)
-                        .map((c) => (
-                          <button type="button" key={c.slug} className="fz-rel-card" data-slug={c.slug} onClick={() => promptAddToCart(c)}>
-                            <span className="fz-rel-img">{c.imageUrl ? <img src={c.imageUrl} alt={c.title} loading="lazy" /> : "📦"}</span>
-                            <span className="fz-rel-title">{c.title}</span>
-                            <span className="fz-rel-meta">
-                              <b>{c.priceLabel}</b>
-                              <small>{related.reasons[c.slug]}</small>
-                            </span>
-                            <span className="fz-rel-add">🛒 ใส่ตะกร้า</span>
-                          </button>
-                        ))}
-                    </div>
-                  </div>
+                {related && (
+                  <RelatedStrip
+                    cards={related.cards}
+                    reasons={related.reasons}
+                    excludeSlugs={cart.items.map((it) => it.slug)}
+                    onAdd={promptAddToCart}
+                    onShowAll={() => void showRelated(undefined)}
+                  />
                 )}
               </div>
             )}

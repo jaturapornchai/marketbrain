@@ -6,7 +6,7 @@
 ![หน้าหลักเลขาน้องตี๋ Javis Sales Concierge พร้อมเวทีแสดงสินค้าและตะกร้าสด](docs/screenshots/01-nong-tee-cockpit.png)
 
 ## Objective
-สร้างระบบสมองความรู้สินค้า (**3D Product Knowledge Graph + Hybrid BM25/Synapse GraphRAG + Faceted Search + MCP Server**) ผสานห้องสนทนาปิดการขายอัจฉริยะ (**Javis "น้องตี๋"**) สำหรับค้นหา เปรียบเทียบ ส่องรูปสินค้า จัดตะกร้า และออกใบสั่งซื้อครบวงจร โดยเชื่อมข้อมูลสินค้าจริงในตลาดค้าส่ง-ค้าปลีกไทยแบบ **Read-Only** (`7,646` รายการ, `144` หน่วยนับ, `98,106` ไซแนปส์) ขับเคลื่อนด้วย **DeepSeek**, เสียงพูดภาษาไทยโคลนในเครื่อง (**Local GPU `hotdogs/omnivoice-thai`**), ระบบฟังเสียงสด (**Local CPU `OpenThai 2.0 ASR Streaming`**) และระบบส่องค้นหาจากภาพสินค้า (**Local Vision `qwen3-vl:8b-instruct` + BarcodeDetector**) บนสถาปัตยกรรม **Next.js Mobile-First** และคำนวณเงินทุกบรรทัดด้วย `Decimal.js` (`ROUND_HALF_UP`)
+สร้างระบบสมองความรู้สินค้า (**3D Product Knowledge Graph + Hybrid BM25/Synapse GraphRAG + Faceted Search + MCP Server**) ผสานห้องสนทนาปิดการขายอัจฉริยะ (**Javis "น้องตี๋"**) สำหรับค้นหา เปรียบเทียบ ส่องรูปสินค้า จัดตะกร้า และออกใบสั่งซื้อครบวงจร โดยเชื่อมข้อมูลสินค้าจริงในตลาดค้าส่ง-ค้าปลีกไทยแบบ **Read-Only** (`7,646` รายการ, `144` หน่วยนับ, `98,106` ไซแนปส์) ขับเคลื่อนด้วย **DeepSeek**, เสียงพูดภาษาไทยโคลนในเครื่อง (**Local GPU `hotdogs/omnivoice-thai`**), ระบบฟังเสียงสด (**Local CPU `OpenThai 2.0 ASR Streaming`**) และระบบส่องค้นหาจากภาพสินค้า (**Local Vision `qwen3.5:9b` + BarcodeDetector**) บนสถาปัตยกรรม **Next.js Mobile-First** และคำนวณเงินทุกบรรทัดด้วย `Decimal.js` (`ROUND_HALF_UP`)
 
 ---
 
@@ -35,7 +35,7 @@
 
 ```mermaid
 flowchart LR
-  U["ลูกค้า (เสียงพูด / แชท / กล้องส่องรูป)"] --> ASR["Local OpenThai 2.0 ASR + Vision qwen3-vl"]
+  U["ลูกค้า (เสียงพูด / แชท / กล้องส่องรูป)"] --> ASR["Local OpenThai 2.0 ASR + Vision qwen3.5"]
   ASR --> TEE["เลขาน้องตี๋ (DeepSeek Multi-Angle Swarm)"]
   TEE --> BRAIN["MarketBrain Vault (7,646 สินค้า · 98,106 ไซแนปส์)"]
   TEE --> CART["Cart & Order Engine (Decimal.js ROUND_HALF_UP)"]
@@ -48,7 +48,7 @@ flowchart LR
    - กดปุ่ม **`⚙️ อุปกรณ์`** เพื่อเลือก **ไมโครโฟน** (พร้อมแถบวัดระดับเสียงสด), **ลำโพง/หูฟัง** (`setSinkId` + ปุ่มทดสอบเสียง) และ **กล้องส่องสินค้า**
 2. **ถ้ามีรูปสินค้า ไปหาเลย (Instant Visual Product Lookup)**:
    - รองรับทั้งเปิดกล้องส่องสด (โหมด **`👁️ เจอสินค้าแล้วค้นหาเลยอัตโนมัติ`**), อัปโหลดไฟล์รูป, ลากวาง หรือกด `Ctrl+V` วางรูปภาพบนหน้าเว็บ
-   - ระบบอ่านบาร์โค้ดและฉลากด้วย `BarcodeDetector` + Local Vision `qwen3-vl:8b-instruct` จับคู่สินค้าจริงในสมอง เปลี่ยนภาพบนเวที และให้น้องตี๋แจ้งราคาพร้อมเสนอหยิบใส่ตะกร้าทันที
+   - ระบบอ่านบาร์โค้ดและฉลากด้วย `BarcodeDetector` + Local Vision `qwen3.5:9b` จับคู่สินค้าจริงในสมอง เปลี่ยนภาพบนเวที และให้น้องตี๋แจ้งราคาพร้อมเสนอหยิบใส่ตะกร้าทันที
 3. **จัดการตะกร้าสดและปิดการขายครบวงจร**:
    - สั่งด้วยเสียง/แชท (*"เอาไฮคิว 4 กล่อง"*, *"เปลี่ยนเป็น 6 กล่อง"*, *"ดูตะกร้า"*, *"ปิดบิลเลย"*) หรือกดปุ่ม **`🛒 ใส่ตะกร้า`** ในคำตอบและการ์ดสินค้าเพื่อระบุจำนวนและหน่วยนับ
    - คำนวณยอดรวมทุกบรรทัดด้วย `Decimal.js` (`ROUND_HALF_UP`) และออกใบสั่งซื้อพร้อม QR พร้อมเพย์ทันที
@@ -68,7 +68,7 @@ flowchart LR
 | `DEEPSEEK_BASE_URL` | Endpoint ของ DeepSeek API (ค่าเริ่มต้น `https://api.deepseek.com`) |
 | `LOCAL_VOICE_URL` | URL ของบริการเสียงในเครื่อง (ค่าเริ่มต้น `http://127.0.0.1:3091`) |
 | `OLLAMA_BASE_URL` | URL ของ Local Ollama สำหรับส่องรูปสินค้า (ค่าเริ่มต้น `http://127.0.0.1:11434`) |
-| `VISION_MODEL` | ชื่อโมเดล Vision ในเครื่อง (ค่าเริ่มต้น `qwen3-vl:8b-instruct`) |
+| `VISION_MODEL` | ชื่อโมเดล Vision ในเครื่อง (ค่าเริ่มต้น `qwen3.5:9b`) |
 | `NEXT_PUBLIC_SITE_URL` | URL สาธารณะของระบบ (ค่าเริ่มต้น `https://marketbrain.bcsmethai.com`) |
 
 ---
@@ -77,7 +77,7 @@ flowchart LR
 - **Frontend & Server Runtime**: Node.js >= 22, Next.js 16 (App Router), React 19, TypeScript, `decimal.js`, `three`, `marked`, `mongodb`, `@modelcontextprotocol/sdk`, `zod`
 - **Local Voice & Vision AI**:
   - Python 3.11+ พร้อม PyTorch CUDA, `omnivoice` (`hotdogs/omnivoice-thai`), `onnxruntime` (`iapp/OpenThai2.0-ASR-Streaming-ONNX`), `librosa`, `soundfile`, `fastapi`, `uvicorn`
-  - Ollama ในเครื่องที่โหลดโมเดล `qwen3-vl:8b-instruct`
+  - Ollama ในเครื่องที่โหลดโมเดล `qwen3.5:9b`
 
 ---
 
@@ -113,5 +113,5 @@ curl -sS https://marketbrain.bcsmethai.com/mcp \
 
 ## Limitation
 - การเชื่อมต่อฐานข้อมูลต้นทางทำงานแบบ **Read-Only (`secondaryPreferred`)** เท่านั้น ไม่มีการเขียนแก้ไขข้อมูลกลับไปยังระบบต้นทาง กดปุ่ม **↻ ซิงก์ DB** เพื่ออัปเดตแคชสมองสินค้าได้ตลอดเวลา
-- ระบบเสียงโคลน `OmniVoice` (~3.4 GB VRAM) และระบบส่องภาพ `qwen3-vl:8b-instruct` (~5.8 GB VRAM) ประมวลผลบนการ์ดจอของเครื่องโฮสต์ หากไม่ได้เปิดบริการเสริมด้านเสียง ระบบค้นหา แชท ตะกร้าสินค้า และการปิดการขายทั้งหมดยังทำงานได้ตามปกติ
+- ระบบเสียงโคลน `OmniVoice` (~3.4 GB VRAM) และระบบส่องภาพ `qwen3.5:9b` (~5.6 GB VRAM) ประมวลผลบนการ์ดจอของเครื่องโฮสต์ หากไม่ได้เปิดบริการเสริมด้านเสียง ระบบค้นหา แชท ตะกร้าสินค้า และการปิดการขายทั้งหมดยังทำงานได้ตามปกติ
 - ข้อมูลส่วนบุคคลของผู้สั่งซื้อ (เบอร์โทรศัพท์และที่อยู่) บน API ประวัติบิลสาธารณะ (`/api/orders`) จะถูกซ่อนบางส่วนโดยอัตโนมัติเพื่อคุ้มครองความเป็นส่วนตัว

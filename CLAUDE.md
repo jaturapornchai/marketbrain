@@ -7,7 +7,7 @@
 - **Public URL**: `https://marketbrain.bcsmethai.com` (Caddy HTTPS บน `bcsmethai.com` -> Reverse SSH Tunnel `127.0.0.1:13090` -> เครื่องนี้ `127.0.0.1:3090`)
 - **Local Web URL**: `http://localhost:3090` (`next start -p 3090`)
 - **Local Voice Sidecar**: `http://127.0.0.1:3091` (`voice_sidecar/voice_service.py` — GPU `hotdogs/omnivoice-thai` บน `cuda:0` + CPU `iapp/OpenThai2.0-ASR-Streaming-ONNX`)
-- **Local Vision AI**: `http://127.0.0.1:11434` (Ollama `qwen3-vl:8b-instruct` โหลดค้างใน VRAM แล้ว ใช้ส่องรูปสินค้าผ่าน `/api/vision/identify`)
+- **Local Vision AI**: `http://127.0.0.1:11434` (Ollama `qwen3.5:9b` โหลดค้างใน VRAM แล้ว ใช้ส่องรูปสินค้าผ่าน `/api/vision/identify`)
 - **MCP Endpoint**: `https://marketbrain.bcsmethai.com/mcp` (JSON-RPC 2.0 Streamable HTTP)
 - **GitHub Repo**: `https://github.com/jaturapornchai/marketbrain` (`branch: main`)
 - **Background Supervisor**: รันถาวรผ่าน `wscript.exe "D:\marketbrain\deploy\start_hidden.vbs"` -> `node deploy\run-all.mjs` (log อยู่ที่ `.data\marketbrain.log` หมุนไฟล์อัตโนมัติที่ 5 MB)
@@ -35,12 +35,12 @@
 - **เลขาน้องตี๋ (Javis Sales Concierge) + เสียง + กล้องส่องสินค้า + ตะกร้า**:
   - `lib/nong-tee.ts` & `app/api/javis/chat/route.ts` — ระบบสนทนา SSE ของน้องตี๋ (`deepseek-flash` เท่านั้น + Token-Saver Fast-Path + Cart/Order/Calc Tools)
   - `lib/cart-order.ts` & `lib/decimal-money.ts` & `app/api/orders/route.ts` — คำนวณตะกร้าและออกบิล `#MB-YYYYMMDD-XXXX` ด้วย `Decimal.js` (ซ่อน PII บน public `GET /api/orders`)
-  - `app/api/vision/identify/route.ts` — ส่องรูปสินค้า/บาร์โค้ดด้วย Local Ollama `qwen3-vl:8b-instruct` จับคู่สินค้าจริงในสมอง
+  - `app/api/vision/identify/route.ts` — ส่องรูปสินค้า/บาร์โค้ดด้วย Local Ollama `qwen3.5:9b` จับคู่สินค้าจริงในสมอง
   - `voice_sidecar/voice_service.py` & `app/api/voice/*` — เสียงพูดโคลนไทย `OmniVoice` GPU (`:3091`) + ฟังเสียงไทยสด `OpenThai 2.0 ASR`
 - **Frontend UI (Next.js App Router, Mobile-First)**:
   - `components/JavisSalesCockpit.tsx` (`app/page.tsx`) — หน้าหลัก `/` เปิดมาให้น้องตี๋ทำงานทันที, เปลี่ยนเวทีภาพตามบริบท, ตะกร้าสด, ปิดการขายพร้อม PromptPay QR
   - `components/DevicePickerPopover.tsx` — ปุ่ม `⚙️ อุปกรณ์` เลือก ไมค์ (พร้อมแถบวัดเสียงสด) · ลำโพง (`setSinkId` + ทดสอบเสียง) · กล้อง
-  - `components/ProductVisionScanner.tsx` — กล้องส่องสินค้าอัตโนมัติ (`BarcodeDetector` + `qwen3-vl`), อัปโหลดรูป และวางรูป `Ctrl+V`
+  - `components/ProductVisionScanner.tsx` — กล้องส่องสินค้าอัตโนมัติ (`BarcodeDetector` + `qwen3.5`), อัปโหลดรูป และวางรูป `Ctrl+V`
   - `components/AddToCartModal.tsx` & `components/JavisContext.tsx` — ปุ่ม `🛒 ใส่ตะกร้า` เลือกจำนวน/หน่วยบรรจุ และ Global State
   - `components/ProductCatalogWorkbench.tsx` (`app/search/page.tsx`) — หน้าค้นหาสินค้าเต็มความกว้างหน้าจอ 100% (`/search`)
   - `components/Brain3D.tsx` (`app/brain/page.tsx`) & `app/mcp/route.ts` — สมอง 3D และ MCP Server

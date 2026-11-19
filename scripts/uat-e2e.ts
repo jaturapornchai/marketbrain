@@ -1,6 +1,6 @@
 // Full UAT + End-to-End (E2E) Verification Suite for MarketBrain
 // Covers: Routes & SEO/AEO, Faceted Search, Local OmniVoice GPU TTS + OpenThai ASR Round-Trip,
-// Local Vision AI (qwen3-vl:8b-instruct) + Barcode Lookup, Multi-Turn Nong Tee Sales Closing SSE, Decimal Cart/Orders, and MCP JSON-RPC.
+// Local Vision AI (qwen3.5:9b) + Barcode Lookup, Multi-Turn Nong Tee Sales Closing SSE, Decimal Cart/Orders, and MCP JSON-RPC.
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -256,7 +256,7 @@ await step("UAT-04", "Visual Product Search E2E (/api/vision/identify) — Barco
   assert.equal(bcJson.ok && bcJson.hasProduct && bcJson.exactMatch, true);
   assert.ok(bcJson.cards.some((c) => c.slug === sampleWithBarcode.slug), "Barcode lookup must find exact product");
 
-  // 4B: Real Product Image -> Local qwen3-vl:8b-instruct Vision AI -> MarketBrain Match
+  // 4B: Real Product Image -> Local qwen3.5:9b Vision AI -> MarketBrain Match
   const resolvedImgUrl = sampleWithBarcode.imageUrl!.startsWith("/")
     ? `${BASE_URL}${sampleWithBarcode.imageUrl}`
     : sampleWithBarcode.imageUrl!;

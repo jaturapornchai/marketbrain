@@ -471,3 +471,45 @@ export function PayCountdown({ createdAt, minutes = 15 }: { createdAt: string; m
     </div>
   );
 }
+
+/** "🔗 สมองแนะนำของที่เกี่ยวข้อง" row: brain-hub neighbours, tap to add. */
+export function RelatedStrip({
+  cards,
+  reasons,
+  excludeSlugs,
+  onAdd,
+  onShowAll,
+}: {
+  cards: JavisProductCard[];
+  reasons: Record<string, string>;
+  excludeSlugs: string[];
+  onAdd: (c: JavisProductCard) => void;
+  onShowAll: () => void;
+}) {
+  const shown = cards.filter((c) => !excludeSlugs.includes(c.slug)).slice(0, 6);
+  if (!shown.length) return null;
+  return (
+    <div className="fz-related">
+      <div className="fz-related-head">
+        <b>🔗 สมองแนะนำของที่เกี่ยวข้อง</b>
+        <button type="button" className="btn-reset-sm" onClick={onShowAll}>
+          ดูบนจอทั้งหมด
+        </button>
+      </div>
+      <p className="fz-play-tip">พูดว่า “ดูของที่เกี่ยวข้อง” แล้วสั่งตามเบอร์ได้เลย</p>
+      <div className="fz-related-row">
+        {shown.map((c) => (
+          <button type="button" key={c.slug} className="fz-rel-card" data-slug={c.slug} onClick={() => onAdd(c)}>
+            <span className="fz-rel-img">{c.imageUrl ? <img src={c.imageUrl} alt={c.title} loading="lazy" /> : "📦"}</span>
+            <span className="fz-rel-title">{c.title}</span>
+            <span className="fz-rel-meta">
+              <b>{c.priceLabel}</b>
+              <small>{reasons[c.slug]}</small>
+            </span>
+            <span className="fz-rel-add">🛒 ใส่ตะกร้า</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}

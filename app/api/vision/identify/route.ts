@@ -6,7 +6,7 @@ import { searchProductsDetailed } from "@/lib/vault";
 export const dynamic = "force-dynamic";
 
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
-const VISION_MODEL = process.env.VISION_MODEL || "qwen3-vl:8b-instruct";
+const VISION_MODEL = process.env.VISION_MODEL || "qwen3.5:9b";
 const MAX_BODY_CHARS = 7_000_000;
 
 const VISION_SYSTEM_PROMPT = `คุณคือ AI ส่องค้นหาสินค้าของระบบสมองสินค้า MarketBrain สำหรับร้านค้าส่ง-ปลีกไทย

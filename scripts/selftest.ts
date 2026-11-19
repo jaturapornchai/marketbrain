@@ -215,6 +215,7 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
     ["หมุนวงล้อ", "spin"], ["หมุนอีกรอบ", "spin"], ["ลุ้นโชคครับ", "spin"],
     ["ลองเล่น", "play"], ["มีภารกิจอะไรบ้าง", "play"], ["ซ่อนภารกิจ", "play_off"],
     ["ดูของที่เกี่ยวข้อง", "related"], ["มีอะไรใกล้เคียงอีกไหม", "related"],
+    ["เอาด้วย", "take_suggest"], ["ใส่ตัวที่แนะนำครับ", "take_suggest"], ["เอาตัวนั้นด้วยเลย", "take_suggest"],
   ] as const) assert.equal(id(t), want, t);
   assert.deepEqual(cmd("เทียบเบอร์ 2 กับ 5"), { id: "duel", no: 2, no2: 5 });
   assert.deepEqual(cmd("ดวลเบอร์หนึ่งกับเบอร์สามอันไหนคุ้มกว่า"), { id: "duel", no: 1, no2: 3 });
