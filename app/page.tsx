@@ -9,7 +9,7 @@ const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://marketbrain.bcsmet
 
 export default function HomePage() {
   const st = brainStats();
-  const featured = searchProductsDetailed({ multiUnitOnly: true, pageSize: 24 }).items.map(toProductCard);
+  const featured = searchProductsDetailed({ multiUnitOnly: true, pageSize: 36 }).items.map(toProductCard);
 
   return (
     <>

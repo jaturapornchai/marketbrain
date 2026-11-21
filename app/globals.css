@@ -1589,16 +1589,22 @@ select {
   font-size: 19px;
 }
 
-/* Premium Flagship Marketplace Cards (2 cols mobile -> auto-fill dense cols desktop!) */
+/* Dense Marketplace Cards (-25% compact footprint: 2 cols mobile -> 3 small-tablet -> 6+ desktop) */
 .st-cards-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 7px;
+}
+@media (min-width: 560px) and (max-width: 719px) {
+  .st-cards-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
 }
 @media (min-width: 720px) {
   .st-cards-grid {
-    grid-template-columns: repeat(auto-fill, minmax(192px, 1fr));
-    gap: 11px;
+    grid-template-columns: repeat(auto-fill, minmax(144px, 1fr));
+    gap: 8px;
   }
 }
 
@@ -1832,6 +1838,111 @@ select {
 .p-btn-3d:hover {
   border-color: var(--accent-border);
   background: #fff;
+}
+
+/* Scoped -25% Compact Showcase Card (.st-card only; leaves /search .p-card full-sized) */
+.st-card {
+  border-radius: 11px;
+}
+.st-card .st-img-btn {
+  aspect-ratio: auto;
+  height: 108px;
+  max-height: 108px;
+  padding: 6px;
+}
+.st-card .st-img-btn img {
+  max-height: 96px;
+}
+.st-card .p-no-badge {
+  right: 5px;
+  top: 5px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  font-size: 11px;
+  border-width: 1.5px;
+}
+.st-card .p-multi-badge {
+  left: 5px;
+  top: 5px;
+  height: 17px;
+  padding: 0 5px;
+  font-size: 9.5px;
+  border-radius: 5px;
+}
+.st-card .st-card-body {
+  padding: 6px 7px 7px;
+  gap: 3px;
+}
+.st-card .p-meta-top {
+  gap: 4px;
+}
+.st-card .p-brand {
+  font-size: 10px;
+}
+.st-card .p-unit-chip {
+  height: 16px;
+  padding: 0 5px;
+  font-size: 9.5px;
+  border-radius: 4px;
+}
+.st-card .st-card-body h3 {
+  font-size: 11.8px;
+  line-height: 1.28;
+  min-height: 2.56em;
+}
+.st-card .p-price-row {
+  gap: 3px;
+  margin-top: 1px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.st-card .p-price {
+  font-size: 14.5px;
+  white-space: nowrap;
+}
+.st-card .p-per-unit {
+  font-size: 10px;
+  white-space: nowrap;
+}
+.st-card .p-base-calc {
+  font-size: 9.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-card .p-traits {
+  flex-wrap: nowrap;
+  overflow: hidden;
+  gap: 3px;
+}
+.st-card .p-trait-tag {
+  height: 16px;
+  padding: 0 5px;
+  font-size: 9.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-card .st-card-actions {
+  padding-top: 5px;
+  gap: 4px;
+}
+.st-card .st-add-btn {
+  height: 27px;
+  padding: 0 6px;
+  font-size: 11px;
+  border-radius: 7px;
+  line-height: 1;
+}
+.st-card .st-detail-icon {
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  font-size: 12px;
+  border-radius: 7px;
+  line-height: 1;
+  flex: none;
 }
 
 /* Spotlight Hero View */
@@ -3414,10 +3525,12 @@ select {
   border-color: #0f172a;
 }
 .jc-hist-pos {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 700;
   line-height: 1;
   color: var(--muted, #64748b);
+  white-space: nowrap;
+  flex: none;
 }
 .jc-action-chip.cmd {
   background: linear-gradient(135deg, #1d4ed8, #4f46e5);
@@ -3590,10 +3703,11 @@ select {
 /* ---------- Floating Javis HUD Ring (ported from D:\bctest01 style: draggable, resizable, voice-reactive) ---------- */
 .jv-float-hud {
   position: fixed;
-  left: 14px;
-  bottom: 16px;
+  left: 10px;
+  bottom: 10px;
   top: auto;
-  width: 72px;
+  width: 60px;
+  opacity: 0.92;
   aspect-ratio: 1;
   z-index: 820;
   color: #7fa6e0;

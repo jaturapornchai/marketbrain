@@ -65,7 +65,7 @@ export async function POST(req: Request): Promise<Response> {
   const visionSummary = typeof body.visionSummary === "string" ? body.visionSummary.trim().slice(0, 180) : undefined;
 
   const focusSlugs = Array.isArray(body.focusSlugs)
-    ? body.focusSlugs.filter((x): x is string => typeof x === "string" && x.length <= 160).slice(0, 36)
+    ? body.focusSlugs.filter((x): x is string => typeof x === "string" && x.length <= 160).slice(0, 60)
     : undefined;
 
   const encoder = new TextEncoder();

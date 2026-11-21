@@ -1550,7 +1550,7 @@ export async function* runNongTeeTurn(opts: {
   let prefetchLabel = "สินค้าที่พบ";
   const productQuery = productQueryOf(userText);
   const focusItems = (opts.focusSlugs ?? [])
-    .slice(0, 36)
+    .slice(0, 60)
     .map((s) => getProductBySlug(String(s).trim()))
     .filter((p): p is BrainProductItem => Boolean(p));
   const isDirectCartOrOrder = CART_OR_ORDER_DIRECT_RE.test(userText);
@@ -1632,7 +1632,7 @@ export async function* runNongTeeTurn(opts: {
     // Clean from original userText when browsing so phrases like "ไม่ใส่ผงชูรส" don't lose "ใส่".
     const cleanedBrowse = cleanBrowseQuery(userText);
     let searchText = cleanedBrowse.length >= 2 ? cleanedBrowse : productQuery || userText;
-    let localDirect = searchProductsDetailed({ q: searchText, sort: browseSort, pageSize: 24 });
+    let localDirect = searchProductsDetailed({ q: searchText, sort: browseSort, pageSize: 36 });
     let matchedAlt = false;
     if (
       !(localDirect.topStrongMatch && (localDirect.items.length >= 2 || (localDirect.items.length === 1 && searchText.length <= 28))) &&
@@ -1641,7 +1641,7 @@ export async function* runNongTeeTurn(opts: {
     ) {
       const altClean = cleanBrowseQuery(altText);
       const altSearch = altClean.length >= 2 ? altClean : productQueryOf(altText) || altText;
-      const altDirect = searchProductsDetailed({ q: altSearch, sort: browseSort, pageSize: 24 });
+      const altDirect = searchProductsDetailed({ q: altSearch, sort: browseSort, pageSize: 36 });
       if (altDirect.topStrongMatch && (altDirect.items.length >= 2 || (altDirect.items.length === 1 && altSearch.length <= 28))) {
         localDirect = altDirect;
         searchText = altSearch;
@@ -1651,7 +1651,7 @@ export async function* runNongTeeTurn(opts: {
     if (localDirect.topStrongMatch && (localDirect.items.length >= 2 || (localDirect.items.length === 1 && searchText.length <= 28))) {
       const localMs = Math.max(1, Math.round(performance.now() - tLocal));
       for (const p of localDirect.items) {
-        if (cardCollector.size < 24) cardCollector.set(p.slug, toProductCard(p));
+        if (cardCollector.size < 36) cardCollector.set(p.slug, toProductCard(p));
         if (prefetchBlocks.length < 6) prefetchBlocks.push(summarizeProductForLlm(p));
       }
       emitMcpEvent({
@@ -1736,7 +1736,7 @@ export async function* runNongTeeTurn(opts: {
     const tSwarm = performance.now();
     const angleResults = await Promise.all(
       swarmJobs.map(async (sj) => {
-        const prodRes = searchProductsDetailed({ q: sj.angle, pageSize: 12 });
+        const prodRes = searchProductsDetailed({ q: sj.angle, pageSize: 16 });
         const brainHits = search(sj.angle, 2, "all").filter((h) => h.folder !== "product");
         return { sj, prodRes, brainHits, ms: Math.max(1, Math.round(performance.now() - tSwarm)) };
       }),
@@ -1763,7 +1763,7 @@ export async function* runNongTeeTurn(opts: {
       if (useHit) {
         if (!firstMatchedAngle) firstMatchedAngle = ar.sj.angle;
         for (const p of ar.prodRes.items) {
-          if (cardCollector.size < 24) cardCollector.set(p.slug, toProductCard(p));
+          if (cardCollector.size < 36) cardCollector.set(p.slug, toProductCard(p));
           if (!seenSlugs.has(p.slug) && seenSlugs.size < 6) {
             seenSlugs.add(p.slug);
             prefetchBlocks.push(summarizeProductForLlm(p));
@@ -2410,11 +2410,11 @@ export async function* runNongTeeTurn(opts: {
           const slug = String(args.slug ?? "").trim();
           const rawRel = typeof args.relation === "string" ? args.relation.trim() : "";
           const relation = rawRel && isRelationType(rawRel) ? rawRel : undefined;
-          const res = traverseGraph({ slug, depth: 2, relation, limit: 32, audience: "all" });
+          const res = traverseGraph({ slug, depth: 2, relation, limit: 44, audience: "all" });
           if (res.start) {
             for (const nb of res.neighbors) {
               const p = getProductBySlug(nb.slug);
-              if (p && cardCollector.size < 24) cardCollector.set(p.slug, toProductCard(p));
+              if (p && cardCollector.size < 36) cardCollector.set(p.slug, toProductCard(p));
             }
             pendingStage = null;
             yield { type: "cards", cards: [...cardCollector.values()] };
@@ -2459,7 +2459,7 @@ export async function* runNongTeeTurn(opts: {
             sortRaw === "price_asc" || sortRaw === "price_desc" || sortRaw === "unit_price_asc" || sortRaw === "pack_desc"
               ? sortRaw
               : "relevance";
-          const limit = Math.min(24, Math.max(1, Number(args.limit ?? 20) || 20));
+          const limit = Math.min(36, Math.max(1, Number(args.limit ?? 28) || 28));
           const res = searchProductsDetailed({ q, unit, minPrice, maxPrice, multiUnitOnly, thaiGs1Only, sort, pageSize: limit });
           if (res.items.length > 0) {
             // Put fresh tool search hits at card #1..#N instead of appending after stale prefetch cards
@@ -2469,7 +2469,7 @@ export async function* runNongTeeTurn(opts: {
               replacedCardsBySearchTool = true;
             }
             for (const it of res.items) {
-              if (cardCollector.size < 24) cardCollector.set(it.slug, toProductCard(it));
+              if (cardCollector.size < 36) cardCollector.set(it.slug, toProductCard(it));
             }
             const cardsArr = [...cardCollector.values()];
             // Defer refreshing the right-hand stage until all searches finish right before speaking.

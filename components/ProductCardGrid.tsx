@@ -31,7 +31,7 @@ export default function ProductCardGrid({ cards, reasons, actionFx = [], startNo
         const cardNo = startNo + cardIdx;
         const matchedFx = actionFx.findLast((fx) => fx.slug === c.slug);
         const reason = reasons?.[c.slug];
-        const traitsToShow = reason ? c.traits.slice(0, 2) : c.traits.slice(0, 3);
+        const traitsToShow = reason ? c.traits.slice(0, 1) : c.traits.slice(0, 2);
         return (
           <article
             key={c.slug}
@@ -87,10 +87,12 @@ export default function ProductCardGrid({ cards, reasons, actionFx = [], startNo
                 </button>
                 <button
                   type="button"
-                  className="p-btn-detail"
+                  className="p-btn-detail st-detail-icon"
                   onClick={() => onDetail(c)}
+                  title="ดูรายละเอียดสินค้า"
+                  aria-label="ดูรายละเอียดสินค้า"
                 >
-                  ดูละเอียด
+                  <span aria-hidden="true">🔍</span>
                 </button>
               </div>
             </div>

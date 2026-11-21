@@ -22,7 +22,7 @@ export async function GET(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const raw = url.searchParams.get("slugs") ?? "";
   const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "24", 10);
-  const limit = Number.isFinite(limitRaw) ? Math.min(48, Math.max(1, limitRaw)) : 24;
+  const limit = Number.isFinite(limitRaw) ? Math.min(60, Math.max(1, limitRaw)) : 24;
 
   const seeds = [...new Set(raw.split(",").map((s) => s.trim()).filter((s) => SLUG_RE.test(s)))].slice(0, 10);
   if (!seeds.length) return Response.json({ cards: [], reasons: {} }, { status: 400 });

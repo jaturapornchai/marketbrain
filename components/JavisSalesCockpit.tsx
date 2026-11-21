@@ -150,7 +150,7 @@ const MODE_LABEL: Record<JavisStageMode, string> = {
 
 function snapKey(x: ScreenSnap): string {
   const mode = x.mode === "welcome" ? "showcase" : x.mode;
-  const cards = x.cards.slice(0, 36).map((c) => c.slug).join(",");
+  const cards = x.cards.slice(0, 60).map((c) => c.slug).join(",");
   return `${mode}|${mode === "spotlight" ? (x.spotlight?.slug ?? "") : ""}|${cards}`;
 }
 
@@ -234,6 +234,8 @@ export default function JavisSalesCockpit({
   const actionFxTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const stageCardsRef = useRef(stageCards);
   stageCardsRef.current = stageCards;
+  const stageBodyRef = useRef<HTMLDivElement>(null);
+  const prevStageListKeyRef = useRef<string | null>(null);
   const router = useRouter();
   const [screenHist, setScreenHist] = useState<{ list: ScreenSnap[]; idx: number }>({ list: [], idx: -1 });
   const screenHistRef = useRef(screenHist);
@@ -264,7 +266,7 @@ export default function JavisSalesCockpit({
     const shownSet = new Set(stageCards.map((c) => c.slug));
     return stageRelated.set.cards.filter((c) => !shownSet.has(c.slug));
   }, [stageRelatedKey, stageRelated, stageCards]);
-  const showcaseRelatedShown = useMemo(() => showcaseRelatedAll.slice(0, 16), [showcaseRelatedAll]);
+  const showcaseRelatedShown = useMemo(() => showcaseRelatedAll.slice(0, 24), [showcaseRelatedAll]);
   const spotRelatedAll = useMemo(
     () =>
       stageMode === "spotlight" && spotlight && spotRelated?.slug === spotlight.slug
@@ -272,13 +274,13 @@ export default function JavisSalesCockpit({
         : [],
     [stageMode, spotlight, spotRelated],
   );
-  const spotRelatedShown = useMemo(() => spotRelatedAll.slice(0, 16), [spotRelatedAll]);
+  const spotRelatedShown = useMemo(() => spotRelatedAll.slice(0, 24), [spotRelatedAll]);
   const cartRelatedAll = useMemo(() => {
     if (stageMode !== "cart" || !related) return [];
     const inCart = new Set(cart.items.map((it) => it.slug));
     return related.cards.filter((c) => !inCart.has(c.slug));
   }, [stageMode, related, cart.items]);
-  const cartRelatedShown = useMemo(() => cartRelatedAll.slice(0, 16), [cartRelatedAll]);
+  const cartRelatedShown = useMemo(() => cartRelatedAll.slice(0, 24), [cartRelatedAll]);
   // Single source of truth for numbered voice/text orders ("เอาเบอร์ 2 สองชิ้น", "ดูเบอร์ 3"):
   // always matches the exact numbered ProductCardGrid the customer sees right now.
   const activeNumberedCards = useMemo(() => {
@@ -291,15 +293,37 @@ export default function JavisSalesCockpit({
   }, [stageMode, spotRelatedShown, cartRelatedShown, showcaseRelatedShown, stageCards]);
   const activeNumberedCardsRef = useRef(activeNumberedCards);
   activeNumberedCardsRef.current = activeNumberedCards;
-  const openProductSpotlight = useCallback((card: JavisProductCard) => {
-    setSpotlight(card);
-    setStageMode("spotlight");
-    setStageTitle(card.title);
-    setMobileTab("stage");
-    const body = document.querySelector<HTMLElement>(".jc-stage-body");
-    if (body && body.scrollHeight > body.clientHeight + 4) body.scrollTo({ top: 0, behavior: "smooth" });
-    else window.scrollTo({ top: 0, behavior: "smooth" });
+  const scrollStageToTop = useCallback((smooth = true) => {
+    const behavior: ScrollBehavior = smooth ? "smooth" : "auto";
+    const body = stageBodyRef.current ?? document.querySelector<HTMLElement>(".jc-stage-body");
+    if (body && body.scrollTop > 0) body.scrollTo({ top: 0, behavior });
+    if (typeof window !== "undefined" && window.scrollY > 0) window.scrollTo({ top: 0, behavior });
   }, []);
+
+  useEffect(() => {
+    const listKey = stageCards.map((c) => c.slug).join(",");
+    if (prevStageListKeyRef.current === null) {
+      prevStageListKeyRef.current = listKey;
+      return;
+    }
+    if (listKey && listKey !== prevStageListKeyRef.current) {
+      prevStageListKeyRef.current = listKey;
+      const raf = requestAnimationFrame(() => scrollStageToTop(true));
+      return () => cancelAnimationFrame(raf);
+    }
+    prevStageListKeyRef.current = listKey;
+  }, [stageCards, scrollStageToTop]);
+
+  const openProductSpotlight = useCallback(
+    (card: JavisProductCard) => {
+      setSpotlight(card);
+      setStageMode("spotlight");
+      setStageTitle(card.title);
+      setMobileTab("stage");
+      requestAnimationFrame(() => scrollStageToTop(true));
+    },
+    [scrollStageToTop],
+  );
   // Continuous cross-sell: the item Nong Tee offered last ("เอาด้วย" takes it) + everything offered so far.
   const suggestRef = useRef<{ card: JavisProductCard | null; offered: Set<string> }>({ card: null, offered: new Set() });
   const nextSuggestion = (cards: JavisProductCard[]) => {
@@ -899,7 +923,7 @@ export default function JavisSalesCockpit({
 
       // What the customer is looking at right now, so "อันนั้น/ตัวแรก" in the next sentence still means something
       // Card numbers the customer sees right now (home showcase OR related grid on spotlight/cart) = focusSlugs[no - 1].
-      const focusSlugs = activeNumberedCardsRef.current.slice(0, 36).map((c) => c.slug);
+      const focusSlugs = activeNumberedCardsRef.current.slice(0, 60).map((c) => c.slug);
 
       setTurns((prev) => [
         ...prev,
@@ -1001,7 +1025,7 @@ export default function JavisSalesCockpit({
                 // so products never stay hidden behind welcome/camera/compare/old spotlight screens.
                 if (isNewCardSet) {
                   setStageMode((m) => (m === "cart" || m === "checkout" ? m : "showcase"));
-                  document.querySelector(".st-showcase")?.scrollTo({ top: 0, behavior: "smooth" });
+                  requestAnimationFrame(() => scrollStageToTop(true));
                 }
               }
               markStagePaintedSoon();
@@ -1015,6 +1039,7 @@ export default function JavisSalesCockpit({
               if (ev.title) setStageTitle(ev.title);
               if (ev.spotlight) setSpotlight(ev.spotlight);
               setMobileTab(ev.mode === "cart" ? "cart" : "stage");
+              requestAnimationFrame(() => scrollStageToTop(true));
               markStagePaintedSoon();
             } else if (ev.type === "cart") {
               replaceServerCart(ev.cart);
@@ -2144,7 +2169,7 @@ export default function JavisSalesCockpit({
     const inView = stageMode === "spotlight" && spotlight ? [spotlight.slug] : [];
     const seeds = inView.length ? inView : cart.items.length ? cart.items.map((it) => it.slug) : stageCardsRef.current.slice(0, 6).map((c) => c.slug);
     if (!seeds.length) return reportCommand("ยังไม่มีสินค้าให้สมองหาของเกี่ยวข้องครับ บอกชื่อสินค้าก่อนนะครับ", heard, true);
-    const r = await fetchRelated(seeds, 32);
+    const r = await fetchRelated(seeds, 48);
     if (!r?.cards.length) return reportCommand("สมองยังไม่พบของที่เกี่ยวข้องกับตัวนี้ครับ", heard, true);
     setRelated(r);
     setStageCards(r.cards);
@@ -2221,7 +2246,7 @@ export default function JavisSalesCockpit({
     playTing("add");
     markMission("add");
     // Show related recommendations visually on screen (silent — never speak cross-sell aloud).
-    void fetchRelated([grown.slug]).then((r) => {
+    void fetchRelated([grown.slug], 36).then((r) => {
       if (!r?.cards.length) return;
       setRelated(r);
       const pick = nextSuggestion(r.cards);
@@ -2235,7 +2260,7 @@ export default function JavisSalesCockpit({
     const seeds = stageRelatedKey.split(",").filter(Boolean);
     if (!seeds.length) return;
     let alive = true;
-    void fetchRelated(seeds, 24).then((r) => alive && r && setStageRelated({ key: stageRelatedKey, set: r }));
+    void fetchRelated(seeds, 36).then((r) => alive && r && setStageRelated({ key: stageRelatedKey, set: r }));
     return () => {
       alive = false;
     };
@@ -2246,7 +2271,7 @@ export default function JavisSalesCockpit({
     const slug = spotlight.slug;
     if (spotRelated?.slug === slug) return;
     let alive = true;
-    void fetchRelated([slug], 24).then((r) => alive && r && setSpotRelated({ slug, set: r }));
+    void fetchRelated([slug], 36).then((r) => alive && r && setSpotRelated({ slug, set: r }));
     return () => {
       alive = false;
     };
@@ -2915,7 +2940,7 @@ export default function JavisSalesCockpit({
             </button>
           </div>
 
-          <div className="jc-stage-body">
+          <div className="jc-stage-body" ref={stageBodyRef}>
             {busy && <ThinkingBrain jobs={latestJobs} cards={latestTurn?.cards ?? []} />}
             {wheelOpen && (
               <LuckyWheel
