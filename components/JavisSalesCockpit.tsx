@@ -800,19 +800,28 @@ export default function JavisSalesCockpit({
     (sentence: string) => {
       if (!ttsEnabledRef.current || !sentence.trim()) return;
       const clean = sentence.trim();
-      const promise = fetch("/api/voice/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: clean }),
-      })
-        .then(async (res) => {
-          if (!res.ok) return null;
-          const dur = Number(res.headers.get("X-Audio-Duration") || "2.2") || 2.2;
-          const buf = await res.arrayBuffer();
-          const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
-          return { url, dur, buf };
-        })
-        .catch(() => null);
+      const promise = (async () => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const res = await fetch("/api/voice/tts", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: clean }),
+            });
+            if (res.ok) {
+              const dur = Number(res.headers.get("X-Audio-Duration") || "2.2") || 2.2;
+              const buf = await res.arrayBuffer();
+              const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+              return { url, dur, buf };
+            }
+            if (res.status !== 502 && res.status !== 503 && res.status !== 504) return null;
+          } catch {
+            // transient network error: retry once below
+          }
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 300));
+        }
+        return null;
+      })();
 
       audioQueueRef.current.push({ text: clean, promise });
       void drainAudioQueue();

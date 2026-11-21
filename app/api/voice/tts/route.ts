@@ -30,14 +30,29 @@ export async function POST(req: Request): Promise<Response> {
     const text = typeof body.text === "string" ? toSpokenThai(body.text.trim().slice(0, 600)) : "";
     if (!text) return Response.json({ error: "Empty text" }, { status: 400 });
 
-    const res = await fetch(`${VOICE_URL}/tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
+    let res: Response | null = null;
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        res = await fetch(`${VOICE_URL}/tts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        lastErr = null;
+        if (res.ok || res.status < 500) break;
+      } catch (err) {
+        lastErr = err;
+        res = null;
+      }
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
+    }
 
+    if (!res) throw lastErr ?? new Error("Voice service unreachable");
     if (!res.ok) {
-      return Response.json({ error: `TTS status ${res.status}` }, { status: 502 });
+      const detail = (await res.text().catch(() => "")).slice(0, 200);
+      console.error("[api/voice/tts] upstream error", res.status, detail);
+      return Response.json({ error: `TTS status ${res.status}`, detail }, { status: 502 });
     }
 
     const dur = res.headers.get("X-Audio-Duration") || "2.0";

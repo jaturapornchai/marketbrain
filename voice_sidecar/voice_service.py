@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import warnings
 from collections import OrderedDict
@@ -336,15 +337,24 @@ def _trim_silence(arr: np.ndarray, top_db: float = 40.0) -> np.ndarray:
 
 
 audio_cache: "OrderedDict[str, tuple[bytes, float]]" = OrderedDict()
+cache_lock = threading.Lock()
 
 
 def synthesize_wav(text: str) -> tuple[bytes, float]:
     key = text.strip()
-    if key in audio_cache:
-        audio_cache.move_to_end(key)
-        return audio_cache[key]
+    with cache_lock:
+        if key in audio_cache:
+            audio_cache.move_to_end(key)
+            return audio_cache[key]
 
-    norm = normalize_text(_thai_pronounce(_say_numbers(key))).strip()
+    raw_thai = _thai_pronounce(_say_numbers(key))
+    with tts_lock:
+        try:
+            norm = normalize_text(raw_thai).strip()
+        except Exception as exc:
+            print(f"[voice_service] normalize_text failed ({type(exc).__name__}): {exc}", file=sys.stderr, flush=True)
+            norm = raw_thai.strip()
+
     if not norm:
         silent = np.zeros(TTS_SAMPLE_RATE // 10, dtype=np.float32)
         buf = io.BytesIO()
@@ -352,21 +362,37 @@ def synthesize_wav(text: str) -> tuple[bytes, float]:
         return buf.getvalue(), 0.1
 
     arr = np.zeros(0, dtype=np.float32)
-    for _ in range(3):
-        with tts_lock, torch.inference_mode():
-            wav = tts_model.generate(
-                text=norm,
-                language="th",
-                voice_clone_prompt=voice_prompt,
-                speed=TTS_SPEED,
-                generation_config=OmniVoiceGenerationConfig(num_step=TTS_STEP, guidance_scale=TTS_CFG),
-            )[0]
-        cand = np.asarray(wav, dtype=np.float32).reshape(-1) if wav is not None else np.zeros(0, dtype=np.float32)
-        if cand.size:
-            cand = _trim_silence(cand, top_db=40.0)
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            with tts_lock, torch.inference_mode():
+                wav = tts_model.generate(
+                    text=norm,
+                    language="th",
+                    voice_clone_prompt=voice_prompt,
+                    speed=TTS_SPEED,
+                    generation_config=OmniVoiceGenerationConfig(num_step=TTS_STEP, guidance_scale=TTS_CFG),
+                )[0]
+            cand = np.asarray(wav, dtype=np.float32).reshape(-1) if wav is not None else np.zeros(0, dtype=np.float32)
             if cand.size:
-                arr = level_audio(cand)
-                break
+                cand = _trim_silence(cand, top_db=40.0)
+                if cand.size:
+                    arr = level_audio(cand)
+                    last_err = None
+                    break
+        except Exception as exc:
+            last_err = exc
+            print(
+                f"[voice_service] TTS attempt {attempt + 1} failed ({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            gc.collect()
+            if has_cuda:
+                torch.cuda.empty_cache()
+
+    if not arr.size and last_err is not None:
+        raise last_err
 
     if not arr.size:
         arr = np.zeros(TTS_SAMPLE_RATE // 10, dtype=np.float32)
@@ -380,9 +406,10 @@ def synthesize_wav(text: str) -> tuple[bytes, float]:
     sf.write(buf, full, TTS_SAMPLE_RATE, format="WAV", subtype="PCM_16")
     wav_bytes = buf.getvalue()
 
-    if len(audio_cache) >= 256:
-        audio_cache.popitem(last=False)
-    audio_cache[key] = (wav_bytes, dur)
+    with cache_lock:
+        if len(audio_cache) >= 256:
+            audio_cache.popitem(last=False)
+        audio_cache[key] = (wav_bytes, dur)
     return wav_bytes, dur
 
 
@@ -455,7 +482,12 @@ async def tts_endpoint(req: Request):
     if not text:
         return JSONResponse({"error": "empty text"}, status_code=400)
     t0 = time.perf_counter()
-    wav_bytes, dur = await asyncio.to_thread(synthesize_wav, text)
+    try:
+        wav_bytes, dur = await asyncio.to_thread(synthesize_wav, text)
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
     gen_ms = round((time.perf_counter() - t0) * 1000)
     return Response(
         content=wav_bytes,

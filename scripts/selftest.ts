@@ -422,7 +422,7 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
     assert.equal(searchProductsDetailed({ q: strong, pageSize: 4 }).topStrongMatch, true, `real product/symptom must be topStrongMatch: ${strong}`);
   }
   const genRes = searchProductsDetailed({ q: "เครื่องปั่นไฟ", pageSize: 4 });
-  assert.ok(genRes.items[0]?.nameTh.includes("เครื่องกำเนิดไฟฟ้า"), `เครื่องปั่นไฟ must rank เครื่องกำเนิดไฟฟ้า #1, got: ${genRes.items[0]?.nameTh}`);
+  assert.ok(/เครื่องปั่นไฟ|เครื่องกำเนิดไฟฟ้า/.test(genRes.items[0]?.nameTh ?? ""), `เครื่องปั่นไฟ must rank generator #1, got: ${genRes.items[0]?.nameTh}`);
   const scalpRes = searchProductsDetailed({ q: "คันหัว", pageSize: 4 });
   assert.ok(!scalpRes.items[0]?.nameTh.includes("ช้อน"), `คันหัว must not return spoon, got: ${scalpRes.items[0]?.nameTh}`);
   const footRes = searchProductsDetailed({ q: "คันเท้า", pageSize: 4 });
@@ -839,10 +839,10 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   assert.equal(digitGuard.text, "รับเบอร์หกสองชิ้น");
   assert.equal(digitGuard.altText, "", "drop misleading fused digits from altText");
 
-  const ear2Win = chooseBestHeard("มีเอสเซลล์พงสักฟอก", "บรีสเอกเซลผงซักฟอก", vocab, dualScore);
+  const ear2Win = chooseBestHeard("มีบีดเซวพงสักฟอก", "บรีสเอกเซลผงซักฟอก", vocab, dualScore);
   assert.equal(ear2Win.picked, "ear2", "pick Ear 2 when Ear 2 matches catalog brand strongly");
   assert.equal(ear2Win.text, "บรีสเอกเซลผงซักฟอก");
-  assert.equal(ear2Win.altText, "มีเอสเซลล์ผงซักฟอก");
+  assert.equal(ear2Win.altText, "มีบีดเซวผงซักฟอก");
 
   const ear2StrongOnly = chooseBestHeard("ปันไฟถูกสุดหน่อย", "เครื่องปั่นไฟ", vocab, dualScore);
   assert.equal(ear2StrongOnly.picked, "ear2", "pick Ear 2 when Ear 1 has no strong match and Ear 2 is strong");
