@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useJavis } from "./JavisContext";
 
 export default function Shell({
@@ -18,6 +18,9 @@ export default function Shell({
   const router = useRouter();
   const { cart, askNongTee } = useJavis();
   const [searchVal, setSearchVal] = useState(q);
+  useEffect(() => {
+    setSearchVal(q);
+  }, [q]);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
 

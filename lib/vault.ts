@@ -13,8 +13,31 @@ import {
   type AudienceFilter,
   type RelationType,
 } from "./groups";
+import {
+  BILINGUAL_EQUIV_GROUPS,
+  buildBilingualIndex,
+  extractKnownBilingualPhrases,
+  getBilingualEquivalents,
+  TRANSLITERATED_COMPOUND_BRANDS,
+  type BilingualIndex,
+} from "./bilingual-search";
 import { compareMoney, formatThaiBaht, moneyInRange } from "./decimal-money";
-import { buildHeardVocab, type HeardVocab } from "./heard-fix";
+import { evaluateDietaryShield, type DietaryTagId } from "./dietary-shield";
+import { buildHeardVocab, soundKey, type HeardVocab } from "./heard-fix";
+import {
+  BADGE_BIT_BY_ID,
+  computeBadgeMask,
+  extractFdaNumber,
+  extractProductBadges,
+  SEMANTIC_BADGE_DEFS,
+} from "./product-badges";
+import {
+  findFuzzyCorrection,
+  flipThaiEnKeyboard,
+  parseSmartSearchQuery,
+  type FuzzyVocabEntry,
+  type SearchScope,
+} from "./smart-search";
 import { NUTRITION_KEY_THAI, SOURCE_THAI_LABEL, toCleanSlug } from "./trait-dictionary";
 import {
   getSnapshotFilePath,
@@ -207,9 +230,22 @@ export type ProductSearchQuery = {
   maxPrice?: string;
   multiUnitOnly?: boolean;
   thaiGs1Only?: boolean;
+  exclude?: string;
+  badges?: string[];
+  dietary?: DietaryTagId[];
+  scope?: SearchScope;
+  noAutoCorrect?: boolean;
   sort?: "relevance" | "price_asc" | "price_desc" | "unit_price_asc" | "pack_desc";
   page?: number;
   pageSize?: number;
+};
+
+export type BadgeFacetBucket = {
+  id: string;
+  icon: string;
+  label: string;
+  tone: string;
+  count: number;
 };
 
 export type ProductSearchResult = {
@@ -220,6 +256,13 @@ export type ProductSearchResult = {
   appliedTerms: string[];
   /** True when the #1 product strongly matches the query in its title/synonym/trait (not a stray body mention). */
   topStrongMatch: boolean;
+  elapsedMs?: number;
+  parsedHints?: string[];
+  correctedFrom?: string;
+  correctedTo?: string;
+  correctionReason?: "keyboard_layout" | "typo" | "relaxed";
+  didYouMean?: string[];
+  bilingualPairs?: Array<{ from: string; to: string }>;
   items: BrainProductItem[];
   facets: {
     categories: CategoryFacetNode[];
@@ -227,7 +270,28 @@ export type ProductSearchResult = {
     units: FacetBucket[];
     traits: FacetBucket[];
     sources: FacetBucket[];
+    badges: BadgeFacetBucket[];
   };
+};
+
+export type ProductSuggestionItem = {
+  slug: string;
+  nameTh: string;
+  brandTh: string;
+  bestPrice: string | null;
+  unitCode: string;
+  primaryBarcode: string | null;
+  isThaiGs1: boolean;
+  imageUrl: string | null;
+};
+
+export type ProductSuggestionResponse = {
+  q: string;
+  flippedQuery: string | null;
+  brands: Array<{ slug: string; label: string; count: number }>;
+  categories: Array<{ slug: string; label: string; pathLabel: string; count: number }>;
+  products: ProductSuggestionItem[];
+  queries: string[];
 };
 
 const VAULT_DIR = path.join(process.cwd(), "vault");
@@ -281,6 +345,7 @@ const COMPOUND_CLAIMS = [
   "น้ำมันปาล์ม",
   "น้ำมันพืช",
   "ซอสหอยนางรม",
+  "น้ำมันหอยเป๋าฮื้อ",
   "น้ำมันหอย",
   "กระดาษทิชชู่",
   "กระดาษเช็ดหน้า",
@@ -343,7 +408,9 @@ const COMPOUND_CLAIMS = [
   "ท้องเสีย",
   "ลดกรด",
   "ยุงกัด",
+  ...TRANSLITERATED_COMPOUND_BRANDS,
 ];
+const COMPOUND_SET = new Set(COMPOUND_CLAIMS);
 
 const SYNONYM_GROUPS: string[][] = [
   ["ไม่ใส่ผงชูรส", "no_msg", "ไร้ผงชูรส", "ไม่มีผงชูรส"],
@@ -755,6 +822,13 @@ type VaultBundle = {
   indexes: Map<AudienceFilter, SearchIndex>;
   productPostings: Map<string, Int32Array>;
   productHayTitles: string[];
+  productBodyHays: string[];
+  productFdaNumbers: string[];
+  productByFda: Map<string, number[]>;
+  productBadgeMasks: Uint16Array;
+  fuzzyVocab: FuzzyVocabEntry[];
+  brandFacetsAll: Array<{ slug: string; label: string; normLabel: string; count: number }>;
+  bilingualIndex: BilingualIndex;
 };
 
 type VaultGlobalState = {
@@ -1444,9 +1518,39 @@ function buildBundleFromSnapshot(snap: BrainSnapshot): VaultBundle {
   // Build fast inverted index over productsList for instant faceted product search
   const productsList = snap.products;
   const tempProdPostings = new Map<string, number[]>();
+  const productBodyHays: string[] = new Array(productsList.length);
+  const productFdaNumbers: string[] = new Array(productsList.length);
+  const productByFda = new Map<string, number[]>();
+  const productBadgeMasks = new Uint16Array(productsList.length);
+
   for (let i = 0; i < productsList.length; i++) {
     const p = productsList[i];
     const pNote = notes.get(p.slug)!;
+    const fda = extractFdaNumber(p) ?? "";
+    productFdaNumbers[i] = fda.toLowerCase();
+    if (fda) {
+      const fKey = fda.toLowerCase();
+      let fArr = productByFda.get(fKey);
+      if (!fArr) {
+        fArr = [];
+        productByFda.set(fKey, fArr);
+      }
+      fArr.push(i);
+    }
+    productBodyHays[i] = p.warnings ? `${pNote.haystack.body} ${normalizeText(p.warnings)}` : pNote.haystack.body;
+    const badgeList = extractProductBadges({
+      title: p.nameTh,
+      category: p.categoryPathTh,
+      brand: p.brandTh || p.brandEn,
+      fdaNumber: fda || p.fdaNumber,
+      traits: p.traits.map((t) => t.valueTh),
+      description: p.description,
+      features: p.features,
+      warnings: p.warnings,
+      specs: p.specs,
+    });
+    productBadgeMasks[i] = computeBadgeMask(badgeList);
+
     const tokSet = new Set<string>([
       ...tokenizeBodyFast(pNote.haystack.title),
       ...tokenizeBodyFast(pNote.haystack.meta),
@@ -1454,6 +1558,7 @@ function buildBundleFromSnapshot(snap: BrainSnapshot): VaultBundle {
     ]);
     for (const bc of p.barcodes) tokSet.add(bc.toLowerCase());
     tokSet.add(p.productCode.toLowerCase());
+    if (fda) tokSet.add(fda.toLowerCase());
     for (const tok of tokSet) {
       let arr = tempProdPostings.get(tok);
       if (!arr) {
@@ -1464,14 +1569,50 @@ function buildBundleFromSnapshot(snap: BrainSnapshot): VaultBundle {
     }
   }
   const productPostings = new Map<string, Int32Array>();
+  const vocabMap = new Map<string, number>();
   for (const [tok, arr] of tempProdPostings) {
     productPostings.set(tok, Int32Array.from(arr));
+    if (arr.length >= 3 && tok.length >= 4 && !/^\d+$/.test(tok) && !tok.startsWith("sz_") && /^[ก-๙a-z0-9-]+$/.test(tok)) {
+      vocabMap.set(tok, arr.length);
+    }
   }
+  for (const grp of BILINGUAL_EQUIV_GROUPS) {
+    for (const rawTerm of grp) {
+      const t = normalizeText(rawTerm.trim());
+      if (t.length >= 4 && !/\s/.test(t) && !vocabMap.has(t)) {
+        const df = tempProdPostings.get(t)?.length ?? 50;
+        if (df > 0) vocabMap.set(t, df);
+      }
+    }
+  }
+  const fuzzyVocab: FuzzyVocabEntry[] = [...vocabMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12000)
+    .map(([term, df]) => ({
+      term,
+      df,
+      sk: /[ก-๙]/.test(term) ? soundKey(term) : "",
+    }));
+
+  const brandFacetsAll = [...brandBuckets.values()]
+    .map((br) => {
+      const label =
+        br.nameEn && br.nameEn.toLowerCase() !== br.nameTh.toLowerCase() ? `${br.nameTh} (${br.nameEn})` : br.nameTh;
+      return {
+        slug: br.slug,
+        label,
+        normLabel: normalizeText(`${br.nameTh} ${br.nameEn}`),
+        count: br.products.length,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+
   const productHayTitles = productsList.map((p) => {
     const raw = normalizeText(`${p.nameTh} ${p.nameEn} ${p.brandTh} ${p.brandEn} ${p.productCode}`);
     const sz = extractCanonicalSizes(raw).tokens;
     return sz.length ? `${raw} ${sz.join(" ")}` : raw;
   });
+  const bilingualIndex = buildBilingualIndex(productsList);
 
   const stats: BrainStats = {
     totalNotes: notes.size,
@@ -1508,6 +1649,13 @@ function buildBundleFromSnapshot(snap: BrainSnapshot): VaultBundle {
     indexes: new Map(),
     productPostings,
     productHayTitles,
+    productBodyHays,
+    productFdaNumbers,
+    productByFda,
+    productBadgeMasks,
+    fuzzyVocab,
+    brandFacetsAll,
+    bilingualIndex,
   };
 }
 
@@ -1932,7 +2080,21 @@ export function search(q: string, limit = 10, filter: AudienceFilter = "all"): S
 
   // Instant exact barcode / productCode hit boost
   const exactProd = b.productByBarcode.get(trimmed) ?? b.productByCode.get(trimmed.toLowerCase());
-  const ts = terms(trimmed);
+  const phrase = normalizeText(trimmed);
+  const biSplit = phrase ? extractKnownBilingualPhrases(phrase, b.bilingualIndex) : { phrases: [], remainder: "" };
+  const rawTs = [...new Set([...biSplit.phrases, ...(biSplit.remainder ? terms(biSplit.remainder) : [])])];
+  for (const ws of phrase.split(/\s+/)) {
+    if (
+      ws.length >= 4 &&
+      /[ก-๙]/.test(ws) &&
+      !b.productPostings.has(ws) &&
+      !rawTs.includes(ws) &&
+      getBilingualEquivalents(ws, b.bilingualIndex, 0, !SYNONYM_MAP.has(ws) && !COMPOUND_SET.has(ws)).length > 0
+    ) {
+      rawTs.push(ws);
+    }
+  }
+  const ts = rawTs.length ? rawTs : terms(trimmed);
   if (!ts.length && !exactProd) return [];
 
   const idx = getSearchIndex(b, filter);
@@ -1940,6 +2102,16 @@ export function search(q: string, limit = 10, filter: AudienceFilter = "all"): S
   if (!N) return [];
 
   const synTerms = expandSynonyms(ts);
+  const bilingualExpansions = ts.flatMap((t) =>
+    getBilingualEquivalents(
+      t,
+      b.bilingualIndex,
+      b.productPostings.get(t)?.length ?? 0,
+      !SYNONYM_MAP.has(t) && !COMPOUND_SET.has(t),
+    ).flatMap((eq) =>
+      eq.includes(" ") ? eq.split(" ") : [eq],
+    ),
+  );
   const base = idx.baseBuf;
   const matched = idx.matchBuf;
   base.fill(0);
@@ -1952,6 +2124,17 @@ export function search(q: string, limit = 10, filter: AudienceFilter = "all"): S
       const docId = p.idx[k];
       base[docId] += p.raw[k] * p.idf;
       matched[docId]++;
+    }
+  }
+
+  for (let bi = 0; bi < bilingualExpansions.length; bi++) {
+    const ep = idx.postings.get(bilingualExpansions[bi]);
+    if (!ep) continue;
+    const w = ep.idf * 0.88;
+    for (let k = 0; k < ep.idx.length; k++) {
+      const docId = ep.idx[k];
+      base[docId] += ep.raw[k] * w;
+      if (matched[docId] < ts.length) matched[docId]++;
     }
   }
 
@@ -1969,16 +2152,26 @@ export function search(q: string, limit = 10, filter: AudienceFilter = "all"): S
     if (exactId !== undefined) base[exactId] += 250;
   }
 
-  const phrase = normalizeText(trimmed);
+  const bilingualTitleHints = ts.flatMap((t) =>
+    getBilingualEquivalents(
+      t,
+      b.bilingualIndex,
+      b.productPostings.get(t)?.length ?? 0,
+      !SYNONYM_MAP.has(t) && !COMPOUND_SET.has(t),
+    ),
+  );
   const ranked: { idx: number; score: number }[] = [];
   for (let i = 0; i < N; i++) {
     let sc = base[i];
-    if (sc <= 0 && phrase.length >= 3 && idx.titles[i].includes(phrase)) {
+    const titleHit =
+      phrase.length >= 2 &&
+      (idx.titles[i].includes(phrase) || bilingualTitleHints.some((bh) => idx.titles[i].includes(bh)));
+    if (sc <= 0 && titleHit) {
       sc = 45;
     }
     if (sc <= 0) continue;
-    if (ts.length > 1 && matched[i] === ts.length) sc *= 1.45;
-    if (phrase.length >= 3 && idx.titles[i].includes(phrase)) sc += 25;
+    if (ts.length > 1 && matched[i] >= ts.length) sc *= 1.45;
+    if (titleHit) sc += 25;
 
     // 1-hop synapse boost
     const nbs = idx.neighborIdx[i];
@@ -2020,128 +2213,318 @@ export function search(q: string, limit = 10, filter: AudienceFilter = "all"): S
 
 // ---------- Detailed Faceted Product Search Engine ----------
 export function searchProductsDetailed(params: ProductSearchQuery): ProductSearchResult {
+  const t0 = performance.now();
   const b = getBundle();
-  const q = (params.q ?? "").trim();
+  const rawQ = (params.q ?? "").trim();
+  const parsed = parseSmartSearchQuery(rawQ);
+  const q = parsed.cleanQuery;
   const category = params.category?.trim() || "";
   const brand = params.brand?.trim() || "";
   const unit = params.unit?.trim().toLowerCase() || "";
   const traitFilter = (params.traits ?? []).map((t) => t.trim()).filter(Boolean);
   const source = params.source?.trim() || "";
-  const minPrice = params.minPrice?.trim() || null;
-  const maxPrice = params.maxPrice?.trim() || null;
+  const minPrice = params.minPrice?.trim() || parsed.minPrice || null;
+  const maxPrice = params.maxPrice?.trim() || parsed.maxPrice || null;
   const multiUnitOnly = Boolean(params.multiUnitOnly);
   const thaiGs1Only = Boolean(params.thaiGs1Only);
-  const sort = params.sort ?? "relevance";
+  const scope: SearchScope = params.scope ?? "all";
+  const badgeFilter = (params.badges ?? []).filter((id) => Boolean(BADGE_BIT_BY_ID[id]));
+  const reqBadgeMask = badgeFilter.reduce((mask, id) => mask | (BADGE_BIT_BY_ID[id] ?? 0), 0);
+  const dietaryFilter = (params.dietary ?? []).filter(Boolean);
+  const sort =
+    params.sort && params.sort !== "relevance" ? params.sort : parsed.inferredSort ?? params.sort ?? "relevance";
   const page = Math.max(1, Math.floor(params.page ?? 1));
   const pageSize = Math.min(60, Math.max(6, Math.floor(params.pageSize ?? 24)));
 
-  const qTerms = q ? terms(q) : [];
-  const synTerms = qTerms.length ? expandSynonyms(qTerms) : [];
-  const normPhrase = normalizeText(q);
+  const rawExcludes = [
+    ...(params.exclude ? params.exclude.split(/[\s,;]+/) : []),
+    ...parsed.excludeTerms,
+  ]
+    .map((x) => x.replace(/^-+/, "").trim())
+    .filter((x) => x.length >= 2);
+  const excludeExpanded: string[] = [];
+  for (const ex of rawExcludes) {
+    const nx = normalizeText(ex);
+    if (nx && !excludeExpanded.includes(nx)) excludeExpanded.push(nx);
+    for (const eq of b.bilingualIndex.directMap.get(nx) ?? []) {
+      if (!excludeExpanded.includes(eq)) excludeExpanded.push(eq);
+    }
+  }
 
-  // Score candidate products if query `q` is provided
+  const normPhrase = normalizeText(q);
+  const biSplit = normPhrase ? extractKnownBilingualPhrases(normPhrase, b.bilingualIndex) : { phrases: [], remainder: "" };
+  const extractedTerms = [...new Set([...biSplit.phrases, ...(biSplit.remainder ? terms(biSplit.remainder) : [])])];
+  if (normPhrase) {
+    for (const ws of normPhrase.split(/\s+/)) {
+      if (
+        ws.length >= 4 &&
+        /[ก-๙]/.test(ws) &&
+        !b.productPostings.has(ws) &&
+        !extractedTerms.includes(ws) &&
+        getBilingualEquivalents(ws, b.bilingualIndex, 0, !SYNONYM_MAP.has(ws) && !COMPOUND_SET.has(ws)).length > 0
+      ) {
+        extractedTerms.push(ws);
+      }
+    }
+  }
+  const qTerms = extractedTerms.length ? extractedTerms : q ? terms(q) : [];
+  const synTerms = scope === "all" && qTerms.length ? expandSynonyms(qTerms) : [];
+  const qGroups = qTerms.map((t) => ({
+    primary: t,
+    bilingual: getBilingualEquivalents(
+      t,
+      b.bilingualIndex,
+      b.productPostings.get(t)?.length ?? 0,
+      !SYNONYM_MAP.has(t) && !COMPOUND_SET.has(t),
+    ),
+  }));
+
+  const bilingualPairs: Array<{ from: string; to: string }> = [];
+  for (const g of qGroups) {
+    if (g.bilingual.length > 0 && bilingualPairs.length < 4) {
+      bilingualPairs.push({ from: g.primary, to: g.bilingual[0] });
+    }
+  }
+
+  // Score candidate products if query text, barcode(s), or FDA number(s) are provided
   let scores: Float64Array | null = null;
   let strictMatch: Uint8Array | null = null;
   let strongTitleMatch: Uint8Array | null = null;
   let strictCount = 0;
-  if (q) {
+  const hasQuerySignals = Boolean(q || parsed.barcodes.length > 0 || parsed.fdaNumbers.length > 0);
+  if (hasQuerySignals) {
     scores = new Float64Array(b.productsList.length);
     const matchedCount = new Int32Array(b.productsList.length);
+    const exactSet = new Set<number>();
 
-    const exact = b.productByBarcode.get(q) ?? b.productByCode.get(q.toLowerCase());
+    const exact = q ? b.productByBarcode.get(q) ?? b.productByCode.get(q.toLowerCase()) : undefined;
     if (exact) {
       const eIdx = b.productsList.indexOf(exact);
-      if (eIdx >= 0) scores[eIdx] += 500;
+      if (eIdx >= 0) {
+        scores[eIdx] += 500;
+        exactSet.add(eIdx);
+      }
     }
-
-    for (const t of qTerms) {
-      const post = b.productPostings.get(t);
-      if (post) {
-        const idf = Math.log(1 + b.productsList.length / (1 + post.length));
-        for (let k = 0; k < post.length; k++) {
-          scores[post[k]] += 12 * idf;
-          matchedCount[post[k]]++;
+    for (const bc of parsed.barcodes) {
+      const hit = b.productByBarcode.get(bc);
+      if (hit) {
+        const idx = b.productsList.indexOf(hit);
+        if (idx >= 0) {
+          scores[idx] += 500;
+          exactSet.add(idx);
         }
-      }
-    }
-    // Synonyms only widen recall: count the single best synonym hit, never a sum that could outrank a real term match
-    const synBest = new Float64Array(b.productsList.length);
-    for (const st of synTerms) {
-      const post = b.productPostings.get(st);
-      if (post) {
-        const synScore = 4.5 * Math.log(1 + b.productsList.length / (1 + post.length));
-        for (let k = 0; k < post.length; k++) {
-          if (synScore > synBest[post[k]]) synBest[post[k]] = synScore;
-        }
-      }
-    }
-    strictMatch = new Uint8Array(b.productsList.length);
-    strongTitleMatch = new Uint8Array(b.productsList.length);
-    // Single unspaced Thai words split into 2 segments (e.g. "ถูกต้อง" -> ["ถูก","ต้อง"]) must match both segments
-    // in the title to count as a strong title hit; spaced 2-term product+trait queries keep 1 title + 2 matched.
-    const needTitleTerms =
-      qTerms.length <= 1 ? 1 : qTerms.length === 2 ? (/\s/.test(normPhrase) ? 1 : 2) : Math.ceil(qTerms.length * 0.6);
-    const needMatchedTerms = qTerms.length <= 2 ? qTerms.length : Math.ceil(qTerms.length * 0.6);
-
-    // Substring fallback on normalized title/brand/barcode so partial Thai/code queries always find matches
-    for (let i = 0; i < b.productsList.length; i++) {
-      const p = b.productsList[i];
-      scores[i] += synBest[i];
-      const allTerms = qTerms.length > 0 && matchedCount[i] === qTerms.length;
-      if (qTerms.length > 1 && allTerms) {
-        scores[i] *= 1.6;
-      }
-      let phraseHit = false;
-      let titleTermHits = 0;
-      let synTitleHit = false;
-      if (normPhrase.length >= 2) {
-        const hayTitle = b.productHayTitles[i];
-        // A term that is in the product name itself says far more than one buried in the description
-        for (const t of qTerms) {
-          if (hayTitle.includes(t)) {
-            scores[i] += 18;
-            titleTermHits++;
+      } else {
+        for (let i = 0; i < b.productsList.length; i++) {
+          if (b.productsList[i].barcodes.some((pb) => pb.includes(bc))) {
+            scores[i] += 240;
+            exactSet.add(i);
           }
         }
-        // Only boost synonym title hits when no primary query term matched directly (e.g. "น้ำมันพืช" -> "น้ำมันปาล์ม"),
-        // so synonyms can never outrank exact matches on the named product.
-        if (matchedCount[i] === 0 && synBest[i] > 0 && synTerms.some((st) => hayTitle.includes(st))) {
-          scores[i] += 18;
-          synTitleHit = true;
-        }
-        const inPrep = "ใน" + normPhrase;
-        const isInPrepositionOnly =
-          hayTitle.includes(inPrep) && !hayTitle.split(inPrep).join(" ").includes(normPhrase);
-        if (isInPrepositionOnly) {
-          // "ปลาทูน่าในน้ำมันพืช" is packed IN vegetable oil, not a bottle of vegetable oil.
-          scores[i] *= 0.15;
-        } else if (hayTitle.includes(normPhrase)) {
-          scores[i] += 35;
-          phraseHit = true;
-        } else if (p.barcodes.some((bc) => bc.includes(q))) {
-          scores[i] += 80;
-          phraseHit = true;
-        } else if (matchedCount[i] > 0 && titleTermHits === 0 && p !== exact) {
-          // Body-only mention (e.g. a mushroom recipe mentioning "ผัดน้ำมันหอย") must not beat real titles/synonyms.
-          scores[i] *= 0.35;
-        }
       }
-      const traitHit =
-        qTerms.length === 1 &&
-        matchedCount[i] > 0 &&
-        p.traits.some((tr) => normalizeText(tr.valueTh).includes(qTerms[0]) || tr.slug.includes(qTerms[0]));
-      if (
-        p === exact ||
-        phraseHit ||
-        (qTerms.length > 0 && titleTermHits >= needTitleTerms && matchedCount[i] >= needMatchedTerms) ||
-        (synTitleHit && qTerms.length <= 2) ||
-        traitHit
-      ) {
-        strongTitleMatch[i] = 1;
+    }
+    for (const fda of parsed.fdaNumbers) {
+      for (const fIdx of b.productByFda.get(fda.toLowerCase()) ?? []) {
+        scores[fIdx] += 500;
+        exactSet.add(fIdx);
       }
-      if (allTerms || phraseHit || p === exact) {
-        strictMatch[i] = 1;
+    }
+
+    if (scope === "code" && q) {
+      const qCode = q.toLowerCase().trim();
+      const qDigits = qCode.replace(/[\s-]+/g, "");
+      const isAlphaCode = /^[a-z0-9-]{3,}$/i.test(qCode);
+      strictMatch = new Uint8Array(b.productsList.length);
+      strongTitleMatch = new Uint8Array(b.productsList.length);
+      for (const eIdx of exactSet) {
+        strongTitleMatch[eIdx] = 1;
+        strictMatch[eIdx] = 1;
         strictCount++;
+      }
+      for (let i = 0; i < b.productsList.length; i++) {
+        const p = b.productsList[i];
+        let matchedCode = exactSet.has(i);
+        if (!matchedCode && qCode.length >= 3 && p.productCode.toLowerCase().includes(qCode)) {
+          scores[i] += 260;
+          matchedCode = true;
+        } else if (!matchedCode && qCode.length >= 4 && b.productFdaNumbers[i].includes(qCode)) {
+          scores[i] += 260;
+          matchedCode = true;
+        } else if (!matchedCode && qDigits.length >= 4 && p.barcodes.some((bc) => bc.includes(qDigits))) {
+          scores[i] += 240;
+          matchedCode = true;
+        } else if (!matchedCode && isAlphaCode && b.productHayTitles[i].includes(normalizeText(qCode))) {
+          scores[i] += 180;
+          matchedCode = true;
+        }
+        if (matchedCode) {
+          strongTitleMatch[i] = 1;
+          strictMatch[i] = 1;
+          strictCount++;
+        }
+      }
+    } else {
+      const groupBuf = new Float64Array(b.productsList.length);
+      for (const g of qGroups) {
+        const touched: number[] = [];
+        const primaryPost = b.productPostings.get(g.primary);
+        let maxDf = primaryPost?.length ?? 0;
+        for (const eq of g.bilingual) {
+          if (!eq.includes(" ")) {
+            const len = b.productPostings.get(eq)?.length ?? 0;
+            if (len > maxDf) maxDf = len;
+          }
+        }
+        const groupIdf = Math.log(1 + b.productsList.length / (1 + maxDf));
+        if (primaryPost) {
+          const pts = 12 * groupIdf + 2;
+          for (let k = 0; k < primaryPost.length; k++) {
+            const pIdx = primaryPost[k];
+            if (groupBuf[pIdx] === 0) touched.push(pIdx);
+            if (pts > groupBuf[pIdx]) groupBuf[pIdx] = pts;
+          }
+        }
+        for (const eq of g.bilingual) {
+          if (eq.includes(" ")) {
+            const parts = eq.split(" ").filter(Boolean);
+            const firstPost = parts.length ? b.productPostings.get(parts[0]) : undefined;
+            if (!firstPost) continue;
+            const pts = 11.5 * Math.min(groupIdf, Math.log(1 + b.productsList.length / (1 + firstPost.length)));
+            for (let k = 0; k < firstPost.length; k++) {
+              const pIdx = firstPost[k];
+              if (b.productHayTitles[pIdx].includes(eq)) {
+                if (groupBuf[pIdx] === 0) touched.push(pIdx);
+                if (pts > groupBuf[pIdx]) groupBuf[pIdx] = pts;
+              }
+            }
+          } else {
+            const eqPost = b.productPostings.get(eq);
+            if (!eqPost) continue;
+            const pts = 11.5 * groupIdf;
+            for (let k = 0; k < eqPost.length; k++) {
+              const pIdx = eqPost[k];
+              if (groupBuf[pIdx] === 0) touched.push(pIdx);
+              if (pts > groupBuf[pIdx]) groupBuf[pIdx] = pts;
+            }
+          }
+        }
+        for (let k = 0; k < touched.length; k++) {
+          const pIdx = touched[k];
+          scores[pIdx] += groupBuf[pIdx];
+          matchedCount[pIdx]++;
+          groupBuf[pIdx] = 0;
+        }
+      }
+      // Synonyms only widen recall: count the single best synonym hit, never a sum that could outrank a real term match
+      const synBest = new Float64Array(b.productsList.length);
+      for (const st of synTerms) {
+        const post = b.productPostings.get(st);
+        if (post) {
+          const synScore = 4.5 * Math.log(1 + b.productsList.length / (1 + post.length));
+          for (let k = 0; k < post.length; k++) {
+            if (synScore > synBest[post[k]]) synBest[post[k]] = synScore;
+          }
+        }
+      }
+      strictMatch = new Uint8Array(b.productsList.length);
+      strongTitleMatch = new Uint8Array(b.productsList.length);
+      const needTitleTerms =
+        qGroups.length <= 1 ? 1 : qGroups.length === 2 ? (/\s/.test(normPhrase) ? 1 : 2) : Math.ceil(qGroups.length * 0.6);
+      const needMatchedTerms = qGroups.length <= 2 ? qGroups.length : Math.ceil(qGroups.length * 0.6);
+
+      for (let i = 0; i < b.productsList.length; i++) {
+        const p = b.productsList[i];
+        scores[i] += synBest[i];
+        const allTerms = qGroups.length > 0 && matchedCount[i] === qGroups.length;
+        if (qGroups.length > 1 && allTerms) {
+          scores[i] *= 1.6;
+        }
+        let phraseHit = exactSet.has(i);
+        let titleTermHits = 0;
+        let synTitleHit = false;
+        if (normPhrase.length >= 2) {
+          const hayTitle = b.productHayTitles[i];
+          for (const g of qGroups) {
+            if (hayTitle.includes(g.primary)) {
+              scores[i] += 20;
+              titleTermHits++;
+            } else if (g.bilingual.some((eq) => hayTitle.includes(eq))) {
+              scores[i] += 18;
+              titleTermHits++;
+            }
+          }
+          if (scores[i] > 0) {
+            const normBrandTh = p.brandTh ? normalizeText(p.brandTh) : "";
+            const normBrandEn = p.brandEn ? normalizeText(p.brandEn) : "";
+            for (const g of qGroups) {
+              if (
+                (normBrandTh && (normBrandTh === g.primary || g.bilingual.includes(normBrandTh))) ||
+                (normBrandEn && (normBrandEn === g.primary || g.bilingual.includes(normBrandEn)))
+              ) {
+                scores[i] += 16;
+              }
+            }
+          }
+          if (matchedCount[i] === 0 && synBest[i] > 0 && synTerms.some((st) => hayTitle.includes(st))) {
+            scores[i] += 18;
+            synTitleHit = true;
+          }
+          const inPrep = "ใน" + normPhrase;
+          const isInPrepositionOnly =
+            hayTitle.includes(inPrep) && !hayTitle.split(inPrep).join(" ").includes(normPhrase);
+          const eqPhraseHit =
+            qGroups.length === 1 && qGroups[0].bilingual.some((eq) => hayTitle.includes(eq));
+          if (isInPrepositionOnly) {
+            scores[i] *= 0.15;
+          } else if (hayTitle.includes(normPhrase)) {
+            scores[i] += 35;
+            phraseHit = true;
+          } else if (eqPhraseHit) {
+            scores[i] += 32;
+            phraseHit = true;
+          } else if (p.barcodes.some((bc) => bc.includes(q))) {
+            scores[i] += 80;
+            phraseHit = true;
+          } else if (matchedCount[i] > 0 && titleTermHits === 0 && !exactSet.has(i)) {
+            scores[i] *= 0.35;
+          }
+        }
+        const traitHit =
+          qGroups.length === 1 &&
+          matchedCount[i] > 0 &&
+          p.traits.some(
+            (tr) =>
+              normalizeText(tr.valueTh).includes(qGroups[0].primary) ||
+              tr.slug.includes(qGroups[0].primary) ||
+              qGroups[0].bilingual.some((eq) => normalizeText(tr.valueTh).includes(eq) || tr.slug.includes(eq)),
+          );
+        if (scope === "title" && qGroups.length > 0 && titleTermHits === 0 && !phraseHit && !synTitleHit && !exactSet.has(i)) {
+          scores[i] = 0;
+          continue;
+        }
+        if (scope === "ingredients" && normPhrase.length >= 2) {
+          const bodyHay = b.productBodyHays[i];
+          const inBody =
+            bodyHay.includes(normPhrase) ||
+            qGroups.some((g) => bodyHay.includes(g.primary) || g.bilingual.some((eq) => bodyHay.includes(eq)));
+          if (!inBody && !exactSet.has(i)) {
+            scores[i] = 0;
+            continue;
+          }
+          scores[i] += 25;
+        }
+        if (
+          exactSet.has(i) ||
+          phraseHit ||
+          (qGroups.length > 0 && titleTermHits >= needTitleTerms && matchedCount[i] >= needMatchedTerms) ||
+          (synTitleHit && qGroups.length <= 2) ||
+          traitHit
+        ) {
+          strongTitleMatch[i] = 1;
+        }
+        if ((allTerms && (titleTermHits > 0 || traitHit)) || phraseHit || exactSet.has(i)) {
+          strictMatch[i] = 1;
+          strictCount++;
+        }
       }
     }
   }
@@ -2154,10 +2537,9 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
   const unitCounts = new Map<string, { label: string; count: number }>();
   const traitCounts = new Map<string, { label: string; group: string; count: number }>();
   const srcCounts = new Map<string, { label: string; count: number }>();
+  const badgeCounts = new Int32Array(SEMANTIC_BADGE_DEFS.length);
 
   const matchedIndices: number[] = [];
-  // Enforce all-term strict matching when sorting by price/pack OR when querying a specific pipe/hardware size (e.g. "ข้องอ 4 หุน" -> sz_1_2_)
-  // so 1-1/2" elbows or 4-hun concrete posts never pollute 1/2" elbow results.
   const hasSizeTerm = qTerms.some((t) => t.startsWith("sz_"));
   const strictOnly = (sort !== "relevance" || hasSizeTerm) && strictCount > 0 ? strictMatch : null;
 
@@ -2170,6 +2552,13 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
     if (thaiGs1Only && !p.isThaiGs1) continue;
     if (!moneyInRange(p.bestPrice, minPrice, maxPrice)) continue;
 
+    if (excludeExpanded.length > 0) {
+      const exHay = `${b.productHayTitles[i]} ${b.productBodyHays[i]}`;
+      if (excludeExpanded.some((ex) => exHay.includes(ex))) continue;
+    }
+
+    const pMask = b.productBadgeMasks[i];
+    const passBadges = reqBadgeMask === 0 || (pMask & reqBadgeMask) === reqBadgeMask;
     const passCat = !allowedCatSet || p.categorySlugs.some((cs) => allowedCatSet.has(cs));
     const passBrand = !brand || p.brandSlug === brand;
     const passUnit =
@@ -2181,16 +2570,35 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
       traitFilter.length === 0 || traitFilter.every((tf) => p.traits.some((pt) => pt.slug === tf));
     const passSource = !source || p.sources.some((s) => s.source === source);
 
+    let passDietary = true;
+    if (dietaryFilter.length > 0 && passBadges && passCat && passBrand && passUnit && passTraits && passSource) {
+      const verdict = evaluateDietaryShield(
+        {
+          title: p.nameTh,
+          traits: p.traits.map((t) => t.valueTh),
+          ingredients: p.ingredients,
+          warnings: p.warnings,
+          nutrition: p.nutrition,
+          description: p.description,
+        },
+        dietaryFilter,
+      );
+      if (verdict.status === "warn" || (dietaryFilter.includes("halal") && verdict.status !== "safe")) {
+        passDietary = false;
+      }
+    }
+    if (!passDietary) continue;
+
     // Count facets with contextual cross-filtering
-    if (passBrand && passUnit && passTraits && passSource) {
+    if (passBadges && passBrand && passUnit && passTraits && passSource) {
       for (const cs of p.categorySlugs) catCounts.set(cs, (catCounts.get(cs) ?? 0) + 1);
     }
-    if (passCat && passUnit && passTraits && passSource && p.brandSlug) {
+    if (passBadges && passCat && passUnit && passTraits && passSource && p.brandSlug) {
       const label = p.brandTh || p.brandEn;
       const cur = brandCounts.get(p.brandSlug);
       brandCounts.set(p.brandSlug, { label, count: (cur?.count ?? 0) + 1 });
     }
-    if (passCat && passBrand && passTraits && passSource) {
+    if (passBadges && passCat && passBrand && passTraits && passSource) {
       const uSet = new Set<string>([p.unitCode, ...p.unitConversions.map((u) => u.unitCode)]);
       for (const uc of uSet) {
         const key = uc.toLowerCase();
@@ -2198,13 +2606,13 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
         unitCounts.set(key, { label: uc, count: (cur?.count ?? 0) + 1 });
       }
     }
-    if (passCat && passBrand && passUnit && passSource) {
+    if (passBadges && passCat && passBrand && passUnit && passSource) {
       for (const tr of p.traits) {
         const cur = traitCounts.get(tr.slug);
         traitCounts.set(tr.slug, { label: tr.valueTh, group: tr.groupLabelTh, count: (cur?.count ?? 0) + 1 });
       }
     }
-    if (passCat && passBrand && passUnit && passTraits) {
+    if (passBadges && passCat && passBrand && passUnit && passTraits) {
       const seenS = new Set<string>();
       for (const s of p.sources) {
         if (seenS.has(s.source)) continue;
@@ -2213,9 +2621,85 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
         srcCounts.set(s.source, { label: s.label, count: (cur?.count ?? 0) + 1 });
       }
     }
-
     if (passCat && passBrand && passUnit && passTraits && passSource) {
+      for (let bi = 0; bi < SEMANTIC_BADGE_DEFS.length; bi++) {
+        if (pMask & SEMANTIC_BADGE_DEFS[bi].bit) badgeCounts[bi]++;
+      }
+    }
+
+    if (passBadges && passCat && passBrand && passUnit && passTraits && passSource) {
       matchedIndices.push(i);
+    }
+  }
+
+  // Zero-result smart auto-recovery: keyboard layout flip -> bounded Damerau-Levenshtein/phonetic typo fix
+  if (
+    matchedIndices.length === 0 &&
+    q &&
+    !params.noAutoCorrect &&
+    parsed.barcodes.length === 0 &&
+    parsed.fdaNumbers.length === 0
+  ) {
+    const flipped = flipThaiEnKeyboard(q);
+    if (flipped && flipped !== q) {
+      const alt = searchProductsDetailed({
+        ...params,
+        q: flipped,
+        minPrice: minPrice ?? undefined,
+        maxPrice: maxPrice ?? undefined,
+        exclude: rawExcludes.length ? rawExcludes.join(",") : undefined,
+        sort,
+        noAutoCorrect: true,
+      });
+      if (alt.total > 0) {
+        return {
+          ...alt,
+          correctedFrom: q,
+          correctedTo: flipped,
+          correctionReason: "keyboard_layout",
+          parsedHints: parsed.parsedHints.length ? parsed.parsedHints : alt.parsedHints,
+          elapsedMs: Math.max(1, Math.round(performance.now() - t0)),
+        };
+      }
+    }
+
+    const toks = normPhrase.split(/\s+/).filter(Boolean);
+    if (toks.length >= 1 && toks.length <= 3 && !COMPOUND_SET.has(normPhrase)) {
+      let changed = false;
+      const altsSet = new Set<string>();
+      const fixedToks = toks.map((tok) => {
+        if (tok.length < 4 || COMPOUND_SET.has(tok) || b.productPostings.has(tok)) return tok;
+        const cands = findFuzzyCorrection(tok, b.fuzzyVocab, soundKey);
+        if (cands.length > 0) {
+          changed = true;
+          for (const c of cands) altsSet.add(c);
+          return cands[0];
+        }
+        return tok;
+      });
+      const fixedQ = fixedToks.join(" ");
+      if (changed && fixedQ !== normPhrase) {
+        const alt = searchProductsDetailed({
+          ...params,
+          q: fixedQ,
+          minPrice: minPrice ?? undefined,
+          maxPrice: maxPrice ?? undefined,
+          exclude: rawExcludes.length ? rawExcludes.join(",") : undefined,
+          sort,
+          noAutoCorrect: true,
+        });
+        if (alt.total > 0) {
+          return {
+            ...alt,
+            correctedFrom: q,
+            correctedTo: fixedQ,
+            correctionReason: "typo",
+            didYouMean: [...altsSet].filter((c) => c !== fixedQ).slice(0, 4),
+            parsedHints: parsed.parsedHints.length ? parsed.parsedHints : alt.parsedHints,
+            elapsedMs: Math.max(1, Math.round(performance.now() - t0)),
+          };
+        }
+      }
     }
   }
 
@@ -2236,6 +2720,17 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
   const safePage = Math.min(page, totalPages);
   const start = (safePage - 1) * pageSize;
   const items = matchedIndices.slice(start, start + pageSize).map((idx) => b.productsList[idx]);
+
+  const didYouMean: string[] = [];
+  if (total === 0 && q && !COMPOUND_SET.has(normPhrase)) {
+    const flipped = flipThaiEnKeyboard(q);
+    if (flipped && flipped !== q) didYouMean.push(flipped);
+    for (const tok of normPhrase.split(/\s+/).filter((t) => t.length >= 4).slice(0, 2)) {
+      for (const c of findFuzzyCorrection(tok, b.fuzzyVocab, soundKey)) {
+        if (!didYouMean.includes(c)) didYouMean.push(c);
+      }
+    }
+  }
 
   // Build hierarchical Category Tree (depths 1..3 for clean UI navigation)
   function buildCatTree(parentSlug: string | null, depth: number): CategoryFacetNode[] {
@@ -2258,13 +2753,27 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
     return list.sort((x, y) => y.count - x.count || x.label.localeCompare(y.label, "th"));
   }
 
+  const badgeFacets: BadgeFacetBucket[] = SEMANTIC_BADGE_DEFS.map((d, idx) => ({
+    id: d.id,
+    icon: d.icon,
+    label: d.label,
+    tone: d.tone,
+    count: badgeCounts[idx],
+  }))
+    .filter((bf) => bf.count > 0 || badgeFilter.includes(bf.id))
+    .sort((a, b2) => b2.count - a.count);
+
   return {
     total,
     page: safePage,
     pageSize,
     totalPages,
     appliedTerms: qTerms,
-    topStrongMatch: !q || (matchedIndices.length > 0 && Boolean(strongTitleMatch?.[matchedIndices[0]])),
+    topStrongMatch: !hasQuerySignals || (matchedIndices.length > 0 && Boolean(strongTitleMatch?.[matchedIndices[0]])),
+    elapsedMs: Math.max(1, Math.round(performance.now() - t0)),
+    parsedHints: parsed.parsedHints.length ? parsed.parsedHints : undefined,
+    didYouMean: didYouMean.length ? didYouMean.slice(0, 4) : undefined,
+    bilingualPairs: bilingualPairs.length ? bilingualPairs : undefined,
     items,
     facets: {
       categories: buildCatTree(null, 1).slice(0, 30),
@@ -2283,7 +2792,96 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
       sources: [...srcCounts.entries()]
         .map(([slug, v]) => ({ slug, label: v.label, count: v.count }))
         .sort((x, y) => y.count - x.count),
+      badges: badgeFacets,
     },
+  };
+}
+
+/**
+ * Instant autocomplete suggestions (< 15ms) across brands, categories, products, and keyboard/bilingual hints.
+ */
+export function suggestProducts(rawQ: string): ProductSuggestionResponse {
+  const b = getBundle();
+  const q = rawQ.trim();
+  if (!q) {
+    return { q: "", flippedQuery: null, brands: [], categories: [], products: [], queries: [] };
+  }
+
+  const parsed = parseSmartSearchQuery(q);
+  const cleanQ = parsed.cleanQuery || q;
+  const normQ = normalizeText(cleanQ);
+  const biEquivs = getBilingualEquivalents(
+    normQ,
+    b.bilingualIndex,
+    b.productPostings.get(normQ)?.length ?? 0,
+    !SYNONYM_MAP.has(normQ) && !COMPOUND_SET.has(normQ),
+  );
+  const prefixMatches: string[] = [];
+  if (normQ.length >= 2) {
+    for (const [k, eqs] of b.bilingualIndex.directMap) {
+      if (k.startsWith(normQ)) {
+        if (!prefixMatches.includes(k)) prefixMatches.push(k);
+        for (const eq of eqs) {
+          if (!prefixMatches.includes(eq)) prefixMatches.push(eq);
+        }
+        if (prefixMatches.length >= 6) break;
+      }
+    }
+  }
+  const needleSet = [...new Set([normQ, ...biEquivs.slice(0, 3), ...prefixMatches])].filter((s) => s.length >= 2);
+
+  const brands = b.brandFacetsAll
+    .filter((br) => needleSet.some((nd) => br.normLabel.includes(nd)))
+    .slice(0, 4)
+    .map(({ slug, label, count }) => ({ slug, label, count }));
+
+  const catHits: Array<{ slug: string; label: string; pathLabel: string; count: number }> = [];
+  for (const c of b.categoriesMap.values()) {
+    if (c.productSlugs.length === 0) continue;
+    const normLabel = normalizeText(`${c.label} ${c.pathLabel}`);
+    if (needleSet.some((nd) => normLabel.includes(nd))) {
+      catHits.push({
+        slug: c.slug,
+        label: c.label,
+        pathLabel: c.pathLabel,
+        count: c.productSlugs.length,
+      });
+    }
+  }
+  const categories = catHits.sort((a, b2) => b2.count - a.count).slice(0, 4);
+
+  let searchRes = searchProductsDetailed({ q, pageSize: 6 });
+  if ((searchRes.items.length === 0 || !searchRes.topStrongMatch) && prefixMatches.length > 0) {
+    const prefRes = searchProductsDetailed({ q: prefixMatches[0], pageSize: 6 });
+    if (prefRes.items.length > 0) searchRes = prefRes;
+  }
+  const products: ProductSuggestionItem[] = searchRes.items.slice(0, 5).map((p) => ({
+    slug: p.slug,
+    nameTh: p.nameTh,
+    brandTh: p.brandTh || p.brandEn || "",
+    bestPrice: p.bestPrice,
+    unitCode: p.unitCode,
+    primaryBarcode: p.primaryBarcode,
+    isThaiGs1: p.isThaiGs1,
+    imageUrl: p.imageUrl,
+  }));
+
+  const flippedRaw = flipThaiEnKeyboard(cleanQ);
+  const flippedQuery = flippedRaw && flippedRaw !== cleanQ ? flippedRaw : null;
+  const querySet = new Set<string>();
+  if (searchRes.correctedTo && searchRes.correctedTo !== cleanQ) querySet.add(searchRes.correctedTo);
+  if (flippedQuery) querySet.add(flippedQuery);
+  for (const pm of prefixMatches.slice(0, 3)) querySet.add(pm);
+  for (const eq of biEquivs.slice(0, 2)) querySet.add(eq);
+  for (const d of searchRes.didYouMean ?? []) querySet.add(d);
+
+  return {
+    q,
+    flippedQuery,
+    brands,
+    categories,
+    products,
+    queries: [...querySet].filter((s) => s && s.toLowerCase() !== q.toLowerCase()).slice(0, 4),
   };
 }
 

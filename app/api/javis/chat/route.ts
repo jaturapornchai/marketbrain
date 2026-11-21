@@ -1,4 +1,5 @@
 import type { CartItem, CustomerCheckoutInfo } from "@/lib/cart-order";
+import { DIETARY_TAGS, type DietaryTagId } from "@/lib/dietary-shield";
 import { PRIMARY_LOCAL_MODEL, runNongTeeTurn, type JavisChatMessage } from "@/lib/nong-tee";
 import { appendLlmDevLog, appendVoiceLog, type LlmProviderKind } from "@/lib/voice-log";
 
@@ -24,6 +25,7 @@ export async function POST(req: Request): Promise<Response> {
     pendingSlug?: unknown;
     viewingSlug?: unknown;
     couponCode?: unknown;
+    dietaryTags?: unknown;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -66,6 +68,11 @@ export async function POST(req: Request): Promise<Response> {
 
   const focusSlugs = Array.isArray(body.focusSlugs)
     ? body.focusSlugs.filter((x): x is string => typeof x === "string" && x.length <= 160).slice(0, 60)
+    : undefined;
+
+  const validDietaryIds = new Set<string>(DIETARY_TAGS.map((t) => t.id));
+  const dietaryTags = Array.isArray(body.dietaryTags)
+    ? (body.dietaryTags.filter((x): x is DietaryTagId => typeof x === "string" && validDietaryIds.has(x)) as DietaryTagId[]).slice(0, 8)
     : undefined;
 
   const encoder = new TextEncoder();
@@ -116,6 +123,7 @@ export async function POST(req: Request): Promise<Response> {
           visionSlugs,
           visionSummary,
           focusSlugs,
+          dietaryTags,
           couponCode: typeof body.couponCode === "string" && body.couponCode.length <= 20 ? body.couponCode : undefined,
           pendingSlug: typeof body.pendingSlug === "string" && body.pendingSlug.length <= 160 ? body.pendingSlug : undefined,
           viewingSlug: typeof body.viewingSlug === "string" && body.viewingSlug.length <= 160 ? body.viewingSlug : undefined,

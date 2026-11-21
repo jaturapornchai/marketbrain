@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Decimal from "decimal.js";
+import { evaluateDietaryShield } from "@/lib/dietary-shield";
+import { computePackUpgrade } from "@/lib/wholesale-tools";
 import { useJavis } from "./JavisContext";
 
 Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
@@ -19,7 +21,7 @@ function bumpQty(el: HTMLElement | null) {
 }
 
 export default function AddToCartModal() {
-  const { qtyModalProduct, closeQtyModal, addToCart } = useJavis();
+  const { qtyModalProduct, closeQtyModal, addToCart, dietaryTags } = useJavis();
   const [qty, setQty] = useState(1);
   const [selectedUnitIdx, setSelectedUnitIdx] = useState(0);
   const qtyInputRef = useRef<HTMLInputElement>(null);
@@ -67,6 +69,32 @@ export default function AddToCartModal() {
     }
   }, [activeUnit, qty]);
 
+  const dietaryVerdict = useMemo(
+    () => (qtyModalProduct && dietaryTags.length > 0 ? evaluateDietaryShield(qtyModalProduct, dietaryTags) : null),
+    [dietaryTags, qtyModalProduct],
+  );
+
+  const modalPackUpgrade = useMemo(() => {
+    if (!qtyModalProduct || !activeUnit || qtyModalProduct.unitOptions.length < 2) return null;
+    const candidates = qtyModalProduct.unitOptions.map((u) => ({
+      slug: qtyModalProduct.slug,
+      title: qtyModalProduct.title,
+      unitCode: u.unitCode,
+      packQty: u.packQty,
+      unitPrice: u.price,
+    }));
+    return computePackUpgrade(
+      {
+        slug: qtyModalProduct.slug,
+        unitCode: activeUnit.unitCode,
+        packQty: activeUnit.packQty,
+        qty,
+        unitPrice: activeUnit.price,
+      },
+      candidates,
+    );
+  }, [activeUnit, qty, qtyModalProduct]);
+
   if (!qtyModalProduct || !activeUnit) return null;
 
   return (
@@ -94,6 +122,31 @@ export default function AddToCartModal() {
             </div>
           </div>
         </div>
+
+        {dietaryVerdict?.status === "warn" && (
+          <div className="qty-diet-warn">
+            ⚠️ <strong>แจ้งเตือนเกราะสุขภาพ:</strong> สินค้านี้พบข้อมูลตรงกับเงื่อนไข {dietaryVerdict.warnLabels.join(", ")}
+          </div>
+        )}
+
+        {modalPackUpgrade && (
+          <div className="qty-pack-hint">
+            <span>💡 {modalPackUpgrade.reasonTh}</span>
+            <button
+              type="button"
+              className="btn-upgrade-mini"
+              onClick={() => {
+                const idx = qtyModalProduct.unitOptions.findIndex((u) => u.unitCode === modalPackUpgrade.targetUnitCode);
+                if (idx >= 0) {
+                  setSelectedUnitIdx(idx);
+                  setQty(modalPackUpgrade.targetQty);
+                }
+              }}
+            >
+              สลับเลย
+            </button>
+          </div>
+        )}
 
         {qtyModalProduct.unitOptions.length > 1 && (
           <div className="qty-section">

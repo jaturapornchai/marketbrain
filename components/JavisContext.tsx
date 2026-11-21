@@ -4,6 +4,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import Decimal from "decimal.js";
 import type { CartItem, CartSummary, CustomerCheckoutInfo } from "@/lib/cart-order";
+import { DIETARY_TAGS, type DietaryTagId } from "@/lib/dietary-shield";
 import type { JavisProductCard } from "@/lib/product-card";
 import { applyCoupon, findPromotion } from "@/lib/promotions";
 
@@ -12,6 +13,7 @@ Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
 const CART_STORAGE_KEY = "mb_nongtee_cart_v1";
 const CUSTOMER_STORAGE_KEY = "mb_nongtee_customer_v1";
 const COUPON_STORAGE_KEY = "mb_nongtee_coupon_v1";
+const DIETARY_STORAGE_KEY = "mb_dietary_shield_v1";
 const DEV_MIC_KEY = "mb.dev.audioinput";
 const DEV_SPK_KEY = "mb.dev.audiooutput";
 const DEV_CAM_KEY = "mb.dev.videoinput";
@@ -89,6 +91,10 @@ type JavisContextValue = {
   pendingVision: PendingVisionPayload | null;
   qtyModalProduct: JavisProductCard | null;
   lastAddedNotice: string;
+  dietaryTags: DietaryTagId[];
+  toggleDietaryTag: (id: DietaryTagId) => void;
+  setDietaryTags: (tags: DietaryTagId[]) => void;
+  clearDietaryTags: () => void;
   micDeviceId: string;
   speakerDeviceId: string;
   cameraDeviceId: string;
@@ -102,6 +108,12 @@ type JavisContextValue = {
   promptAddToCart: (product: JavisProductCard) => void;
   closeQtyModal: () => void;
   addToCart: (product: JavisProductCard, qty: number, unitCode?: string, unitPrice?: string) => void;
+  addManyToCart: (entries: Array<{ product: JavisProductCard; qty: number; unitCode?: string; unitPrice?: string }>) => void;
+  replaceCartItem: (
+    oldSlug: string,
+    oldUnitCode: string,
+    next: { slug: string; title: string; unitCode: string; packQty: number; unitPrice: string; qty: number },
+  ) => void;
   updateCartQty: (slug: string, unitCode: string, qty: number) => void;
   removeFromCart: (slug: string, unitCode: string) => void;
   clearCart: () => void;
@@ -118,6 +130,10 @@ const JavisContext = createContext<JavisContextValue>({
   pendingVision: null,
   qtyModalProduct: null,
   lastAddedNotice: "",
+  dietaryTags: [],
+  toggleDietaryTag: () => {},
+  setDietaryTags: () => {},
+  clearDietaryTags: () => {},
   micDeviceId: "",
   speakerDeviceId: "",
   cameraDeviceId: "",
@@ -131,6 +147,8 @@ const JavisContext = createContext<JavisContextValue>({
   promptAddToCart: () => {},
   closeQtyModal: () => {},
   addToCart: () => {},
+  addManyToCart: () => {},
+  replaceCartItem: () => {},
   updateCartQty: () => {},
   removeFromCart: () => {},
   clearCart: () => {},
@@ -158,6 +176,7 @@ export function JavisProvider({ children }: { children: ReactNode }) {
   const [pendingVision, setPendingVision] = useState<PendingVisionPayload | null>(null);
   const [qtyModalProduct, setQtyModalProduct] = useState<JavisProductCard | null>(null);
   const [lastAddedNotice, setLastAddedNotice] = useState("");
+  const [dietaryTags, setDietaryState] = useState<DietaryTagId[]>([]);
   const [micDeviceId, setMicState] = useState("");
   const [speakerDeviceId, setSpeakerState] = useState("");
   const [cameraDeviceId, setCameraState] = useState("");
@@ -172,6 +191,14 @@ export function JavisProvider({ children }: { children: ReactNode }) {
       }
       const savedCoupon = findPromotion(localStorage.getItem(COUPON_STORAGE_KEY));
       if (savedCoupon) setCouponState(savedCoupon.code);
+      const rawDietary = localStorage.getItem(DIETARY_STORAGE_KEY);
+      if (rawDietary) {
+        const valid = new Set<string>(DIETARY_TAGS.map((t) => t.id));
+        const parsedD = JSON.parse(rawDietary) as unknown;
+        if (Array.isArray(parsedD)) {
+          setDietaryState(parsedD.filter((x): x is DietaryTagId => typeof x === "string" && valid.has(x)));
+        }
+      }
       const rawCust = localStorage.getItem(CUSTOMER_STORAGE_KEY);
       if (rawCust) {
         const pc = JSON.parse(rawCust) as Partial<CustomerCheckoutInfo>;
@@ -269,11 +296,34 @@ export function JavisProvider({ children }: { children: ReactNode }) {
     setQtyModalProduct(null);
   }, []);
 
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      localStorage.setItem(DIETARY_STORAGE_KEY, JSON.stringify(dietaryTags));
+    } catch {
+      // ignore
+    }
+  }, [dietaryTags, hydrated]);
+
+  const toggleDietaryTag = useCallback((id: DietaryTagId) => {
+    setDietaryState((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }, []);
+
+  const setDietaryTags = useCallback((tags: DietaryTagId[]) => {
+    setDietaryState([...new Set(tags)]);
+  }, []);
+
+  const clearDietaryTags = useCallback(() => {
+    setDietaryState([]);
+  }, []);
+
   const addToCart = useCallback(
     (product: JavisProductCard, qty: number, unitCode?: string, unitPrice?: string) => {
       const cleanQty = Math.max(1, Math.min(9999, Math.floor(qty) || 1));
       const chosenUnit = unitCode || product.unitCode || "ชิ้น";
-      const chosenPrice = unitPrice || product.bestPrice || "0.00";
+      const unitOpt = product.unitOptions.find((u) => u.unitCode === chosenUnit);
+      const chosenPrice = unitPrice || unitOpt?.price || product.bestPrice || "0.00";
+      const chosenPackQty = Math.max(1, unitOpt?.packQty ?? product.packQty ?? 1);
       setCart((prev) => {
         const existingIdx = prev.items.findIndex(
           (x) => x.slug === product.slug && x.unitCode === chosenUnit,
@@ -294,7 +344,7 @@ export function JavisProvider({ children }: { children: ReactNode }) {
             category: product.category,
             imageUrl: product.imageUrl,
             unitCode: chosenUnit,
-            packQty: product.packQty,
+            packQty: chosenPackQty,
             baseUnitCode: product.baseUnitCode,
             unitPrice: chosenPrice,
             unitPriceFormatted: "",
@@ -307,6 +357,94 @@ export function JavisProvider({ children }: { children: ReactNode }) {
       });
       setQtyModalProduct(null);
       setLastAddedNotice(`เพิ่ม "${product.title}" × ${cleanQty} ${chosenUnit} ลงตะกร้าแล้วครับ`);
+      setTimeout(() => setLastAddedNotice(""), 3200);
+    },
+    [],
+  );
+
+  const addManyToCart = useCallback(
+    (entries: Array<{ product: JavisProductCard; qty: number; unitCode?: string; unitPrice?: string }>) => {
+      if (!entries.length) return;
+      setCart((prev) => {
+        const nextItems = [...prev.items];
+        for (const entry of entries) {
+          const cleanQty = Math.max(1, Math.min(9999, Math.floor(entry.qty) || 1));
+          const p = entry.product;
+          const chosenUnit = entry.unitCode || p.unitCode || "ชิ้น";
+          const unitOpt = p.unitOptions.find((u) => u.unitCode === chosenUnit);
+          const chosenPrice = entry.unitPrice || unitOpt?.price || p.bestPrice || "0.00";
+          const chosenPackQty = Math.max(1, unitOpt?.packQty ?? p.packQty ?? 1);
+          const existingIdx = nextItems.findIndex((x) => x.slug === p.slug && x.unitCode === chosenUnit);
+          if (existingIdx >= 0) {
+            nextItems[existingIdx] = {
+              ...nextItems[existingIdx],
+              qty: Math.min(9999, nextItems[existingIdx].qty + cleanQty),
+            };
+          } else {
+            nextItems.push({
+              slug: p.slug,
+              productCode: p.productCode,
+              barcode: p.barcode,
+              title: p.title,
+              brand: p.brand,
+              category: p.category,
+              imageUrl: p.imageUrl,
+              unitCode: chosenUnit,
+              packQty: chosenPackQty,
+              baseUnitCode: p.baseUnitCode,
+              unitPrice: chosenPrice,
+              unitPriceFormatted: "",
+              qty: cleanQty,
+              lineTotal: "0.00",
+              lineTotalFormatted: "",
+            });
+          }
+        }
+        return computeClientCart(nextItems);
+      });
+      setLastAddedNotice(`เพิ่มทั้งชุด ${entries.length} รายการลงตะกร้าแล้วครับ`);
+      setTimeout(() => setLastAddedNotice(""), 3200);
+    },
+    [],
+  );
+
+  const replaceCartItem = useCallback(
+    (
+      oldSlug: string,
+      oldUnitCode: string,
+      next: { slug: string; title: string; unitCode: string; packQty: number; unitPrice: string; qty: number },
+    ) => {
+      setCart((prev) => {
+        const oldRow = prev.items.find((it) => it.slug === oldSlug && it.unitCode === oldUnitCode);
+        const filtered = prev.items.filter((it) => !(it.slug === oldSlug && it.unitCode === oldUnitCode));
+        const existingTarget = filtered.findIndex((it) => it.slug === next.slug && it.unitCode === next.unitCode);
+        if (existingTarget >= 0) {
+          filtered[existingTarget] = {
+            ...filtered[existingTarget],
+            qty: Math.min(9999, filtered[existingTarget].qty + Math.max(1, next.qty)),
+          };
+        } else {
+          filtered.push({
+            slug: next.slug,
+            productCode: oldRow?.productCode ?? next.slug,
+            barcode: oldRow?.barcode ?? null,
+            title: next.title,
+            brand: oldRow?.brand ?? "-",
+            category: oldRow?.category ?? "",
+            imageUrl: oldRow?.imageUrl ?? null,
+            unitCode: next.unitCode,
+            packQty: Math.max(1, next.packQty),
+            baseUnitCode: oldRow?.baseUnitCode ?? next.unitCode,
+            unitPrice: next.unitPrice,
+            unitPriceFormatted: "",
+            qty: Math.max(1, next.qty),
+            lineTotal: "0.00",
+            lineTotalFormatted: "",
+          });
+        }
+        return computeClientCart(filtered);
+      });
+      setLastAddedNotice(`สลับเป็น ${next.title} (${next.unitCode}) เรียบร้อยแล้วครับ`);
       setTimeout(() => setLastAddedNotice(""), 3200);
     },
     [],
@@ -348,6 +486,10 @@ export function JavisProvider({ children }: { children: ReactNode }) {
         pendingVision,
         qtyModalProduct,
         lastAddedNotice,
+        dietaryTags,
+        toggleDietaryTag,
+        setDietaryTags,
+        clearDietaryTags,
         micDeviceId,
         speakerDeviceId,
         cameraDeviceId,
@@ -361,6 +503,8 @@ export function JavisProvider({ children }: { children: ReactNode }) {
         promptAddToCart,
         closeQtyModal,
         addToCart,
+        addManyToCart,
+        replaceCartItem,
         updateCartQty,
         removeFromCart,
         clearCart,

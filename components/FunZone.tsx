@@ -8,6 +8,7 @@
 import Decimal from "decimal.js";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CartSummary } from "@/lib/cart-order";
+import type { DietaryTagId } from "@/lib/dietary-shield";
 import type { JavisProductCard, JavisTeamJob } from "@/lib/product-card";
 import { PROMOTIONS, formatBaht, type Promotion } from "@/lib/promotions";
 import ProductCardGrid, { type CardActionFx } from "./ProductCardGrid";
@@ -481,6 +482,7 @@ export function RelatedStrip({
   startNo = 1,
   title = "🔗 สมองแนะนำของที่เกี่ยวข้อง",
   actionFx,
+  dietaryTags,
   onAdd,
   onDetail,
   onShowAll,
@@ -491,6 +493,7 @@ export function RelatedStrip({
   startNo?: number;
   title?: string;
   actionFx?: CardActionFx[];
+  dietaryTags?: DietaryTagId[];
   onAdd: (c: JavisProductCard) => void;
   onDetail: (c: JavisProductCard) => void;
   onShowAll: () => void;
@@ -517,6 +520,7 @@ export function RelatedStrip({
         reasons={reasons}
         startNo={startNo}
         actionFx={actionFx}
+        dietaryTags={dietaryTags}
         onAdd={onAdd}
         onDetail={onDetail}
       />

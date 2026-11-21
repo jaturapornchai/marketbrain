@@ -55,12 +55,29 @@ export default async function NoteDetailPage({ params, searchParams }: Props) {
   const backMode: AudienceFilter = n.audience === "both" ? requestedMode : n.audience;
   const linkSuffix = backMode !== "all" ? `?mode=${backMode}` : "";
 
-  const edgeItem = (s: string, rel: RelationType) => (
-    <li key={`${s}-${rel}`} className="edge-item">
-      <Link href={`/n/${encodeURIComponent(s)}${linkSuffix}`}>{getNote(s)?.title ?? s}</Link>
-      <span className="chip rel">{RELATION_LABEL[rel]}</span>
-    </li>
-  );
+  const edgeItem = (s: string, rel: RelationType) => {
+    const nbProd = getProductBySlug(s);
+    const nbCard = nbProd ? toProductCard(nbProd) : null;
+    return (
+      <li key={`${s}-${rel}`} className="edge-item">
+        <div className="edge-main">
+          <Link href={`/n/${encodeURIComponent(s)}${linkSuffix}`}>{getNote(s)?.title ?? s}</Link>
+          <span className="chip rel">{RELATION_LABEL[rel]}</span>
+        </div>
+        {nbProd && (
+          <div className="edge-meta">
+            {nbProd.primaryBarcode && <code className="edge-bc">▌▌ {nbProd.primaryBarcode}</code>}
+            {nbProd.isThaiGs1 && <span className="p-gs1">885</span>}
+            {(nbCard?.badges ?? []).slice(0, 2).map((b) => (
+              <span key={b.id} className={`p-trait-tag p-sbadge tone-${b.tone}`} title={b.title}>
+                {b.icon} {b.label}
+              </span>
+            ))}
+          </div>
+        )}
+      </li>
+    );
+  };
 
   const visibleOut = n.outEdges
     .filter((e) => {
@@ -100,6 +117,13 @@ export default async function NoteDetailPage({ params, searchParams }: Props) {
               {[...new Set(n.tags)].map((t) => (
                 <span className="chip" key={t}>
                   #{t}
+                </span>
+              ))}
+              {productCard?.barcode && <code className="edge-bc">▌▌ {productCard.barcode}</code>}
+              {productCard?.fdaNumber && <span className="p-trait-tag p-sbadge tone-fda">🛡️ อ.ย. {productCard.fdaNumber}</span>}
+              {(productCard?.badges ?? []).map((b) => (
+                <span key={b.id} className={`p-trait-tag p-sbadge tone-${b.tone}`} title={b.title}>
+                  {b.icon} {b.label}
                 </span>
               ))}
             </div>

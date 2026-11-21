@@ -867,4 +867,307 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
     assert.equal(fixHeard(t, vocab), t, `everyday Thai left alone: ${t}`);
 }
 
+// ---------- Batch order + Pack Upgrader + Margin Calc + Dietary Shield + Screen Commands + Thought Strip ----------
+{
+  const { stripModelThoughtTokens, toProductCard } = await import("../lib/nong-tee.ts");
+  assert.equal(
+    stripModelThoughtTokens("thought\n<channel|>พบซุปเข้มข้นหม้อไฟรสไก่ เบอร์ 1"),
+    "พบซุปเข้มข้นหม้อไฟรสไก่ เบอร์ 1",
+    "strip Gemma 4 thought\\n<channel|> leak",
+  );
+  assert.equal(
+    stripModelThoughtTokens("<think>internal notes</think><|thought|>more<|channel|>พร้อมช่วยครับ"),
+    "พร้อมช่วยครับ",
+    "strip <think> and <|thought|>...<|channel|> blocks",
+  );
+
+  const { parseBatchOrderPhrases, resolveBatchOrderWithSearch } = await import("../lib/batch-order.ts");
+  const parsedBatch = parseBatchOrderPhrases("เอาน้ำปลาทิพรส 2 ขวด น้ำมันพืช 3 ขวด มาม่า 1 แพ็ค");
+  assert.equal(parsedBatch.length, 3, "parses 3 spoken Thai batch items");
+  assert.equal(parsedBatch[0].qty, 2);
+  assert.equal(parsedBatch[1].qty, 3);
+  assert.equal(parsedBatch[2].qty, 1);
+
+  for (const singleOrSpec of ["ข้องอ 4 หุน", "หลอดไฟ 32 วัตต์", "เอาเบอร์ 1 สองขวด"]) {
+    assert.deepEqual(parseBatchOrderPhrases(singleOrSpec), [], `must not false-split: ${singleOrSpec}`);
+  }
+
+  const resolvedBatch = resolveBatchOrderWithSearch(
+    "เอาน้ำปลาทิพรส 2 ขวด น้ำมันพืช 3 ขวด มาม่า 1 แพ็ค",
+    (q) => searchProductsDetailed({ q, pageSize: 6 }).items.map(toProductCard),
+  );
+  assert.ok(resolvedBatch && resolvedBatch.matchedCount >= 2, "resolves spoken batch order against real 67k catalog");
+  assert.ok(resolvedBatch.totalFormatted.startsWith("฿"), "batch total formatted in baht via Decimal.js");
+
+  const { computePackUpgrade, computeRetailMargin, parseMarginCommand } = await import("../lib/wholesale-tools.ts");
+  const { parseThaiNumber: parseThaiNumForMargin } = await import("../lib/numbered-order.ts");
+  const upgrade = computePackUpgrade(
+    { slug: "prod-test-item", unitCode: "ชิ้น", packQty: 1, qty: 8, unitPrice: "15.00" },
+    [
+      { slug: "prod-test-item", title: "สินค้าทดสอบ", unitCode: "แพ็ค", packQty: 12, unitPrice: "144.00" },
+    ],
+  );
+  assert.ok(upgrade, "suggests cheaper larger pack once qty reaches >= 50% of pack");
+  assert.equal(upgrade.targetUnitCode, "แพ็ค");
+  assert.equal(upgrade.targetQty, 1);
+  assert.equal(upgrade.perBaseSaving, "3.00");
+  assert.equal(upgrade.totalSaving, "36.00");
+
+  const margin = computeRetailMargin(
+    {
+      items: [
+        {
+          slug: "prod-m1",
+          productCode: "M1",
+          barcode: null,
+          title: "น้ำจิ้มไก่",
+          brand: "ไฮคิว",
+          category: "ซอส",
+          imageUrl: null,
+          unitCode: "กล่อง",
+          packQty: 1,
+          baseUnitCode: "กล่อง",
+          unitPrice: "31.00",
+          unitPriceFormatted: "฿31",
+          qty: 6,
+          lineTotal: "186.00",
+          lineTotalFormatted: "฿186",
+        },
+      ],
+    },
+    20,
+  );
+  assert.ok(margin, "computes exact Decimal retail margin summary");
+  assert.equal(margin.totalProfitFormatted, "฿37.20");
+  assert.equal(margin.totalRevenueFormatted, "฿223.20");
+
+  assert.equal(parseMarginCommand("ตั้งกำไร 20%", parseThaiNumForMargin), 20);
+  assert.equal(parseMarginCommand("บวกกำไรสามสิบเปอร์เซ็นต์", parseThaiNumForMargin), 30);
+  assert.equal(parseMarginCommand("ปิดคิดกำไร", parseThaiNumForMargin), 0);
+
+  const { evaluateDietaryShield, parseDietaryCommand } = await import("../lib/dietary-shield.ts");
+  assert.deepEqual(parseDietaryCommand("ผมแพ้ถั่วกับนมวัว"), { action: "add", tags: ["no_peanut", "no_dairy"] });
+  assert.deepEqual(parseDietaryCommand("เอาเฉพาะฮาลาล ไม่ใส่ผงชูรส"), { action: "add", tags: ["halal", "no_msg"] });
+  assert.deepEqual(parseDietaryCommand("ล้างเกราะสุขภาพ"), { action: "clear", tags: [] });
+  assert.equal(parseDietaryCommand("ขอดูน้ำจิ้มไก่ไม่ใส่ผงชูรส"), null, "product browse query is never hijacked");
+
+  assert.equal(
+    evaluateDietaryShield(
+      {
+        title: "ขนมกรอบ",
+        traits: [],
+        ingredients: "แป้งสาลี น้ำตาล ผงปรุงรส (INS621)",
+        warnings: "มีแป้งสาลี",
+        description: "",
+      },
+      ["no_msg", "no_gluten"],
+    ).status,
+    "warn",
+  );
+  assert.equal(
+    evaluateDietaryShield(
+      {
+        title: "น้ำส้มสายชูกลั่น",
+        traits: ["ฮาลาล", "ไม่ใส่ผงชูรส"],
+        ingredients: "น้ำส้มสายชูกลั่น 5%",
+        warnings: "",
+        description: "รับรองฮาลาล ไม่ใส่ผงชูรส",
+      },
+      ["halal", "no_msg"],
+    ).status,
+    "safe",
+  );
+  assert.equal(
+    evaluateDietaryShield(
+      {
+        title: "หลอดไฟ LED 18W แสงขาว",
+        traits: ["ประหยัดไฟ"],
+        ingredients: "",
+        warnings: "",
+        description: "หลอดไฟสำหรับบ้าน",
+      },
+      ["halal", "no_msg", "low_sugar"],
+    ).status,
+    "unknown",
+    "never guesses safe/warn on non-food item without food evidence",
+  );
+
+  const { parseScreenCommand: parseCmdExtra } = await import("../lib/voice-commands.ts");
+  assert.equal(parseCmdExtra("ใส่ตะกร้าทั้งชุด", { modalOpen: true })?.id, "batch_confirm");
+  assert.equal(parseCmdExtra("สลับเลย")?.id, "upgrade_pack");
+  assert.equal(parseCmdExtra("เปิดเส้นทางสมอง")?.id, "brain_path_on");
+  assert.equal(parseCmdExtra("ปิดเส้นทางสมอง")?.id, "brain_path_off");
+}
+
+// ---------- Semantic Product Badges + FDA Extraction + Bidirectional Thai <-> English Search ----------
+{
+  const { extractFdaNumber, extractProductBadges } = await import("../lib/product-badges.ts");
+  const { crossScriptPhoneticKey } = await import("../lib/bilingual-search.ts");
+  const { toProductCard } = await import("../lib/product-card.ts");
+
+  assert.equal(
+    extractFdaNumber({ fdaNumber: "", features: "เลขที่ใบรับจดแจ้ง 20-1-6500032418 สูตรเกลือสมุนไพร" }),
+    "20-1-6500032418",
+    "extracts Thai FDA notification number cleanly",
+  );
+
+  const medBadges = extractProductBadges({
+    title: "คาลาไมน์ โลชั่น ทาแก้ผื่นคัน",
+    fdaNumber: "10-1-6500001234",
+  });
+  assert.ok(medBadges.some((b) => b.id === "fda"), "medicine with FDA has 🛡️ อ.ย.");
+  assert.ok(medBadges.some((b) => b.id === "med"), "calamine gets 💊 ยา");
+
+  const pasteBadges = extractProductBadges({
+    title: "คอลเกต ยาสีฟัน สูตรเกลือสมุนไพร 35 กรัม",
+    fdaNumber: "20-1-6400020818",
+  });
+  assert.ok(pasteBadges.some((b) => b.id === "fda"), "toothpaste has 🛡️ อ.ย.");
+  assert.ok(!pasteBadges.some((b) => b.id === "med"), "toothpaste must NEVER be tagged 💊 ยา");
+
+  const beerBadges = extractProductBadges({ title: "สิงห์ เบียร์ขวด 620 มล." });
+  assert.ok(beerBadges.some((b) => b.id === "age20"), "beer gets 🔞 20+");
+
+  const alcGelBadges = extractProductBadges({ title: "ศิริบัญชา เจลแอลกอฮอล์ล้างมือ 75%" });
+  assert.ok(!alcGelBadges.some((b) => b.id === "age20"), "hand sanitizer alcohol must NEVER be tagged 🔞 20+");
+
+  const bulbBadges = extractProductBadges({ title: "หลอดไฟ LED 18W แสงขาว" });
+  assert.ok(bulbBadges.some((b) => b.id === "elec"), "LED bulb gets ⚡ ไฟฟ้า");
+
+  const catBadges = extractProductBadges({ title: "วิสกัส อาหารแมว รสปลาทู 1.2 กก." });
+  assert.ok(catBadges.some((b) => b.id === "pet"), "cat food gets 🐾 สัตว์เลี้ยง");
+
+  const tisBadges = extractProductBadges({ title: "ปลั๊กพ่วง มอก. 2432-2555" });
+  assert.ok(tisBadges.some((b) => b.id === "tis"), "TIS product gets 🏛️ มอก.");
+
+  // Cross-script phonetic equivalence
+  assert.equal(crossScriptPhoneticKey("มากิต้า"), crossScriptPhoneticKey("makita"));
+  assert.equal(crossScriptPhoneticKey("บราเวคโต้"), crossScriptPhoneticKey("bravecto"));
+
+  // Bidirectional Thai <-> English catalog search
+  const thMakita = searchProductsDetailed({ q: "มากิต้า", pageSize: 6 });
+  assert.equal(thMakita.topStrongMatch, true, "มากิต้า must be topStrongMatch");
+  assert.match(`${thMakita.items[0]?.nameTh} ${thMakita.items[0]?.brandTh} ${thMakita.items[0]?.brandEn}`, /MAKITA/i);
+
+  const enMakita = searchProductsDetailed({ q: "makita", pageSize: 6 });
+  assert.equal(enMakita.topStrongMatch, true, "makita must be topStrongMatch");
+  assert.match(`${enMakita.items[0]?.nameTh} ${enMakita.items[0]?.brandTh} ${enMakita.items[0]?.brandEn}`, /MAKITA/i);
+
+  const thDrillMakita = searchProductsDetailed({ q: "สว่านมากิต้า", pageSize: 6 });
+  assert.equal(thDrillMakita.topStrongMatch, true, "compound สว่านมากิต้า must be topStrongMatch");
+  assert.ok(thDrillMakita.items.some((p) => /MAKITA/i.test(`${p.nameTh} ${p.brandTh} ${p.brandEn}`)));
+
+  for (const [q, brandRe] of [
+    ["บ๊อช", /BOSCH/i],
+    ["เฮเฟเล่", /HAFELE/i],
+    ["พัมคิน", /PUMPKIN/i],
+  ] as const) {
+    const r = searchProductsDetailed({ q, pageSize: 4 });
+    assert.equal(r.topStrongMatch, true, `${q} must be topStrongMatch`);
+    assert.match(`${r.items[0]?.nameTh} ${r.items[0]?.brandTh} ${r.items[0]?.brandEn}`, brandRe);
+  }
+
+  const fishEn = searchProductsDetailed({ q: "fish sauce", pageSize: 4 });
+  assert.equal(fishEn.topStrongMatch, true, "fish sauce must find Thai น้ำปลา");
+  assert.match(`${fishEn.items[0]?.nameTh} ${fishEn.items[0]?.categoryPathTh}`, /น้ำปลา|Fish/i);
+
+  const catEn = searchProductsDetailed({ q: "cat food", pageSize: 4 });
+  assert.equal(catEn.topStrongMatch, true, "cat food must find Thai อาหารแมว");
+  assert.match(`${catEn.items[0]?.nameTh} ${catEn.items[0]?.categoryPathTh}`, /อาหารแมว|แมว|Cat/i);
+
+  const sampleCard = toProductCard(thMakita.items[0]);
+  assert.ok(sampleCard.barcode, "toProductCard keeps barcode for showcase & related cards");
+}
+
+// ---------- /search Smart Search Engine (Operators, Keyboard Flip, Typo, Scope, Badges, Autocomplete) ----------
+{
+  const { parseSmartSearchQuery, flipThaiEnKeyboard } = await import("../lib/smart-search.ts");
+  const { suggestProducts } = await import("../lib/vault.ts");
+  const { compareMoney } = await import("../lib/decimal-money.ts");
+
+  const p1 = parseSmartSearchQuery("สว่านมากิต้า งบ 2000 ราคาถูกสุด");
+  assert.equal(p1.cleanQuery, "สว่านมากิต้า");
+  assert.equal(p1.maxPrice, "2000");
+  assert.equal(p1.inferredSort, "price_asc");
+
+  const p2 = parseSmartSearchQuery("น้ำปลา -ทิพรส");
+  assert.equal(p2.cleanQuery, "น้ำปลา");
+  assert.deepEqual(p2.excludeTerms, ["ทิพรส"]);
+
+  const p3 = parseSmartSearchQuery("20-1-6500032418");
+  assert.deepEqual(p3.fdaNumbers, ["20-1-6500032418"]);
+  assert.deepEqual(p3.excludeTerms, []);
+  assert.equal(p3.minPrice, "");
+
+  const p4 = parseSmartSearchQuery("8850006234280, 8851124891003");
+  assert.deepEqual(p4.barcodes, ["8850006234280", "8851124891003"]);
+
+  const p5 = parseSmartSearchQuery("ไม่ใส่ผงชูรส");
+  assert.equal(p5.cleanQuery, "ไม่ใส่ผงชูรส");
+  assert.deepEqual(p5.excludeTerms, []);
+
+  const p6 = parseSmartSearchQuery("ข้องอ 1-1/2 นิ้ว");
+  assert.deepEqual(p6.excludeTerms, []);
+  assert.equal(p6.minPrice, "");
+
+  assert.equal(flipThaiEnKeyboard("ohex]k"), "น้ำปลา");
+  assert.equal(flipThaiEnKeyboard("oehx]k"), "น้ำปลา");
+  assert.equal(flipThaiEnKeyboard(",kdb9hk"), "มากิต้า");
+  assert.equal(flipThaiEnKeyboard("ทฟาระฟ"), "makita");
+
+  const oyhRes = searchProductsDetailed({ q: "ohex]k", pageSize: 6 });
+  assert.ok(oyhRes.total > 0, "keyboard-layout recovery returns น้ำปลา products");
+  assert.equal(oyhRes.correctedTo, "น้ำปลา");
+  assert.equal(oyhRes.correctionReason, "keyboard_layout");
+  assert.ok(oyhRes.items.some((p) => p.nameTh.includes("น้ำปลา")));
+
+  const typoRes = searchProductsDetailed({ q: "makitta", pageSize: 6 });
+  assert.ok(typoRes.total > 0, "typo recovery finds MAKITA");
+  assert.equal(typoRes.correctedTo, "makita");
+  assert.equal(typoRes.correctionReason, "typo");
+  assert.ok(typoRes.items.some((p) => /MAKITA/i.test(`${p.nameTh} ${p.brandEn}`)));
+
+  const budgetRes = searchProductsDetailed({ q: "น้ำปลา ไม่เกิน 40", pageSize: 12 });
+  assert.ok(budgetRes.total > 0, "natural price operator finds items <= 40 THB");
+  assert.ok(
+    budgetRes.items.every((p) => p.bestPrice !== null && compareMoney(p.bestPrice, "40") <= 0),
+    "all budget items obey Decimal <= 40",
+  );
+
+  const exRes = searchProductsDetailed({ q: "น้ำปลา -ทิพรส", pageSize: 12 });
+  assert.ok(exRes.total > 0, "negative exclusion returns non-empty results");
+  assert.ok(
+    exRes.items.every((p) => !p.nameTh.includes("ทิพรส") && !p.brandTh.includes("ทิพรส")),
+    "excluded brand ทิพรส never appears",
+  );
+
+  const fdaBadgeRes = searchProductsDetailed({ badges: ["fda"], pageSize: 6 });
+  assert.ok(fdaBadgeRes.total > 0, "semantic badge filter finds อ.ย. products");
+  assert.ok(fdaBadgeRes.facets.badges.some((b) => b.id === "fda"));
+  assert.ok(fdaBadgeRes.facets.badges.some((b) => b.id === "med" || b.id === "pet" || b.id === "elec"));
+
+  const fdaDirectRes = searchProductsDetailed({ q: "20-1-6500032418", pageSize: 6 });
+  assert.ok(fdaDirectRes.total > 0, "direct Thai FDA number search finds product");
+  assert.ok(
+    fdaDirectRes.items.some(
+      (p) => p.nameTh.includes("คอลเกต") || p.fdaNumber.includes("20-1-6500032418") || p.features.includes("20-1-6500032418"),
+    ),
+  );
+
+  const multiBcRes = searchProductsDetailed({ q: "8850006234280 8851124891003", pageSize: 6 });
+  assert.equal(multiBcRes.total, 2, "multi-barcode search returns both products");
+
+  const titleScopeRes = searchProductsDetailed({ q: "น้ำปลา", scope: "title", sort: "price_asc", pageSize: 6 });
+  assert.ok(titleScopeRes.total > 0 && titleScopeRes.items.every((p) => p.nameTh.includes("น้ำปลา")));
+
+  const ingScopeRes = searchProductsDetailed({ q: "น้ำปลา", scope: "ingredients", pageSize: 6 });
+  assert.ok(ingScopeRes.total > 0, "ingredients scope finds products mentioning น้ำปลา in ingredients/specs");
+
+  const sug = suggestProducts("มากิ");
+  assert.ok(
+    sug.brands.length > 0 && sug.brands.some((b) => /MAKITA|มากิต้า/i.test(b.label)) && sug.products.length > 0,
+    "suggestProducts returns matching brand + products fast",
+  );
+}
+
 console.log(`✓ MarketBrain selftest passed (${stats.totalProducts} products, ${stats.totalNotes} notes, ${stats.totalSynapses} synapses, order=${testOrder.orderNo})`);

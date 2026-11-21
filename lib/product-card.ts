@@ -1,6 +1,14 @@
+import type { BatchOrderPlan } from "./batch-order";
 import type { CartSummary, CustomerCheckoutInfo, SalesOrder } from "./cart-order";
 import { formatThaiBaht } from "./decimal-money";
+import { extractFdaNumber, extractProductBadges, type ProductSemanticBadge } from "./product-badges";
 import type { BrainProductItem } from "./product-source";
+
+export type BrainPathTrace = {
+  query: string;
+  hubs: Array<{ kind: "category" | "brand" | "trait"; label: string }>;
+  products: Array<{ slug: string; no: number; title: string; priceLabel: string }>;
+};
 
 export type JavisChatMessage = {
   role: "user" | "assistant";
@@ -30,11 +38,15 @@ export type JavisProductCard = {
   pricePerBaseLabel: string | null;
   barcode: string | null;
   isThaiGs1: boolean;
+  fdaNumber?: string | null;
+  badges?: ProductSemanticBadge[];
   imageUrl: string | null;
   extraImages: string[];
   traits: string[];
   description: string;
   ingredients: string;
+  warnings?: string;
+  nutrition?: Record<string, string>;
   unitOptions: UnitOptionCard[];
 };
 
@@ -88,6 +100,8 @@ export type JavisStreamEvent =
   | { type: "order"; order: SalesOrder }
   | { type: "delta"; section: "speech" | "screen"; text: string }
   | { type: "sentence"; text: string }
+  | { type: "batch_order"; plan: BatchOrderPlan }
+  | { type: "brain_path"; path: BrainPathTrace }
   | {
       type: "done";
       spokenText: string;
@@ -130,6 +144,21 @@ export function toProductCard(p: BrainProductItem): JavisProductCard {
     });
   }
 
+  const nutritionEntries = Object.entries(p.nutrition ?? {}).slice(0, 8);
+  const fdaNumber = extractFdaNumber(p);
+  const traitValues = [...new Set(p.traits.map((t) => t.valueTh))];
+  const badges = extractProductBadges({
+    title: p.nameTh,
+    category: p.categoryPathTh,
+    brand: p.brandTh || p.brandEn,
+    fdaNumber,
+    traits: traitValues,
+    description: p.description,
+    features: p.features,
+    warnings: p.warnings,
+    specs: p.specs,
+  });
+
   return {
     slug: p.slug,
     productCode: p.productCode,
@@ -145,11 +174,15 @@ export function toProductCard(p: BrainProductItem): JavisProductCard {
     pricePerBaseLabel,
     barcode: p.primaryBarcode,
     isThaiGs1: p.isThaiGs1,
+    fdaNumber,
+    badges: badges.length > 0 ? badges : undefined,
     imageUrl: p.imageUrl,
     extraImages: p.extraImages,
-    traits: [...new Set(p.traits.map((t) => t.valueTh))].slice(0, 5),
+    traits: traitValues.slice(0, 5),
     description: p.features || p.description,
     ingredients: p.ingredients,
+    warnings: p.warnings || undefined,
+    nutrition: nutritionEntries.length > 0 ? Object.fromEntries(nutritionEntries) : undefined,
     unitOptions,
   };
 }

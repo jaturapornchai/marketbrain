@@ -1,3 +1,4 @@
+import { resolveBatchOrderWithSearch } from "./batch-order";
 import {
   recalculateCart,
   resolveProductForCart,
@@ -9,11 +10,13 @@ import {
   type SalesOrder,
 } from "./cart-order";
 import { calcDecimalLines, formatThaiBaht } from "./decimal-money";
+import { DIETARY_TAGS, evaluateDietaryShield, type DietaryTagId } from "./dietary-shield";
 import { RELATION_LABEL, isRelationType } from "./groups";
 import { emitMcpEvent } from "./mcp-events";
 import type { BrainProductItem } from "./product-source";
 import {
   toProductCard,
+  type BrainPathTrace,
   type JavisChatMessage,
   type JavisProductCard,
   type JavisStageMode,
@@ -57,6 +60,56 @@ export {
 const SCREEN_MARK = "[จอ]";
 const CJK_JUNK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+/g;
 const SENTENCE_END_RE = /(?:ครับ|นะครับ|เลยครับ|ได้ครับ|ไหมครับ|มั้ยครับ|[!?])\s+/g;
+
+const THOUGHT_TAG_BLOCK_RE = /<think>[\s\S]*?<\/think>|<\|?thought\|?>[\s\S]*?(?:<\|?channel\|?>|<\/thought>)/gi;
+const LEADING_THOUGHT_CHANNEL_RE = /^(?:\s*(?:<\|?channel\|?>)?\s*thought(?:\s*\r?\n[\s\S]*?)?<\|?channel\|?>\s*)/i;
+const LEFTOVER_CHANNEL_TAG_RE = /<\/?think>|<\|?(?:thought|channel)\|?>/gi;
+const LEADING_BARE_THOUGHT_RE = /^thought\s*(?:\r?\n|$)/i;
+
+/** Strip reasoning headers emitted by Gemma 4 / DeepSeek (`thought\\n<channel|>`, `<think>...`) before reaching users or TTS. */
+export function stripModelThoughtTokens(raw: string): string {
+  return raw
+    .replace(THOUGHT_TAG_BLOCK_RE, "")
+    .replace(LEADING_THOUGHT_CHANNEL_RE, "")
+    .replace(LEFTOVER_CHANNEL_TAG_RE, "")
+    .replace(LEADING_BARE_THOUGHT_RE, "");
+}
+
+function buildBrainPath(query: string, cards: readonly JavisProductCard[]): BrainPathTrace | null {
+  if (!cards.length) return null;
+  const hubs: BrainPathTrace["hubs"] = [];
+  const seenHub = new Set<string>();
+  const addHub = (kind: BrainPathTrace["hubs"][number]["kind"], rawLabel: string) => {
+    const label = rawLabel.trim();
+    if (!label || label === "-" || seenHub.has(`${kind}:${label}`) || hubs.length >= 3) return;
+    seenHub.add(`${kind}:${label}`);
+    hubs.push({ kind, label });
+  };
+  for (const c of cards.slice(0, 6)) addHub("category", c.category);
+  for (const c of cards.slice(0, 6)) addHub("brand", c.brand);
+  for (const c of cards.slice(0, 4)) {
+    for (const tr of c.traits.slice(0, 2)) addHub("trait", tr);
+  }
+  return {
+    query: query.trim().slice(0, 48) || "คลังสินค้า",
+    hubs: hubs.slice(0, 3),
+    products: cards.slice(0, 4).map((c, idx) => ({
+      slug: c.slug,
+      no: idx + 1,
+      title: c.title,
+      priceLabel: c.priceLabel,
+    })),
+  };
+}
+
+function sortCardsForDietary(cards: JavisProductCard[], dietaryTags: readonly DietaryTagId[]): JavisProductCard[] {
+  if (!dietaryTags.length || cards.length <= 1) return cards;
+  const rank = (c: JavisProductCard) => {
+    const st = evaluateDietaryShield(c, dietaryTags).status;
+    return st === "safe" ? 0 : st === "unknown" ? 1 : 2;
+  };
+  return [...cards].sort((a, b) => rank(a) - rank(b));
+}
 
 const DSML_START = /<[｜|]+\s*DSML/;
 const DSML_INVOKE = /<[｜|]+\s*DSML[｜|]+\s*invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/[｜|]+\s*DSML[｜|]+\s*invoke>/g;
@@ -852,7 +905,7 @@ export function productQueryOf(userText: string): string {
 }
 
 function parsePlannerAngles(rawText: string, fallbackQuery: string): string[] {
-  const text = rawText.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(CJK_JUNK, "").trim();
+  const text = stripModelThoughtTokens(rawText).replace(CJK_JUNK, "").trim();
   const firstLine = text.split(/\r?\n/).find((l) => l.trim()) ?? "";
   if (firstLine === "CART_ONLY") return [];
   if (!firstLine || /(?:ครับ|ค่ะ|คะ)[\s.!?]*$/.test(firstLine)) return [fallbackQuery];
@@ -1188,6 +1241,8 @@ async function* streamOllamaRound(
     let buffer = "";
     let held = "";
     let inThink = false;
+    let inChannelThought = false;
+    let decidedStreamHead = false;
 
     const processLine = function* (rawLine: string): Generator<string> {
       const line = rawLine.trim();
@@ -1257,6 +1312,17 @@ async function* streamOllamaRound(
       held += chunk;
 
       while (held.length > 0) {
+        if (inChannelThought) {
+          const chMatch = held.match(/<\|?channel\|?>/i);
+          if (!chMatch || chMatch.index === undefined) {
+            if (held.length > 2400) held = held.slice(-24);
+            break;
+          }
+          held = held.slice(chMatch.index + chMatch[0].length);
+          inChannelThought = false;
+          decidedStreamHead = true;
+          continue;
+        }
         if (inThink) {
           const endIdx = held.indexOf("</think>");
           if (endIdx === -1) {
@@ -1265,19 +1331,32 @@ async function* streamOllamaRound(
           }
           held = held.slice(endIdx + 8);
           inThink = false;
+          decidedStreamHead = true;
           continue;
+        }
+        if (!decidedStreamHead) {
+          const leadChannelHead = held.match(/^\s*(?:<\|?channel\|?>)?\s*thought(?:\s|\r?\n|$)/i);
+          if (leadChannelHead) {
+            inChannelThought = true;
+            continue;
+          }
+          if (held.length < 18 && /^(?:\s*<|\s*t(?:h(?:o(?:u(?:g(?:h(?:t)?)?)?)?)?)?$)/i.test(held)) {
+            break;
+          }
+          decidedStreamHead = true;
         }
         const thinkIdx = held.indexOf("<think>");
         if (thinkIdx !== -1) {
-          if (thinkIdx > 0) yield held.slice(0, thinkIdx);
+          if (thinkIdx > 0) yield stripModelThoughtTokens(held.slice(0, thinkIdx));
           held = held.slice(thinkIdx + 7);
           inThink = true;
           continue;
         }
         const cutIdx = held.lastIndexOf("<");
-        const safeCut = cutIdx === -1 || held.length - cutIdx > 8 ? held.length : cutIdx;
+        const safeCut = cutIdx === -1 || held.length - cutIdx > 12 ? held.length : cutIdx;
         if (safeCut > 0) {
-          yield held.slice(0, safeCut);
+          const out = stripModelThoughtTokens(held.slice(0, safeCut));
+          if (out) yield out;
           held = held.slice(safeCut);
         } else {
           break;
@@ -1299,8 +1378,9 @@ async function* streamOllamaRound(
     if (buffer.trim()) {
       yield* processLine(buffer);
     }
-    if (held && !inThink) {
-      yield held;
+    if (held && !inThink && !inChannelThought) {
+      const tail = stripModelThoughtTokens(held);
+      if (tail) yield tail;
     }
   } catch (err) {
     if (!signal?.aborted) markLocalLlmCold();
@@ -1468,6 +1548,8 @@ export async function* runNongTeeTurn(opts: {
   pendingSlug?: string;
   /** Product page open on the customer's screen (opened by voice or by hand), so "อันนี้" means that product. */
   viewingSlug?: string;
+  /** Customer dietary/allergen guard tags so safe items rank first and warnings sound proactively. */
+  dietaryTags?: DietaryTagId[];
   /** Coupon the customer picked on screen; every cart recalculation keeps it. */
   couponCode?: string;
   /** Client abort signal so interrupted turns immediately stop DeepSeek & never run stale tools. */
@@ -1480,6 +1562,7 @@ export async function* runNongTeeTurn(opts: {
     .map((m) => ({ role: m.role, content: m.content.split(SCREEN_MARK)[0].trim().slice(0, 220) }))
     .filter((m) => m.content.length > 0);
   const cfg = getLlmConfig();
+  const activeDietary: readonly DietaryTagId[] = opts.dietaryTags ?? [];
   const turnT0 = performance.now();
   const turnState: { provider: LlmProviderKind; model: string; fallbackReason: string; tps?: number } = {
     provider: "local",
@@ -1519,7 +1602,7 @@ export async function* runNongTeeTurn(opts: {
       },
     };
     if (cardCollector.size > 0) {
-      const cardsArr = [...cardCollector.values()];
+      const cardsArr = sortCardsForDietary([...cardCollector.values()], activeDietary);
       stageSetExplicitly = true;
       yield { type: "cards", cards: cardsArr };
       yield {
@@ -1528,6 +1611,8 @@ export async function* runNongTeeTurn(opts: {
         spotlight: cardsArr[0] ?? null,
         title: opts.visionSummary ? `📷 พบจากรูป: ${opts.visionSummary}` : "📷 สินค้าที่ค้นพบจากรูปภาพ",
       };
+      const vPath = buildBrainPath(opts.visionSummary || userText, cardsArr);
+      if (vPath) yield { type: "brain_path", path: vPath };
     }
   }
 
@@ -1559,6 +1644,7 @@ export async function* runNongTeeTurn(opts: {
   const cardNoOf = (p: BrainProductItem) => focusItems.findIndex((f) => f.slug === p.slug) + 1;
   const viewingNo = viewingProduct ? cardNoOf(viewingProduct) : 0;
 
+  let activePathQuery = userText;
   let pendingStage: {
     cards: JavisProductCard[];
     mode: JavisStageMode;
@@ -1569,10 +1655,13 @@ export async function* runNongTeeTurn(opts: {
     if (!pendingStage) return;
     const ps = pendingStage;
     pendingStage = null;
-    yield { type: "cards", cards: ps.cards };
+    const sortedCards = sortCardsForDietary(ps.cards, activeDietary);
+    yield { type: "cards", cards: sortedCards };
     if (!stageSetExplicitly) {
-      yield { type: "stage", mode: ps.mode, spotlight: ps.spotlight, title: ps.title };
+      yield { type: "stage", mode: ps.mode, spotlight: sortedCards[0] ?? ps.spotlight, title: ps.title };
     }
+    const trace = buildBrainPath(activePathQuery || userText, sortedCards);
+    if (trace) yield { type: "brain_path", path: trace };
   };
 
   if (visionSlugs.length === 0) {
@@ -1594,6 +1683,73 @@ export async function* runNongTeeTurn(opts: {
     }
     const handledDirectCart = yield* tryDirectCartAction(userText, focusItems, currentCart, opts.couponCode);
     if (handledDirectCart) return;
+
+    // 0-LLM Voice Batch Order Fast-Path ("เอาน้ำปลาทิพรส 2 ขวด น้ำมันพืช 3 ขวด มาม่า 1 แพ็ค")
+    const batchSearch = (q: string): JavisProductCard[] => {
+      const cleaned = cleanBrowseQuery(q);
+      const r1 = searchProductsDetailed({ q: cleaned.length >= 2 ? cleaned : q, pageSize: 8 });
+      const items = r1.items.length > 0 || cleaned === q ? r1.items : searchProductsDetailed({ q, pageSize: 8 }).items;
+      return items.map(toProductCard);
+    };
+    const batchPlan =
+      resolveBatchOrderWithSearch(userText, batchSearch, activeDietary) ??
+      (altText && altText !== userText ? resolveBatchOrderWithSearch(altText, batchSearch, activeDietary) : null);
+    if (batchPlan && batchPlan.matchedCount >= 1 && batchPlan.rows.length >= 2) {
+      const bMs = Math.max(1, Math.round(performance.now() - turnT0));
+      const matchedMap = new Map<string, JavisProductCard>();
+      for (const row of batchPlan.rows) {
+        if (row.matched && !matchedMap.has(row.matched.slug)) matchedMap.set(row.matched.slug, row.matched);
+        for (const alt of row.alternatives) {
+          if (matchedMap.size < 24 && !matchedMap.has(alt.slug)) matchedMap.set(alt.slug, alt);
+        }
+      }
+      const bCards = sortCardsForDietary([...matchedMap.values()], activeDietary);
+      yield {
+        type: "team",
+        job: {
+          id: jobSeq++,
+          worker: "cart",
+          label: "จัดชุดสั่งรวดเดียว",
+          task: `${batchPlan.matchedCount}/${batchPlan.rows.length} รายการ`,
+          state: "done",
+          ms: bMs,
+          count: batchPlan.matchedCount,
+        },
+      };
+      if (bCards.length > 0) {
+        yield { type: "cards", cards: bCards };
+        yield {
+          type: "stage",
+          mode: "showcase",
+          spotlight: bCards[0] ?? null,
+          title: `📦 จัดชุดสั่งรวดเดียว (${batchPlan.matchedCount}/${batchPlan.rows.length} รายการ)`,
+        };
+        const bPath = buildBrainPath(
+          batchPlan.rows.map((r) => r.query).slice(0, 3).join(" · "),
+          bCards,
+        );
+        if (bPath) yield { type: "brain_path", path: bPath };
+      }
+      yield { type: "batch_order", plan: batchPlan };
+      const warnedRow = batchPlan.rows.find((r) => Boolean(r.dietaryWarn));
+      const warnSpoken = warnedRow
+        ? ` และระวัง ${warnedRow.matched?.title ?? warnedRow.query} มี${warnedRow.dietaryWarn}นะครับ`
+        : "";
+      const spoken = `จัดชุดให้ครบ ${batchPlan.matchedCount} รายการแล้วครับ ยอดประมาณ ${batchPlan.totalFormatted}${warnSpoken} ตรวจหรือสลับยี่ห้อบนจอ แล้วพูดว่า ใส่ตะกร้าทั้งชุด หรือกดยืนยันได้เลยครับ`;
+      yield { type: "engine", provider: "ram", model: "สั่งรวดเดียว (0 ms AI)", label: "สั่งรวดเดียว", ms: bMs };
+      yield { type: "status", state: "speaking", text: "น้องตี๋กำลังพูด…" };
+      yield { type: "delta", section: "speech", text: spoken };
+      yield { type: "sentence", text: spoken };
+      yield {
+        type: "done",
+        spokenText: spoken,
+        screenMarkdown: "",
+        model: "สั่งรวดเดียว (0 ms AI)",
+        provider: "ram",
+        ms: bMs,
+      };
+      return;
+    }
   }
 
   if (visionSlugs.length === 0 && explicitSlugMatches.length === 0 && !isDirectCartOrOrder && (focusItems.length > 0 || viewingProduct) && (!productQuery || mentionsCardNumber(userText, focusItems.length) || (Boolean(viewingProduct) && pointsAtOpenProduct(userText)))) {
@@ -1675,7 +1831,8 @@ export async function* runNongTeeTurn(opts: {
         },
       };
       if (cardCollector.size > 0) {
-        const cardsArr = [...cardCollector.values()];
+        const cardsArr = sortCardsForDietary([...cardCollector.values()], activeDietary);
+        activePathQuery = searchText;
         pendingStage = {
           cards: cardsArr,
           mode: cardsArr.length === 1 ? "spotlight" : "showcase",
@@ -1687,7 +1844,16 @@ export async function* runNongTeeTurn(opts: {
       const activeUserForBrowse = matchedAlt ? altText : userText;
       const activeProductQuery = matchedAlt ? productQueryOf(altText) : productQuery;
       if (activeProductQuery && localDirect.items.length > 0 && isSimpleBrowseQuery(activeUserForBrowse, activeProductQuery)) {
-        const lines = buildDirectBrowseSpeech(searchText, browseSort, localDirect.items);
+        const orderRank = (p: BrainProductItem) => {
+          if (!activeDietary.length) return 0;
+          const card = cardCollector.get(p.slug);
+          const st = card ? evaluateDietaryShield(card, activeDietary).status : "unknown";
+          return st === "safe" ? 0 : st === "unknown" ? 1 : 2;
+        };
+        const orderedItems = activeDietary.length
+          ? [...localDirect.items].sort((a, b) => orderRank(a) - orderRank(b))
+          : localDirect.items;
+        const lines = buildDirectBrowseSpeech(searchText, browseSort, orderedItems);
         if (lines.length > 0) {
           yield* flushPendingStage();
           yield { type: "engine", provider: "ram", model: "ค้นสมองด่วน (0 ms AI)", label: "สมองด่วน", ms: localMs };
@@ -1796,7 +1962,8 @@ export async function* runNongTeeTurn(opts: {
     }
 
     if (cardCollector.size > 0) {
-      const cardsArr = [...cardCollector.values()];
+      const cardsArr = sortCardsForDietary([...cardCollector.values()], activeDietary);
+      activePathQuery = firstMatchedAngle || userText;
       pendingStage = {
         cards: cardsArr,
         mode: cardsArr.length === 1 ? "spotlight" : "showcase",
@@ -1824,14 +1991,22 @@ export async function* runNongTeeTurn(opts: {
     return no > 0 ? "• เบอร์ " + no + " " + block.slice(2) : block;
   };
 
+  const dietaryNote =
+    activeDietary.length > 0
+      ? `เกราะสุขภาพลูกค้า: ${activeDietary.map((id) => DIETARY_TAGS.find((d) => d.id === id)?.shortLabel ?? id).join(", ")} (เตือนลูกค้าทันทีถ้าพบส่วนผสมที่เสี่ยง)`
+      : "";
+
   const contextBlock = [
     formatCartContext(currentCart),
     customerSummary ? `ผู้รับ: ${customerSummary}` : "ผู้รับ: (ยังไม่ระบุ)",
+    dietaryNote,
     cardCollector.size > 0 && prefetchBlocks.length
       ? `${prefetchLabel}:\n${prefetchBlocks.map(withCardNo).join("\n")}`
       : `คลังมี ${st.totalProducts} สินค้า แต่ยังไม่ได้แสดงสินค้าสำหรับคำขอล่าสุดนี้ (ห้ามหยิบสินค้าจากข้อความย้อนหลังมาตอบซ้ำ — ถ้าลูกค้าหาสินค้าหรือบอกอาการ ให้เรียก search_products ทันที ห้ามรับปากเปล่าว่าเดี๋ยวหาให้)`,
     "พูดสั้นไม่เกิน 1-2 ประโยค (~85 ตัวอักษร) จบด้วยคำถามปิดสั้นๆ 1 ข้อ",
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   const altHeardNote = altText && altText !== userText ? `\n(หมายเหตุหูที่สองได้ยิน: ${altText.slice(0, 160)})` : "";
   const llmMessages: Array<Record<string, unknown>> = [
@@ -2101,9 +2276,10 @@ export async function* runNongTeeTurn(opts: {
         roundText = roundRaw;
         if (!calls.length) {
           yield* flushPendingStage();
-          const markIdx = roundRaw.indexOf(SCREEN_MARK);
-          const speechPart = (markIdx !== -1 ? roundRaw.slice(0, markIdx) : roundRaw).replace(/\*/g, "");
-          const screenPart = markIdx !== -1 ? roundRaw.slice(markIdx + SCREEN_MARK.length).replace(/^\r?\n/, "") : "";
+          const cleanedRaw = stripModelThoughtTokens(roundRaw);
+          const markIdx = cleanedRaw.indexOf(SCREEN_MARK);
+          const speechPart = (markIdx !== -1 ? cleanedRaw.slice(0, markIdx) : cleanedRaw).replace(/\*/g, "").trim();
+          const screenPart = markIdx !== -1 ? cleanedRaw.slice(markIdx + SCREEN_MARK.length).replace(/^\r?\n/, "") : "";
           if (speechPart) {
             if (round > 0 && spokenAcc && !/\s$/.test(spokenAcc) && !/^\s/.test(speechPart)) {
               spokenAcc += " ";
@@ -2471,12 +2647,17 @@ export async function* runNongTeeTurn(opts: {
             for (const it of res.items) {
               if (cardCollector.size < 36) cardCollector.set(it.slug, toProductCard(it));
             }
-            const cardsArr = [...cardCollector.values()];
+            const cardsArr = sortCardsForDietary([...cardCollector.values()], activeDietary);
+            if (activeDietary.length) {
+              cardCollector.clear();
+              for (const sc of cardsArr) cardCollector.set(sc.slug, sc);
+            }
+            activePathQuery = q || userText;
             // Defer refreshing the right-hand stage until all searches finish right before speaking.
             pendingStage = {
               cards: cardsArr,
               mode: res.items.length === 1 ? "spotlight" : "showcase",
-              spotlight: toProductCard(res.items[0]),
+              spotlight: cardsArr[0] ?? toProductCard(res.items[0]),
               title: q ? `ผลการค้นหา: "${q}"` : "สินค้าที่คัดเลือก",
             };
             toolOut = `พบ ${res.total} รายการ (คัดหลัก ${Math.min(8, res.items.length)}):\n${res.items.slice(0, 8).map((it) => withCardNo(summarizeProductForLlm(it))).join("\n\n")}`;
@@ -2503,10 +2684,25 @@ export async function* runNongTeeTurn(opts: {
       }
     }
 
+    let finalSpoken = stripModelThoughtTokens(spokenAcc).trim();
+    if (!finalSpoken && !opts.signal?.aborted) {
+      yield* flushPendingStage();
+      finalSpoken =
+        cardCollector.size > 0
+          ? (() => {
+              const first = sortCardsForDietary([...cardCollector.values()], activeDietary)[0];
+              return `พบสินค้าที่น่าสนใจแล้วครับ เบอร์ 1 ${first.title} ${first.priceLabel} รับเบอร์ไหนดีครับ`;
+            })()
+          : "ขออภัยครับ เมื่อสักครู่อาจจะฟังไม่ชัดเจน ลองบอกชื่อสินค้าที่ต้องการให้ตี๋ช่วยหาอีกครั้งได้เลยครับ";
+      yield { type: "status", state: "speaking", text: "น้องตี๋กำลังพูด…" };
+      yield { type: "delta", section: "speech", text: finalSpoken };
+      yield { type: "sentence", text: finalSpoken };
+    }
+
     yield {
       type: "done",
-      spokenText: spokenAcc.trim(),
-      screenMarkdown: screenAcc.trim(),
+      spokenText: finalSpoken,
+      screenMarkdown: stripModelThoughtTokens(screenAcc).trim(),
       model: turnState.model,
       provider: turnState.provider,
       ms: Math.max(1, Math.round(performance.now() - turnT0)),

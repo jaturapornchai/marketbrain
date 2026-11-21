@@ -4,13 +4,17 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marked } from "marked";
 import type { PaymentMethod, SalesOrder } from "@/lib/cart-order";
+import type { BatchOrderMatchRow, BatchOrderPlan } from "@/lib/batch-order";
+import { DIETARY_TAGS, evaluateDietaryShield, parseDietaryCommand, type DietaryTagId } from "@/lib/dietary-shield";
 import type {
+  BrainPathTrace,
   JavisChatMessage,
   JavisProductCard,
   JavisStageMode,
   JavisStreamEvent,
   JavisTeamJob,
 } from "@/lib/product-card";
+import { cartItemKey, computeRetailMargin, parseMarginCommand, type PackUpgradeSuggestion } from "@/lib/wholesale-tools";
 import type { LlmDevLogEntry, LlmDevStats, LlmProviderKind } from "@/lib/voice-log";
 import { AdaptiveNoiseGate, EchoGuard, isEchoTranscript, playedLevel, wavEnvelope } from "@/lib/echo-guard";
 import { BrowserSileroVad } from "@/lib/browser-vad";
@@ -41,6 +45,8 @@ import CouponStrip from "./CouponStrip";
 import { PROMOTIONS, applyCoupon, bestPromotion, findPromotion, parseCouponCommand, type CouponCommand } from "@/lib/promotions";
 import ProductVisionScanner, { identifyProductFromFile, type VisionLookupResult } from "./ProductVisionScanner";
 import ProductCardGrid from "./ProductCardGrid";
+import BatchOrderPanel from "./BatchOrderPanel";
+import LiveBrainPath from "./LiveBrainPath";
 
 type SinkableAudio = SinkableAudioEl;
 
@@ -196,6 +202,63 @@ async function fetchRelated(seeds: string[], limit = 24): Promise<RelatedSet | n
   }
 }
 
+import type { CartMarginSummary } from "@/lib/wholesale-tools";
+
+function RetailMarginControlBar({
+  marginPct,
+  onChangePct,
+  summary,
+}: {
+  marginPct: number;
+  onChangePct: (pct: number) => void;
+  summary: CartMarginSummary | null;
+}) {
+  return (
+    <div className="rcart-margin-bar">
+      <div className="rcart-margin-head">
+        <span>📈 กำไรขายปลีก</span>
+        <div className="rcart-margin-pills">
+          {[15, 20, 30].map((pct) => (
+            <button
+              key={pct}
+              type="button"
+              className={`rcart-mpill${marginPct === pct ? " active" : ""}`}
+              onClick={() => onChangePct(marginPct === pct ? 0 : pct)}
+            >
+              +{pct}%
+            </button>
+          ))}
+          <input
+            type="number"
+            min={0}
+            max={300}
+            step={1}
+            value={marginPct || ""}
+            placeholder="%"
+            aria-label="กำหนดเปอร์เซ็นต์กำไร"
+            className="rcart-minput"
+            onChange={(e) => {
+              const v = Math.max(0, Math.min(300, Number(e.target.value) || 0));
+              onChangePct(v);
+            }}
+          />
+          {marginPct > 0 && (
+            <button type="button" className="rcart-mpill clear" onClick={() => onChangePct(0)}>
+              ปิด
+            </button>
+          )}
+        </div>
+      </div>
+      {summary && (
+        <div className="rcart-margin-summary">
+          <span>ขายปลีกรวม ~{summary.totalRevenueFormatted}</span>
+          <strong>กำไรคาดการณ์ +{summary.totalProfitFormatted}</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function JavisSalesCockpit({
   featuredProducts,
   totalProductsCount,
@@ -218,6 +281,12 @@ export default function JavisSalesCockpit({
     promptAddToCart,
     qtyModalProduct,
     closeQtyModal,
+    dietaryTags,
+    toggleDietaryTag,
+    setDietaryTags,
+    clearDietaryTags,
+    addManyToCart,
+    replaceCartItem,
     updateCartQty,
     removeFromCart,
     clearCart,
@@ -229,6 +298,20 @@ export default function JavisSalesCockpit({
   const [stageTitle, setStageTitle] = useState("สินค้าแนะนำพร้อมขายในสมอง");
   const [stageCards, setStageCards] = useState<JavisProductCard[]>(featuredProducts);
   const [spotlight, setSpotlight] = useState<JavisProductCard | null>(featuredProducts[0] ?? null);
+  const [batchPlan, setBatchPlan] = useState<BatchOrderPlan | null>(null);
+  const [brainPath, setBrainPath] = useState<BrainPathTrace | null>(null);
+  // Keep Live Brain Path calm & opt-in (OFF by default so customers never feel overwhelmed)
+  const [brainPathOpen, setBrainPathOpen] = useState(false);
+  const [shieldOpen, setShieldOpen] = useState(false);
+  const [hideDietaryWarned, setHideDietaryWarned] = useState(false);
+  const [marginPct, setMarginPct] = useState(0);
+  const [packUpgrades, setPackUpgrades] = useState<Record<string, PackUpgradeSuggestion>>({});
+  const batchPlanRef = useRef<BatchOrderPlan | null>(null);
+  batchPlanRef.current = batchPlan;
+  const packUpgradesRef = useRef<Record<string, PackUpgradeSuggestion>>({});
+  packUpgradesRef.current = packUpgrades;
+  const dietaryTagsRef = useRef<DietaryTagId[]>(dietaryTags);
+  dietaryTagsRef.current = dietaryTags;
   // What the system just did for a spoken order ("เบอร์ 5 × 10 เข้าตะกร้าแล้ว"), shown as a banner + card highlight
   const [actionFx, setActionFx] = useState<ActionFx[]>([]);
   const actionFxTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
@@ -281,18 +364,48 @@ export default function JavisSalesCockpit({
     return related.cards.filter((c) => !inCart.has(c.slug));
   }, [stageMode, related, cart.items]);
   const cartRelatedShown = useMemo(() => cartRelatedAll.slice(0, 24), [cartRelatedAll]);
+  const displayedStageCards = useMemo(() => {
+    if (!dietaryTags.length || !hideDietaryWarned) return stageCards;
+    return stageCards.filter((c) => evaluateDietaryShield(c, dietaryTags).status !== "warn");
+  }, [dietaryTags, hideDietaryWarned, stageCards]);
   // Single source of truth for numbered voice/text orders ("เอาเบอร์ 2 สองชิ้น", "ดูเบอร์ 3"):
   // always matches the exact numbered ProductCardGrid the customer sees right now.
   const activeNumberedCards = useMemo(() => {
     if (stageMode === "spotlight" && spotRelatedShown.length > 0) return spotRelatedShown;
     if (stageMode === "cart" && cartRelatedShown.length > 0) return cartRelatedShown;
     if ((stageMode === "welcome" || stageMode === "showcase") && showcaseRelatedShown.length > 0) {
-      return [...stageCards, ...showcaseRelatedShown];
+      return [...displayedStageCards, ...showcaseRelatedShown];
     }
-    return stageCards;
-  }, [stageMode, spotRelatedShown, cartRelatedShown, showcaseRelatedShown, stageCards]);
+    return displayedStageCards;
+  }, [stageMode, spotRelatedShown, cartRelatedShown, showcaseRelatedShown, displayedStageCards]);
   const activeNumberedCardsRef = useRef(activeNumberedCards);
   activeNumberedCardsRef.current = activeNumberedCards;
+
+  const effectiveBrainPath = useMemo<BrainPathTrace | null>(() => {
+    if (brainPath) return brainPath;
+    if (!displayedStageCards.length) return null;
+    const hubs: BrainPathTrace["hubs"] = [];
+    const seen = new Set<string>();
+    const addHub = (kind: BrainPathTrace["hubs"][number]["kind"], raw: string) => {
+      const lbl = raw.trim();
+      if (!lbl || lbl === "-" || seen.has(`${kind}:${lbl}`) || hubs.length >= 3) return;
+      seen.add(`${kind}:${lbl}`);
+      hubs.push({ kind, label: lbl });
+    };
+    for (const c of displayedStageCards.slice(0, 6)) addHub("category", c.category);
+    for (const c of displayedStageCards.slice(0, 6)) addHub("brand", c.brand);
+    for (const c of displayedStageCards.slice(0, 4)) for (const t of c.traits.slice(0, 2)) addHub("trait", t);
+    return {
+      query: stageTitle.replace(/^สินค้าตามบริบท:\s*"?|"?$/g, "").slice(0, 44) || "สินค้าแนะนำ",
+      hubs: hubs.slice(0, 3),
+      products: displayedStageCards.slice(0, 4).map((c, idx) => ({
+        slug: c.slug,
+        no: idx + 1,
+        title: c.title,
+        priceLabel: c.priceLabel,
+      })),
+    };
+  }, [brainPath, displayedStageCards, stageTitle]);
   const scrollStageToTop = useCallback((smooth = true) => {
     const behavior: ScrollBehavior = smooth ? "smooth" : "auto";
     const body = stageBodyRef.current ?? document.querySelector<HTMLElement>(".jc-stage-body");
@@ -352,6 +465,9 @@ export default function JavisSalesCockpit({
   }, []);
   const runCouponCommandRef = useRef<(cmd: CouponCommand, heard: string) => void>(() => {});
   const runBudgetRef = useRef<(amount: string, heard: string) => void>(() => {});
+  const reportCommandRef = useRef<(reply: string, heard: string | undefined, speak: boolean) => void>(() => {});
+  const applyPackUpgradeRef = useRef<(up: PackUpgradeSuggestion, heard?: string) => void>(() => {});
+  const confirmBatchOrderRef = useRef<(rows: BatchOrderMatchRow[], heard?: string) => void>(() => {});
   const couponCodeRef = useRef(couponCode);
   couponCodeRef.current = couponCode;
   const modalOpenRef = useRef(false);
@@ -398,17 +514,19 @@ export default function JavisSalesCockpit({
   }, [stageMode]);
 
   useEffect(() => {
-    if (!chatOpen && !devLogOpen) return;
+    if (!chatOpen && !devLogOpen && !shieldOpen) return;
     const onPointerDown = (e: MouseEvent) => {
       if (dockPopRef.current && !dockPopRef.current.contains(e.target as Node)) {
         setChatOpen(false);
         setDevLogOpen(false);
+        setShieldOpen(false);
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setChatOpen(false);
         setDevLogOpen(false);
+        setShieldOpen(false);
       }
     };
     document.addEventListener("mousedown", onPointerDown);
@@ -417,7 +535,44 @@ export default function JavisSalesCockpit({
       document.removeEventListener("mousedown", onPointerDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [chatOpen, devLogOpen]);
+  }, [chatOpen, devLogOpen, shieldOpen]);
+
+  const marginSummary = useMemo(() => computeRetailMargin(cart, marginPct), [cart, marginPct]);
+
+  useEffect(() => {
+    if (!cart.items.length) {
+      setPackUpgrades({});
+      return;
+    }
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch("/api/products/pack-upgrades", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            items: cart.items.map((it) => ({
+              slug: it.slug,
+              unitCode: it.unitCode,
+              qty: it.qty,
+              unitPrice: it.unitPrice,
+              packQty: it.packQty,
+            })),
+          }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok) return;
+        const j = (await res.json()) as { upgrades?: Record<string, PackUpgradeSuggestion> };
+        if (j.upgrades && typeof j.upgrades === "object") setPackUpgrades(j.upgrades);
+      } catch {
+        // ignore abort/network hiccup
+      }
+    }, 240);
+    return () => {
+      clearTimeout(t);
+      ctrl.abort();
+    };
+  }, [cart.items]);
 
   const [input, setInput] = useState("");
   const [liveUserHeard, setLiveUserHeard] = useState("");
@@ -902,6 +1057,46 @@ export default function JavisSalesCockpit({
         runCouponCommandRef.current(couponCmd, q);
         return;
       }
+      // "ผมแพ้ถั่วกับนมวัว", "เอาเฉพาะฮาลาล ไม่ใส่ผงชูรส" -> dietary shield, 0 tokens
+      const dietaryCmd = q && !extra?.visionSlugs ? parseDietaryCommand(q) : null;
+      if (dietaryCmd) {
+        setInput("");
+        setLiveUserHeard("");
+        let replyMsg = "";
+        if (dietaryCmd.action === "clear") {
+          clearDietaryTags();
+          setHideDietaryWarned(false);
+          replyMsg = "ล้างโปรไฟล์เกราะสุขภาพออกทั้งหมดแล้วครับ";
+        } else if (dietaryCmd.action === "remove") {
+          const next = dietaryTagsRef.current.filter((id) => !dietaryCmd.tags.includes(id));
+          setDietaryTags(next);
+          const names = dietaryCmd.tags.map((id) => DIETARY_TAGS.find((d) => d.id === id)?.shortLabel ?? id).join(" ");
+          replyMsg = `เอาเงื่อนไข ${names} ออกจากเกราะสุขภาพแล้วครับ`;
+        } else {
+          const next = [...new Set([...dietaryTagsRef.current, ...dietaryCmd.tags])];
+          setDietaryTags(next);
+          const names = dietaryCmd.tags.map((id) => DIETARY_TAGS.find((d) => d.id === id)?.shortLabel ?? id).join(" ");
+          replyMsg = `เปิดเกราะสุขภาพ ${names} ให้แล้วครับ ตี๋จะคัดตัวปลอดภัยและเตือนก่อนหยิบให้นะครับ`;
+        }
+        reportCommandRef.current(replyMsg, q, true);
+        return;
+      }
+      // "ตั้งกำไร 20%", "ปิดคิดกำไร" -> wholesale retail margin calc, 0 tokens
+      const marginCmd = q && !extra?.visionSlugs ? parseMarginCommand(q, parseThaiNumber) : null;
+      if (marginCmd !== null) {
+        setInput("");
+        setLiveUserHeard("");
+        setMarginPct(marginCmd);
+        if (marginCmd > 0 && typeof window !== "undefined" && window.innerWidth < 768) {
+          setStageMode("cart");
+        }
+        const replyMsg =
+          marginCmd === 0
+            ? "ปิดโหมดคิดกำไรขายปลีกบนตะกร้าแล้วครับ"
+            : `เปิดคิดราคาขายปลีกบวกกำไร ${marginCmd} เปอร์เซ็นต์ในตะกร้าแล้วครับ`;
+        reportCommandRef.current(replyMsg, q, true);
+        return;
+      }
       // Never drop a new customer command while a previous turn is still finishing: abort the stale turn and run this one immediately.
       if (busyRef.current && abortRef.current) {
         const stale = abortRef.current;
@@ -951,6 +1146,7 @@ export default function JavisSalesCockpit({
 
       const controller = new AbortController();
       abortRef.current = controller;
+      let turnHasBatch = false;
 
       try {
         const res = await fetch("/api/javis/chat", {
@@ -965,6 +1161,7 @@ export default function JavisSalesCockpit({
             visionSummary: extra?.visionSummary,
             altHeard: extra?.altHeard,
             focusSlugs,
+            dietaryTags: dietaryTagsRef.current,
             pendingSlug: qtyModalSlugRef.current || undefined,
             viewingSlug: viewingSlugRef.current || undefined,
             couponCode: couponCodeRef.current || undefined,
@@ -1033,6 +1230,7 @@ export default function JavisSalesCockpit({
                 // Always switch the right-hand stage to showcase when a brand-new search result arrives
                 // so products never stay hidden behind welcome/camera/compare/old spotlight screens.
                 if (isNewCardSet) {
+                  if (!turnHasBatch) setBatchPlan(null);
                   setStageMode((m) => (m === "cart" || m === "checkout" ? m : "showcase"));
                   requestAnimationFrame(() => scrollStageToTop(true));
                 }
@@ -1084,6 +1282,12 @@ export default function JavisSalesCockpit({
             } else if (ev.type === "order") {
               setConfirmedOrder(ev.order);
               setCouponCode("");
+            } else if (ev.type === "batch_order") {
+              turnHasBatch = true;
+              setBatchPlan(ev.plan);
+              requestAnimationFrame(() => scrollStageToTop(true));
+            } else if (ev.type === "brain_path") {
+              setBrainPath(ev.path);
             } else if (ev.type === "sentence") {
               enqueueOmniVoiceSentence(ev.text);
             } else if (ev.type === "delta") {
@@ -1192,7 +1396,7 @@ export default function JavisSalesCockpit({
         }
       }
     },
-    [cart.items, closeQtyModal, customer, enqueueOmniVoiceSentence, logVoiceClient, markStagePaintedSoon, promptAddToCart, replaceServerCart, stageMode, stopAllAudioPlayback, turns, updateCustomer],
+    [cart.items, clearDietaryTags, closeQtyModal, customer, enqueueOmniVoiceSentence, logVoiceClient, markMission, markStagePaintedSoon, promptAddToCart, replaceServerCart, setDietaryTags, stageMode, stopAllAudioPlayback, turns, updateCustomer],
   );
   sendTurnRef.current = sendTurn;
 
@@ -1924,7 +2128,7 @@ export default function JavisSalesCockpit({
     return () => clearTimeout(timer);
   }, [stageMode, stageCards, spotlight, stageTitle]);
 
-  modalOpenRef.current = ordersModalOpen || helpOpen || wheelOpen || Boolean(duel);
+  modalOpenRef.current = ordersModalOpen || helpOpen || wheelOpen || Boolean(duel) || Boolean(batchPlan) || shieldOpen;
 
   const goScreenHistory = useCallback((delta: number): ScreenSnap | null => {
     const h = screenHistRef.current;
@@ -2128,7 +2332,36 @@ export default function JavisSalesCockpit({
         setHelpOpen(false);
         setWheelOpen(false);
         setDuel(null);
+        setBatchPlan(null);
+        setShieldOpen(false);
         reply = "ปิดแล้วครับ";
+        break;
+      case "batch_confirm": {
+        const curPlan = batchPlanRef.current;
+        const picked = curPlan?.rows.filter((r) => r.selected && Boolean(r.matched) && r.qty > 0) ?? [];
+        if (picked.length > 0) {
+          confirmBatchOrderRef.current(picked, heard);
+          return;
+        }
+        reply = "ตอนนี้ยังไม่มีรายการจัดชุดที่เลือกไว้นะครับ";
+        break;
+      }
+      case "upgrade_pack": {
+        const firstUp = Object.values(packUpgradesRef.current)[0];
+        if (firstUp) {
+          applyPackUpgradeRef.current(firstUp, heard);
+          return;
+        }
+        reply = "รายการในตะกร้าตอนนี้คุ้มสุดแล้วครับ หรือยังไม่มีตัวที่อัปไซส์ได้เพิ่มเติมครับ";
+        break;
+      }
+      case "brain_path_on":
+        setBrainPathOpen(true);
+        reply = "เปิดเส้นทางสมองรอบล่าสุดให้แล้วครับ";
+        break;
+      case "brain_path_off":
+        setBrainPathOpen(false);
+        reply = "ซ่อนเส้นทางสมองให้แล้วครับ";
         break;
       case "orders":
         void openOrdersHistory();
@@ -2201,6 +2434,48 @@ export default function JavisSalesCockpit({
     if (speak && reply) enqueueOmniVoiceSentence(reply);
     setHudState(callActiveRef.current ? "listening" : "idle");
   };
+  reportCommandRef.current = reportCommand;
+
+  const applyPackUpgrade = (up: PackUpgradeSuggestion, heard?: string) => {
+    const [oldSlug] = up.itemKey.split("::");
+    replaceCartItem(oldSlug, up.fromUnitCode, {
+      slug: up.targetSlug,
+      title: up.targetTitle,
+      unitCode: up.targetUnitCode,
+      packQty: up.targetPackQty,
+      unitPrice: up.targetUnitPrice,
+      qty: up.targetQty,
+    });
+    playTing("win");
+    reportCommand(
+      `สลับเป็น ${up.targetUnitCode} จำนวน ${up.targetQty} หน่วยเรียบร้อยครับ ประหยัดไป ${bahtSpoken(up.totalSavingFormatted)}`,
+      heard ?? `สลับเป็น ${up.targetUnitCode}`,
+      true,
+    );
+  };
+  applyPackUpgradeRef.current = applyPackUpgrade;
+
+  const confirmBatchOrderRows = (rows: BatchOrderMatchRow[], heard?: string) => {
+    const entries = rows
+      .filter((r) => r.matched && r.qty > 0)
+      .map((r) => ({
+        product: r.matched!,
+        qty: r.qty,
+        unitCode: r.unitCode,
+        unitPrice: r.unitPrice,
+      }));
+    if (!entries.length) return;
+    addManyToCart(entries);
+    setBatchPlan(null);
+    playTing("win");
+    markMission("add");
+    reportCommand(
+      `ใส่ตะกร้าทั้งชุด ${entries.length} รายการเรียบร้อยแล้วครับ ยอดรวมอัปเดตให้แล้ว`,
+      heard ?? `ใส่ตะกร้าทั้งชุด (${entries.length} รายการ)`,
+      true,
+    );
+  };
+  confirmBatchOrderRef.current = confirmBatchOrderRows;
 
   const runCouponCommand = (cmd: CouponCommand, heard: string) => {
     let reply = "";
@@ -2548,12 +2823,40 @@ export default function JavisSalesCockpit({
 
             <button
               type="button"
+              className={`jc-icon-btn is-shield${dietaryTags.length > 0 ? " has-shield" : ""}${shieldOpen ? " active" : ""}`}
+              aria-expanded={shieldOpen}
+              aria-label="เกราะสุขภาพและภูมิแพ้"
+              title='เกราะสุขภาพและภูมิแพ้ (หรือพูดว่า "แพ้ถั่ว" / "เอาเฉพาะฮาลาล")'
+              onClick={() => {
+                setChatOpen(false);
+                setDevLogOpen(false);
+                setShieldOpen((v) => !v);
+              }}
+            >
+              <span aria-hidden="true">🛡️</span>
+              {dietaryTags.length > 0 && <span className="jc-icon-badge">{dietaryTags.length}</span>}
+            </button>
+
+            <button
+              type="button"
+              className={`jc-icon-btn is-brain${brainPathOpen ? " active" : ""}`}
+              aria-pressed={brainPathOpen}
+              aria-label="เปิด/ซ่อนเส้นทางสมองรอบล่าสุด"
+              title='เส้นทางสมอง 3 ขั้นแบบสบายตา (หรือพูดว่า "เปิดเส้นทางสมอง")'
+              onClick={() => setBrainPathOpen((v) => !v)}
+            >
+              <span aria-hidden="true">🧠</span>
+            </button>
+
+            <button
+              type="button"
               className={`jc-icon-btn is-chat${chatOpen ? " active" : ""}`}
               aria-expanded={chatOpen}
               aria-label="ประวัติคุยกับน้องตี๋"
               title="ประวัติคุยกับน้องตี๋"
               onClick={() => {
                 setDevLogOpen(false);
+                setShieldOpen(false);
                 setChatOpen((v) => !v);
               }}
             >
@@ -2570,6 +2873,7 @@ export default function JavisSalesCockpit({
               onClick={() => {
                 const next = !devLogOpen;
                 setChatOpen(false);
+                setShieldOpen(false);
                 setDevLogOpen(next);
                 if (next) void refreshDevLogs();
               }}
@@ -2653,6 +2957,51 @@ export default function JavisSalesCockpit({
             </div>
           )}
         </div>
+
+        {shieldOpen && (
+          <div className="jc-shield-popover" role="dialog" aria-label="ตั้งค่าเกราะสุขภาพและภูมิแพ้">
+            <div className="jc-pop-head">
+              <div className="jc-pop-title">
+                <b>🛡️ เกราะสุขภาพ & ภูมิแพ้</b>
+                <span className="jc-shield-hint">พูดได้: “แพ้ถั่ว” · “เอาเฉพาะฮาลาล”</span>
+              </div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                {dietaryTags.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn-reset-sm"
+                    onClick={() => {
+                      clearDietaryTags();
+                      setHideDietaryWarned(false);
+                    }}
+                  >
+                    ล้างทั้งหมด
+                  </button>
+                )}
+                <button type="button" className="jm-close-btn" onClick={() => setShieldOpen(false)} aria-label="ปิดเกราะสุขภาพ">
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div className="jc-shield-grid">
+              {DIETARY_TAGS.map((tag) => {
+                const active = dietaryTags.includes(tag.id);
+                return (
+                  <button
+                    key={tag.id}
+                    type="button"
+                    className={`jc-shield-chip${active ? " active" : ""}`}
+                    aria-pressed={active}
+                    onClick={() => toggleDietaryTag(tag.id)}
+                  >
+                    <span>{tag.icon}</span>
+                    <span>{tag.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {chatOpen && (
           <div className="jc-chat-popover" role="dialog" aria-label="ประวัติสนทนากับเลขาน้องตี๋">
@@ -2893,6 +3242,38 @@ export default function JavisSalesCockpit({
             </button>
           </div>
           {budget && <BudgetBar budget={budget} cart={cart} onClear={() => setBudget("")} />}
+          {dietaryTags.length > 0 && (
+            <div className="jc-shield-bar" role="region" aria-label="เกราะสุขภาพที่เปิดใช้งาน">
+              <span className="jc-shield-bar-lbl">🛡️ เกราะสุขภาพ:</span>
+              <div className="jc-shield-bar-chips">
+                {dietaryTags.map((id) => {
+                  const def = DIETARY_TAGS.find((t) => t.id === id);
+                  return (
+                    <button key={id} type="button" className="jc-sbar-chip" onClick={() => toggleDietaryTag(id)} title="กดเพื่อนำออก">
+                      {def?.icon} {def?.shortLabel ?? id} ×
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                type="button"
+                className={`btn-reset-sm${hideDietaryWarned ? " active" : ""}`}
+                onClick={() => setHideDietaryWarned((v) => !v)}
+              >
+                {hideDietaryWarned ? "แสดงทั้งหมด" : "ซ่อนตัวเสี่ยง"}
+              </button>
+              <button
+                type="button"
+                className="btn-reset-sm"
+                onClick={() => {
+                  clearDietaryTags();
+                  setHideDietaryWarned(false);
+                }}
+              >
+                ล้าง
+              </button>
+            </div>
+          )}
           <div className="jc-stage-tabs">
             <button
               type="button"
@@ -2951,6 +3332,23 @@ export default function JavisSalesCockpit({
 
           <div className="jc-stage-body" ref={stageBodyRef}>
             {busy && <ThinkingBrain jobs={latestJobs} cards={latestTurn?.cards ?? []} />}
+            {brainPathOpen && (
+              <LiveBrainPath
+                trace={effectiveBrainPath}
+                cards={displayedStageCards}
+                onPickCard={openProductSpotlight}
+                onClose={() => setBrainPathOpen(false)}
+              />
+            )}
+            {batchPlan && (
+              <BatchOrderPanel
+                plan={batchPlan}
+                onChangePlan={setBatchPlan}
+                onConfirm={(rows) => confirmBatchOrderRows(rows)}
+                onClose={() => setBatchPlan(null)}
+                onDetail={openProductSpotlight}
+              />
+            )}
             {wheelOpen && (
               <LuckyWheel
                 onWin={(p) => {
@@ -3048,9 +3446,10 @@ export default function JavisSalesCockpit({
                 </div>
 
                 <ProductCardGrid
-                  cards={stageCards}
+                  cards={displayedStageCards}
                   reasons={stageTitle === "🔗 สมองแนะนำของที่เกี่ยวข้อง" ? related?.reasons : undefined}
                   actionFx={actionFx}
+                  dietaryTags={dietaryTags}
                   onAdd={promptAddToCart}
                   onDetail={openProductSpotlight}
                 />
@@ -3058,11 +3457,12 @@ export default function JavisSalesCockpit({
                 {showcaseRelatedShown.length > 0 && stageRelated && (
                   <RelatedStrip
                     title="🔗 สินค้าที่เกี่ยวข้องจากสมอง"
-                    startNo={stageCards.length + 1}
+                    startNo={displayedStageCards.length + 1}
                     cards={showcaseRelatedShown}
                     reasons={stageRelated.set.reasons}
                     totalCount={showcaseRelatedAll.length}
                     actionFx={actionFx}
+                    dietaryTags={dietaryTags}
                     onAdd={promptAddToCart}
                     onDetail={openProductSpotlight}
                     onShowAll={() => void showRelated(undefined)}
@@ -3105,9 +3505,38 @@ export default function JavisSalesCockpit({
                     {spotlight.barcode && (
                       <p className="muted">
                         บาร์โค้ด: <code>{spotlight.barcode}</code>{" "}
-                        {spotlight.isThaiGs1 && <span className="p-gs1">GS1 ไทย 885</span>} · รหัส: <code>{spotlight.productCode}</code>
+                        {spotlight.isThaiGs1 && <span className="p-gs1">GS1 ไทย 885</span>}
+                        {spotlight.fdaNumber && (
+                          <>
+                            {" "}· เลข อ.ย.: <code>{spotlight.fdaNumber}</code>
+                          </>
+                        )}{" "}
+                        · รหัส: <code>{spotlight.productCode}</code>
                       </p>
                     )}
+
+                    {spotlight.badges && spotlight.badges.length > 0 && (
+                      <div className="p-traits sp-badges">
+                        {spotlight.badges.map((b) => (
+                          <span key={b.id} className={`p-trait-tag p-sbadge tone-${b.tone}`} title={b.title}>
+                            {b.icon} {b.label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {dietaryTags.length > 0 && (() => {
+                      const dv = evaluateDietaryShield(spotlight, dietaryTags);
+                      return dv.status === "warn" ? (
+                        <div className="qty-diet-warn">
+                          ⚠️ <strong>แจ้งเตือนเกราะสุขภาพ:</strong> พบข้อมูลตรงกับเงื่อนไข {dv.warnLabels.join(", ")}
+                        </div>
+                      ) : dv.status === "safe" ? (
+                        <div className="qty-diet-safe">
+                          ✅ <strong>ผ่านเกราะสุขภาพ:</strong> {dv.safeLabels.join(", ")}
+                        </div>
+                      ) : null;
+                    })()}
 
                     {spotlight.traits.length > 0 && (
                       <div className="p-traits">
@@ -3167,6 +3596,7 @@ export default function JavisSalesCockpit({
                     reasons={spotRelated.set.reasons}
                     totalCount={spotRelatedAll.length}
                     actionFx={actionFx}
+                    dietaryTags={dietaryTags}
                     onAdd={promptAddToCart}
                     onDetail={openProductSpotlight}
                     onShowAll={() => void showRelated(undefined)}
@@ -3253,53 +3683,73 @@ export default function JavisSalesCockpit({
                 ) : (
                   <>
                     <div className="cart-list-full">
-                      {cart.items.map((it) => (
-                        <div
-                          key={`${it.slug}-${it.unitCode}`}
-                          className={`cart-row-card${lastChangedSlug === it.slug ? " highlight" : ""}`}
-                        >
-                          {it.imageUrl ? (
-                            <img src={it.imageUrl} alt={it.title} className="cart-row-img" />
-                          ) : (
-                            <div className="jm-prod-noimg">📦</div>
-                          )}
-                          <div className="cart-row-info">
-                            <span className="p-brand">{it.brand}</span>
-                            <h4>{it.title}</h4>
-                            <span className="muted">
-                              ราคา {it.unitPriceFormatted} / {it.unitCode}
-                            </span>
+                      {cart.items.map((it) => {
+                        const rowKey = cartItemKey(it.slug, it.unitCode);
+                        const upgrade = packUpgrades[rowKey];
+                        const mLine = marginSummary?.lines[rowKey];
+                        return (
+                          <div
+                            key={`${it.slug}-${it.unitCode}`}
+                            className={`cart-row-card${lastChangedSlug === it.slug ? " highlight" : ""}`}
+                          >
+                            {it.imageUrl ? (
+                              <img src={it.imageUrl} alt={it.title} className="cart-row-img" />
+                            ) : (
+                              <div className="jm-prod-noimg">📦</div>
+                            )}
+                            <div className="cart-row-info">
+                              <span className="p-brand">{it.brand}</span>
+                              <h4>{it.title}</h4>
+                              <span className="muted">
+                                ราคา {it.unitPriceFormatted} / {it.unitCode}
+                              </span>
+                              {mLine && (
+                                <span className="rcart-margin-line">
+                                  ทุน {mLine.costPerBaseFormatted}/หน่วย → ขายปลีก {mLine.sellPerBaseFormatted} (กำไร +{mLine.lineProfitFormatted})
+                                </span>
+                              )}
+                              {upgrade && (
+                                <div className="rcart-upgrade-chip">
+                                  <span>💡 {upgrade.reasonTh}</span>
+                                  <button type="button" className="btn-upgrade-mini" onClick={() => applyPackUpgrade(upgrade)}>
+                                    สลับเลย
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                            <div className="cart-row-qty">
+                              <button
+                                type="button"
+                                className="qty-step-btn sm"
+                                onClick={() => updateCartQty(it.slug, it.unitCode, it.qty - 1)}
+                              >
+                                −
+                              </button>
+                              <span className="cart-qty-num">{it.qty}</span>
+                              <button
+                                type="button"
+                                className="qty-step-btn sm"
+                                onClick={() => updateCartQty(it.slug, it.unitCode, it.qty + 1)}
+                              >
+                                +
+                              </button>
+                            </div>
+                            <div className="cart-row-total">
+                              <strong>{it.lineTotalFormatted}</strong>
+                              <button
+                                type="button"
+                                className="cart-del-btn"
+                                onClick={() => removeFromCart(it.slug, it.unitCode)}
+                              >
+                                ลบ
+                              </button>
+                            </div>
                           </div>
-                          <div className="cart-row-qty">
-                            <button
-                              type="button"
-                              className="qty-step-btn sm"
-                              onClick={() => updateCartQty(it.slug, it.unitCode, it.qty - 1)}
-                            >
-                              −
-                            </button>
-                            <span className="cart-qty-num">{it.qty}</span>
-                            <button
-                              type="button"
-                              className="qty-step-btn sm"
-                              onClick={() => updateCartQty(it.slug, it.unitCode, it.qty + 1)}
-                            >
-                              +
-                            </button>
-                          </div>
-                          <div className="cart-row-total">
-                            <strong>{it.lineTotalFormatted}</strong>
-                            <button
-                              type="button"
-                              className="cart-del-btn"
-                              onClick={() => removeFromCart(it.slug, it.unitCode)}
-                            >
-                              ลบ
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
+
+                    <RetailMarginControlBar marginPct={marginPct} onChangePct={setMarginPct} summary={marginSummary} />
 
                     <div className="cart-grand-box">
                       <div>
@@ -3330,6 +3780,7 @@ export default function JavisSalesCockpit({
                     reasons={related.reasons}
                     totalCount={cartRelatedAll.length}
                     actionFx={actionFx}
+                    dietaryTags={dietaryTags}
                     onAdd={promptAddToCart}
                     onDetail={openProductSpotlight}
                     onShowAll={() => void showRelated(undefined)}
@@ -3572,31 +4023,52 @@ export default function JavisSalesCockpit({
                 พูดสั่งน้องตี๋ ส่องกล้องรูปสินค้า หรือกดปุ่ม <b>🛒 ใส่ตะกร้า</b> ได้เลยครับ
               </p>
             ) : (
-              cart.items.map((it) => (
-                <div key={`${it.slug}-${it.unitCode}`} className="rcart-item">
-                  {it.imageUrl && <img src={it.imageUrl} alt="" />}
-                  <div className="rcart-info">
-                    <h5>{it.title}</h5>
-                    <span>
-                      {it.unitPriceFormatted}/{it.unitCode}
-                    </span>
-                    <div className="rcart-ctrl">
-                      <button type="button" onClick={() => updateCartQty(it.slug, it.unitCode, it.qty - 1)}>
-                        −
-                      </button>
-                      <b>{it.qty}</b>
-                      <button type="button" onClick={() => updateCartQty(it.slug, it.unitCode, it.qty + 1)}>
-                        +
-                      </button>
-                      <strong className="rcart-line-sum">{it.lineTotalFormatted}</strong>
+              cart.items.map((it) => {
+                const rowKey = cartItemKey(it.slug, it.unitCode);
+                const upgrade = packUpgrades[rowKey];
+                const mLine = marginSummary?.lines[rowKey];
+                return (
+                  <div key={`${it.slug}-${it.unitCode}`} className="rcart-item">
+                    {it.imageUrl && <img src={it.imageUrl} alt="" />}
+                    <div className="rcart-info">
+                      <h5>{it.title}</h5>
+                      <span>
+                        {it.unitPriceFormatted}/{it.unitCode}
+                      </span>
+                      {mLine && (
+                        <span className="rcart-margin-line">
+                          ทุน {mLine.costPerBaseFormatted} → ขาย {mLine.sellPerBaseFormatted} (+{mLine.lineProfitFormatted})
+                        </span>
+                      )}
+                      {upgrade && (
+                        <div className="rcart-upgrade-chip">
+                          <span>💡 แพ็คใหญ่คุ้มกว่า {upgrade.perBaseSavingFormatted}/หน่วย</span>
+                          <button type="button" className="btn-upgrade-mini" onClick={() => applyPackUpgrade(upgrade)}>
+                            สลับเลย
+                          </button>
+                        </div>
+                      )}
+                      <div className="rcart-ctrl">
+                        <button type="button" onClick={() => updateCartQty(it.slug, it.unitCode, it.qty - 1)}>
+                          −
+                        </button>
+                        <b>{it.qty}</b>
+                        <button type="button" onClick={() => updateCartQty(it.slug, it.unitCode, it.qty + 1)}>
+                          +
+                        </button>
+                        <strong className="rcart-line-sum">{it.lineTotalFormatted}</strong>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
 
           <div className="rcart-foot">
+            {cart.items.length > 0 && (
+              <RetailMarginControlBar marginPct={marginPct} onChangePct={setMarginPct} summary={marginSummary} />
+            )}
             <div className="rcart-total">
               <span>ยอดรวมสุทธิ</span>
               <strong key={cart.grandTotalFormatted} className="mb-total-pulse">

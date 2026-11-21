@@ -1,12 +1,17 @@
 import type { Metadata } from "next";
 import ProductCatalogWorkbench from "@/components/ProductCatalogWorkbench";
 import Shell from "@/components/Shell";
+import { DIETARY_TAGS, type DietaryTagId } from "@/lib/dietary-shield";
+import { BADGE_BIT_BY_ID } from "@/lib/product-badges";
+import type { SearchScope } from "@/lib/smart-search";
 import { formatUpdatedAt, searchProductsDetailed, type ProductSearchQuery } from "@/lib/vault";
+
+const ALLOWED_DIETARY = new Set<string>(DIETARY_TAGS.map((t) => t.id));
 
 export const metadata: Metadata = {
   title: "ค้นหาสินค้าแบบละเอียด · MarketBrain สมองสินค้า",
   description:
-    "ค้นหาและกรองสินค้าอุปโภคบริโภคไทยแบบละเอียดตามกลุ่มหมวดหมู่ แบรนด์ หน่วยนับ คุณลักษณะ ส่วนผสม ช่วงราคา และบาร์โค้ด GS1 ไทย พร้อมถามเลขาน้องตี๋",
+    "ค้นหาและกรองสินค้าอุปโภคบริโภคไทยแบบละเอียดตามกลุ่มหมวดหมู่ แบรนด์ หน่วยนับ คุณลักษณะ ส่วนผสม ช่วงราคา ป้ายมาตรฐาน อ.ย./มอก./ฮาลาล และบาร์โค้ด GS1 ไทย",
   alternates: { canonical: "/search" },
 };
 
@@ -26,6 +31,19 @@ export default async function SearchPage({
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
+  const badges = str("badges")
+    .split(",")
+    .map((x) => x.trim())
+    .filter((x) => Boolean(BADGE_BIT_BY_ID[x]));
+  const dietary = str("dietary")
+    .split(",")
+    .map((x) => x.trim())
+    .filter((x): x is DietaryTagId => ALLOWED_DIETARY.has(x));
+  const exclude = str("exclude").trim();
+  const rawScope = str("scope");
+  const scope: SearchScope =
+    rawScope === "title" || rawScope === "code" || rawScope === "ingredients" ? rawScope : "all";
+  const noAutoCorrect = str("noAutoCorrect") === "1" || str("noAutoCorrect") === "true";
   const source = str("source").trim();
   const minPrice = str("minPrice").trim();
   const maxPrice = str("maxPrice").trim();
@@ -52,6 +70,11 @@ export default async function SearchPage({
     maxPrice,
     multiUnitOnly,
     thaiGs1Only,
+    exclude,
+    badges,
+    dietary,
+    scope,
+    noAutoCorrect,
     sort,
     page,
     pageSize: 36,
@@ -72,6 +95,11 @@ export default async function SearchPage({
           maxPrice,
           multiUnitOnly,
           thaiGs1Only,
+          exclude,
+          badges,
+          dietary,
+          scope,
+          noAutoCorrect,
           sort,
           page,
         }}
