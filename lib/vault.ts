@@ -17,6 +17,7 @@ import { compareMoney, formatThaiBaht, moneyInRange } from "./decimal-money";
 import { buildHeardVocab, type HeardVocab } from "./heard-fix";
 import { NUTRITION_KEY_THAI, SOURCE_THAI_LABEL, toCleanSlug } from "./trait-dictionary";
 import {
+  getSnapshotFilePath,
   readCachedBrainSnapshot,
   syncBrainSnapshotFromDb,
   type BrainProductItem,
@@ -217,6 +218,8 @@ export type ProductSearchResult = {
   pageSize: number;
   totalPages: number;
   appliedTerms: string[];
+  /** True when the #1 product strongly matches the query in its title/synonym/trait (not a stray body mention). */
+  topStrongMatch: boolean;
   items: BrainProductItem[];
   facets: {
     categories: CategoryFacetNode[];
@@ -250,7 +253,7 @@ export const normalizeText = (s: string) =>
 
 const segmenter = new Intl.Segmenter("th", { granularity: "word" });
 const STOP = new Set(
-  "คือ อะไร ยังไง อย่างไร ไหม มั้ย หรือ และ ที่ ของ การ ความ ใน ให้ ได้ มี เป็น จะ ว่า กับ แล้ว บ้าง ช่วย หน่อย ครับ ค่ะ คะ นะ เรา ผม ตี๋ น้องตี๋ หา ดู ขอ เอา ตัว อัน แบบ ไม่ ใส่ the a an of to is are how what in on and or for with".split(
+  "คือ อะไร ยังไง อย่างไร ไหม มั้ย หรือ และ ที่ ของ การ ความ ใน ให้ ได้ มี เป็น จะ ว่า กับ แล้ว บ้าง ช่วย หน่อย ครับ ค่ะ คะ นะ เรา ผม ตี๋ น้องตี๋ หา ดู ขอ เอา ตัว อัน แบบ ไม่ ใส่ อยาก ต้องการ ไม่รู้ เยอะ มาก คุณผู้ชม the a an of to is are how what in on and or for with".split(
     " ",
   ),
 );
@@ -268,6 +271,78 @@ const COMPOUND_CLAIMS = [
   "ไม่ใช้วัตถุกันเสีย",
   "ไม่ใส่วัตถุกันเสีย",
   "ไม่ใส่สารกันบูด",
+  // Everyday Thai grocery compound nouns that Intl.Segmenter splits into ambiguous halves
+  "น้ำมันดอกทานตะวัน",
+  "น้ำมันถั่วเหลือง",
+  "น้ำมันคาโนล่า",
+  "น้ำมันข้าวโพด",
+  "น้ำมันรำข้าว",
+  "น้ำมันมะกอก",
+  "น้ำมันปาล์ม",
+  "น้ำมันพืช",
+  "ซอสหอยนางรม",
+  "น้ำมันหอย",
+  "กระดาษทิชชู่",
+  "กระดาษเช็ดหน้า",
+  "กระดาษชำระ",
+  "ทิชชู่เปียก",
+  "ทิชชู่",
+  "ปลาข้าวสาร",
+  "ข้าวหอมมะลิ",
+  // Hardware / tools / machinery compound nouns so Intl.Segmenter never splits them into unrelated halves
+  "เครื่องกำเนิดไฟฟ้า",
+  "เครื่องปั่นไฟ",
+  "น้ำมันเครื่อง",
+  "เครื่องตัดหญ้า",
+  "เครื่องเป่าลม",
+  "เครื่องพ่นยา",
+  "เครื่องฉีดน้ำ",
+  "เครื่องเชื่อม",
+  "สว่านไฟฟ้า",
+  "เลื่อยยนต์",
+  "ตู้เชื่อม",
+  "ปั๊มน้ำ",
+  "ปั้มน้ำ",
+  "ข้องอ",
+  "ข้อต่อ",
+  "สามทาง",
+  "สี่ทาง",
+  "ข้อลด",
+  "บอลวาล์ว",
+  "เช็ควาล์ว",
+  "ฟุตวาล์ว",
+  "ก๊อกน้ำ",
+  "ก๊อกบอล",
+  "สายยาง",
+  "ท่อพีวีซี",
+  "เกลียวใน",
+  "เกลียวนอก",
+  // Everyday symptom / care compound phrases so "คันหัว" never splits into spoon "คัน" + brand "หัว"
+  "แชมพูขจัดรังแค",
+  "ครีมทาส้นเท้า",
+  "ครีมทาเท้า",
+  "ผงโรยเท้า",
+  "แป้งโยคี",
+  "ยาอมแก้ไอ",
+  "ยาแก้ไอ",
+  "ผื่นคัน",
+  "คันศีรษะ",
+  "คันเท้า",
+  "คันหัว",
+  "คันขา",
+  "ปวดหัว",
+  "ปวดขา",
+  "ปวดหลัง",
+  "ปวดเมื่อย",
+  "แก้ปวด",
+  "ลดไข้",
+  "เจ็บคอ",
+  "แสบท้อง",
+  "ปวดท้อง",
+  "ท้องอืด",
+  "ท้องเสีย",
+  "ลดกรด",
+  "ยุงกัด",
 ];
 
 const SYNONYM_GROUPS: string[][] = [
@@ -286,11 +361,26 @@ const SYNONYM_GROUPS: string[][] = [
   ["ไม่มีน้ำตาล", "ไม่เติมน้ำตาล", "sugar_free", "no_added_sugar", "หวานน้อย"],
   ["ไม่มีกลูเตน", "ไร้กลูเตน", "gluten_free"],
   ["บาร์โค้ดไทย", "สินค้าไทย", "885", "gs1"],
+  ["น้ำมันพืช", "น้ำมันปาล์ม", "น้ำมันถั่วเหลือง", "น้ำมันรำข้าว", "น้ำมันคาโนล่า", "น้ำมันดอกทานตะวัน", "น้ำมันข้าวโพด"],
+  ["น้ำมันหอย", "ซอสหอยนางรม"],
+  ["ทิชชู่", "กระดาษทิชชู่", "กระดาษชำระ", "กระดาษเช็ดหน้า"],
+  ["ข้าวสาร", "ข้าวหอมมะลิ", "ข้าวขาว", "ข้าวเหนียว"],
   ["น้ำจิ้ม", "ซอส", "น้ำปลา", "ซีอิ๊ว", "เครื่องปรุง"],
   ["ขนม", "ขนมขบเคี้ยว", "สแน็ก", "snack"],
   ["นม", "เครื่องดื่ม", "น้ำดื่ม", "กาแฟ", "ชา"],
   ["สบู่", "ยาสีฟัน", "แชมพู", "ของใช้ส่วนตัว"],
   ["ผงซักฟอก", "น้ำยาล้างจาน", "น้ำยาปรับผ้านุ่ม", "ของใช้ในบ้าน"],
+  ["เครื่องปั่นไฟ", "เครื่องกำเนิดไฟฟ้า", "generator"],
+  ["เครื่องเชื่อม", "ตู้เชื่อม"],
+  ["ปั๊มน้ำ", "ปั้มน้ำ"],
+  ["คันเท้า", "คันขา", "ผื่นคัน", "คาลาไมน์", "ผงโรยเท้า", "ครีมทาเท้า", "แป้งโยคี"],
+  ["คันหัว", "คันศีรษะ", "รังแค", "แชมพูขจัดรังแค"],
+  ["ปวดหัว", "พาราเซตามอล", "ลดไข้"],
+  ["เจ็บคอ", "ยาอมแก้ไอ", "ยาแก้ไอ"],
+  ["ปวดเมื่อย", "ปวดขา", "ปวดหลัง", "ยาหม่อง", "แก้ปวด"],
+  ["แสบท้อง", "ปวดท้อง", "ท้องอืด", "ลดกรด", "อีโน", "ยาธาตุ"],
+  ["ท้องเสีย", "เกลือแร่"],
+  ["ยุงกัด", "กันยุง", "ยาหม่อง", "คาลาไมน์"],
 ];
 
 const SYNONYM_MAP = (() => {
@@ -345,10 +435,97 @@ function tokenizeShortText(normText: string): string[] {
   return out;
 }
 
+const HUN_TO_CANONICAL_SIZE: Record<string, string> = {
+  "1": "sz_1_8_",
+  "2": "sz_1_4_",
+  "3": "sz_3_8_",
+  "4": "sz_1_2_",
+  "5": "sz_5_8_",
+  "6": "sz_3_4_",
+  "7": "sz_7_8_",
+  "8": "sz_1in_",
+  หนึ่ง: "sz_1_8_",
+  สอง: "sz_1_4_",
+  สาม: "sz_3_8_",
+  สี่: "sz_1_2_",
+  ห้า: "sz_5_8_",
+  หก: "sz_3_4_",
+  เจ็ด: "sz_7_8_",
+  แปด: "sz_1in_",
+};
+
+/**
+ * Extracts canonical Thai hardware/pipe size tokens so "4 หุน" / "สี่หุ่น" / "1/2 นิ้ว" / '1/2"' all map to `sz_1_2_`
+ * while staying strictly disjoint from "1-1/2 นิ้ว" (`sz_1_1_2_`) and single-digit sizes survive length > 1 filtering.
+ */
+function extractCanonicalSizes(normText: string): { tokens: string[]; cleaned: string } {
+  if (!normText) return { tokens: [], cleaned: "" };
+  const tokens: string[] = [];
+  let s = normText;
+
+  // 1. Mixed inch fractions first ("1-1/2 นิ้ว", "1 1/2\"", "1.1/2\"", "2-1/2") so they never leak a standalone "1/2".
+  s = s.replace(
+    /(?<![\d/])([1-9])\s*(?:[-.]|\s)\s*(\d{1,2})\/(\d{1,2})(?:\s*(?:นิ้ว|''|"))?/g,
+    (m, w: string, n: string, d: string) => {
+      const ni = Number(n);
+      const di = Number(d);
+      if (!ni || !di || ni >= di) return m;
+      // Only allow plain-space mixed fraction for integers 1-6 so e.g. "45 1/2" never merges angle + size.
+      if (!m.includes("-") && !m.includes(".") && Number(w) > 6) return m;
+      tokens.push(`sz_${w}_${n}_${d}_`);
+      return " ";
+    },
+  );
+
+  // 2. Spoken Thai "หุน" / STT "หุ่น" (1–8 หุน) -> canonical inch fraction token.
+  s = s.replace(
+    /(?<![\d.])(?<!สิบ|ยี่)([1-8]|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด)\s*หุ่?น(?![ก-๙])/g,
+    (_m, d: string) => {
+      const tok = HUN_TO_CANONICAL_SIZE[d];
+      if (tok) tokens.push(tok);
+      return " ";
+    },
+  );
+
+  // 3. Spoken "นิ้วครึ่ง" / "ครึ่งนิ้ว"
+  s = s.replace(/หนึ่งนิ้วครึ่ง|(?<![ก-๙0-9])นิ้วครึ่ง/g, () => {
+    tokens.push("sz_1_1_2_");
+    return " ";
+  });
+  s = s.replace(/สองนิ้วครึ่ง/g, () => {
+    tokens.push("sz_2_1_2_");
+    return " ";
+  });
+  s = s.replace(/ครึ่งนิ้ว/g, () => {
+    tokens.push("sz_1_2_");
+    return " ";
+  });
+
+  // 4. Standalone common inch fractions ("1/2 นิ้ว", '1/2"', "3/4", "1/4", "3/8", "5/8", "1/8", "7/8").
+  s = s.replace(
+    /(?<![\d/])(1\/8|1\/4|3\/8|1\/2|5\/8|3\/4|7\/8)(?:\s*(?:นิ้ว|''|"))?(?!\s*(?:กก|ก\.|มล|ลิตร|โหล|ซอง|ชิ้น|เม็ด|ขวด))/g,
+    (_m, frac: string) => {
+      const [n, d] = frac.split("/");
+      tokens.push(`sz_${n}_${d}_`);
+      return " ";
+    },
+  );
+
+  // 5. Whole-inch sizes ("1 นิ้ว", '2"', "10 นิ้ว") so single-digit inch sizes survive length > 1 filtering.
+  s = s.replace(/(?<![\d/.-])(\d{1,2})\s*(?:นิ้ว|''|")(?![ก-๙0-9])/g, (_m, n: string) => {
+    tokens.push(`sz_${n}in_`);
+    return " ";
+  });
+
+  return { tokens, cleaned: s };
+}
+
 function tokenizeBodyFast(normText: string): string[] {
   if (!normText) return [];
   const out: string[] = [];
-  let rest = normText;
+  const sz = extractCanonicalSizes(normText);
+  for (const t of sz.tokens) out.push(t);
+  let rest = sz.cleaned;
   for (const cp of COMPOUND_CLAIMS) {
     if (rest.includes(cp)) {
       out.push(cp);
@@ -577,9 +754,34 @@ type VaultBundle = {
   searches: Map<string, SearchHit[]>;
   indexes: Map<AudienceFilter, SearchIndex>;
   productPostings: Map<string, Int32Array>;
+  productHayTitles: string[];
 };
 
-let bundleCache: VaultBundle | null = null;
+type VaultGlobalState = {
+  bundle: VaultBundle | null;
+  snapshotMtimeMs: number;
+  lastStatAt: number;
+  heardVocab: { products: BrainProductItem[]; vocab: HeardVocab } | null;
+};
+
+const VAULT_GLOBAL_KEY = Symbol.for("marketbrain.vaultBundleState");
+const SNAPSHOT_STAT_INTERVAL_MS = 3000;
+
+function getVaultState(): VaultGlobalState {
+  const g = globalThis as unknown as Record<symbol, VaultGlobalState | undefined>;
+  if (!g[VAULT_GLOBAL_KEY]) {
+    g[VAULT_GLOBAL_KEY] = { bundle: null, snapshotMtimeMs: 0, lastStatAt: 0, heardVocab: null };
+  }
+  return g[VAULT_GLOBAL_KEY]!;
+}
+
+function readSnapshotMtimeMs(): number {
+  try {
+    return fs.statSync(getSnapshotFilePath()).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
 
 function ensureSnapshotSync(): BrainSnapshot {
   const cached = readCachedBrainSnapshot();
@@ -1265,6 +1467,11 @@ function buildBundleFromSnapshot(snap: BrainSnapshot): VaultBundle {
   for (const [tok, arr] of tempProdPostings) {
     productPostings.set(tok, Int32Array.from(arr));
   }
+  const productHayTitles = productsList.map((p) => {
+    const raw = normalizeText(`${p.nameTh} ${p.nameEn} ${p.brandTh} ${p.brandEn} ${p.productCode}`);
+    const sz = extractCanonicalSizes(raw).tokens;
+    return sz.length ? `${raw} ${sz.join(" ")}` : raw;
+  });
 
   const stats: BrainStats = {
     totalNotes: notes.size,
@@ -1300,29 +1507,45 @@ function buildBundleFromSnapshot(snap: BrainSnapshot): VaultBundle {
     searches: new Map(),
     indexes: new Map(),
     productPostings,
+    productHayTitles,
   };
 }
 
 function getBundle(): VaultBundle {
-  if (!bundleCache) {
-    bundleCache = buildBundleFromSnapshot(ensureSnapshotSync());
+  const st = getVaultState();
+  const now = Date.now();
+  if (!st.bundle) {
+    st.snapshotMtimeMs = readSnapshotMtimeMs();
+    st.lastStatAt = now;
+    st.bundle = buildBundleFromSnapshot(ensureSnapshotSync());
+  } else if (now - st.lastStatAt >= SNAPSHOT_STAT_INTERVAL_MS) {
+    st.lastStatAt = now;
+    const diskMtime = readSnapshotMtimeMs();
+    if (diskMtime > 0 && diskMtime !== st.snapshotMtimeMs) {
+      st.snapshotMtimeMs = diskMtime;
+      st.bundle = buildBundleFromSnapshot(ensureSnapshotSync());
+      st.heardVocab = null;
+    }
   }
-  return bundleCache;
+  return st.bundle;
 }
-
-let heardVocabCache: { products: BrainProductItem[]; vocab: HeardVocab } | null = null;
 
 /** Brand and product words the listener snaps misheard words to; rebuilt only when the brain is reloaded. */
 export function heardVocab(): HeardVocab {
+  const st = getVaultState();
   const products = getBundle().productsList;
-  if (heardVocabCache?.products !== products) heardVocabCache = { products, vocab: buildHeardVocab(products) };
-  return heardVocabCache.vocab;
+  if (st.heardVocab?.products !== products) st.heardVocab = { products, vocab: buildHeardVocab(products) };
+  return st.heardVocab.vocab;
 }
 
 export async function refreshBrainFromDatabase(): Promise<BrainStats> {
   const snap = await syncBrainSnapshotFromDb();
-  bundleCache = buildBundleFromSnapshot(snap);
-  return bundleCache.stats;
+  const st = getVaultState();
+  st.snapshotMtimeMs = readSnapshotMtimeMs();
+  st.lastStatAt = Date.now();
+  st.bundle = buildBundleFromSnapshot(snap);
+  st.heardVocab = null;
+  return st.bundle.stats;
 }
 
 export function brainStats(): BrainStats {
@@ -1819,6 +2042,7 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
   // Score candidate products if query `q` is provided
   let scores: Float64Array | null = null;
   let strictMatch: Uint8Array | null = null;
+  let strongTitleMatch: Uint8Array | null = null;
   let strictCount = 0;
   if (q) {
     scores = new Float64Array(b.productsList.length);
@@ -1852,6 +2076,12 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
       }
     }
     strictMatch = new Uint8Array(b.productsList.length);
+    strongTitleMatch = new Uint8Array(b.productsList.length);
+    // Single unspaced Thai words split into 2 segments (e.g. "ถูกต้อง" -> ["ถูก","ต้อง"]) must match both segments
+    // in the title to count as a strong title hit; spaced 2-term product+trait queries keep 1 title + 2 matched.
+    const needTitleTerms =
+      qTerms.length <= 1 ? 1 : qTerms.length === 2 ? (/\s/.test(normPhrase) ? 1 : 2) : Math.ceil(qTerms.length * 0.6);
+    const needMatchedTerms = qTerms.length <= 2 ? qTerms.length : Math.ceil(qTerms.length * 0.6);
 
     // Substring fallback on normalized title/brand/barcode so partial Thai/code queries always find matches
     for (let i = 0; i < b.productsList.length; i++) {
@@ -1862,17 +2092,52 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
         scores[i] *= 1.6;
       }
       let phraseHit = false;
+      let titleTermHits = 0;
+      let synTitleHit = false;
       if (normPhrase.length >= 2) {
-        const hayTitle = normalizeText(`${p.nameTh} ${p.nameEn} ${p.brandTh} ${p.brandEn} ${p.productCode}`);
+        const hayTitle = b.productHayTitles[i];
         // A term that is in the product name itself says far more than one buried in the description
-        for (const t of qTerms) if (hayTitle.includes(t)) scores[i] += 18;
-        if (hayTitle.includes(normPhrase)) {
+        for (const t of qTerms) {
+          if (hayTitle.includes(t)) {
+            scores[i] += 18;
+            titleTermHits++;
+          }
+        }
+        // Only boost synonym title hits when no primary query term matched directly (e.g. "น้ำมันพืช" -> "น้ำมันปาล์ม"),
+        // so synonyms can never outrank exact matches on the named product.
+        if (matchedCount[i] === 0 && synBest[i] > 0 && synTerms.some((st) => hayTitle.includes(st))) {
+          scores[i] += 18;
+          synTitleHit = true;
+        }
+        const inPrep = "ใน" + normPhrase;
+        const isInPrepositionOnly =
+          hayTitle.includes(inPrep) && !hayTitle.split(inPrep).join(" ").includes(normPhrase);
+        if (isInPrepositionOnly) {
+          // "ปลาทูน่าในน้ำมันพืช" is packed IN vegetable oil, not a bottle of vegetable oil.
+          scores[i] *= 0.15;
+        } else if (hayTitle.includes(normPhrase)) {
           scores[i] += 35;
           phraseHit = true;
         } else if (p.barcodes.some((bc) => bc.includes(q))) {
           scores[i] += 80;
           phraseHit = true;
+        } else if (matchedCount[i] > 0 && titleTermHits === 0 && p !== exact) {
+          // Body-only mention (e.g. a mushroom recipe mentioning "ผัดน้ำมันหอย") must not beat real titles/synonyms.
+          scores[i] *= 0.35;
         }
+      }
+      const traitHit =
+        qTerms.length === 1 &&
+        matchedCount[i] > 0 &&
+        p.traits.some((tr) => normalizeText(tr.valueTh).includes(qTerms[0]) || tr.slug.includes(qTerms[0]));
+      if (
+        p === exact ||
+        phraseHit ||
+        (qTerms.length > 0 && titleTermHits >= needTitleTerms && matchedCount[i] >= needMatchedTerms) ||
+        (synTitleHit && qTerms.length <= 2) ||
+        traitHit
+      ) {
+        strongTitleMatch[i] = 1;
       }
       if (allTerms || phraseHit || p === exact) {
         strictMatch[i] = 1;
@@ -1891,8 +2156,10 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
   const srcCounts = new Map<string, { label: string; count: number }>();
 
   const matchedIndices: number[] = [];
-  // Sorting by price/pack throws relevance away, so loose (synonym / partial) matches must not reach the top
-  const strictOnly = sort !== "relevance" && strictCount > 0 ? strictMatch : null;
+  // Enforce all-term strict matching when sorting by price/pack OR when querying a specific pipe/hardware size (e.g. "ข้องอ 4 หุน" -> sz_1_2_)
+  // so 1-1/2" elbows or 4-hun concrete posts never pollute 1/2" elbow results.
+  const hasSizeTerm = qTerms.some((t) => t.startsWith("sz_"));
+  const strictOnly = (sort !== "relevance" || hasSizeTerm) && strictCount > 0 ? strictMatch : null;
 
   for (let i = 0; i < b.productsList.length; i++) {
     if (scores && scores[i] <= 0) continue;
@@ -1997,6 +2264,7 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
     pageSize,
     totalPages,
     appliedTerms: qTerms,
+    topStrongMatch: !q || (matchedIndices.length > 0 && Boolean(strongTitleMatch?.[matchedIndices[0]])),
     items,
     facets: {
       categories: buildCatTree(null, 1).slice(0, 30),
@@ -2152,6 +2420,7 @@ export function connectedNeighbors(
   seedSlugs: string[],
   filter: AudienceFilter = "all",
   limit = 8,
+  perSeedEdges = 30,
 ): (TraverseStep & { shared: number })[] {
   const all = vault();
   const seeds = new Set(seedSlugs);
@@ -2160,7 +2429,7 @@ export function connectedNeighbors(
   for (const seedSlug of seedSlugs) {
     const seed = all.get(seedSlug);
     if (!seed || !matchesAudience(seed.audience, filter)) continue;
-    for (const e of edgeListFor(seed, "both").slice(0, 30)) {
+    for (const e of edgeListFor(seed, "both").slice(0, perSeedEdges)) {
       if (seeds.has(e.slug) || e.slug === "index") continue;
       const nb = all.get(e.slug);
       if (!nb || !matchesAudience(nb.audience, filter)) continue;

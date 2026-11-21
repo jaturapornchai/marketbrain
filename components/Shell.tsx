@@ -109,7 +109,7 @@ export default function Shell({
           >
             <span>🛒 ตะกร้า</span>
             {cart.itemCount > 0 && (
-              <span className="cart-top-badge">
+              <span key={cart.itemCount} className="cart-top-badge mb-bump">
                 {cart.itemCount} · {cart.grandTotalFormatted}
               </span>
             )}
@@ -134,7 +134,17 @@ export default function Shell({
       <nav className="mobile-bottom-nav" aria-label="เมนูด้านล่างสำหรับมือถือ">
         <Link href="/" className={`mb-nav-item mb-javis${pathname === "/" ? " active" : ""}`}>
           <span className="mb-ico">🧑‍💼</span>
-          <span>น้องตี๋{cart.itemCount > 0 ? ` (${cart.itemCount})` : ""}</span>
+          <span>
+            น้องตี๋
+            {cart.itemCount > 0 && (
+              <>
+                {" "}
+                <span key={cart.itemCount} className="mb-count-bump">
+                  ({cart.itemCount})
+                </span>
+              </>
+            )}
+          </span>
         </Link>
         <Link href="/search" className={`mb-nav-item${pathname.startsWith("/search") ? " active" : ""}`}>
           <span className="mb-ico">🔎</span>

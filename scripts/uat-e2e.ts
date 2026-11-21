@@ -1,6 +1,6 @@
 // Full UAT + End-to-End (E2E) Verification Suite for MarketBrain
 // Covers: Routes & SEO/AEO, Faceted Search, Local OmniVoice GPU TTS + OpenThai ASR Round-Trip,
-// Local Vision AI (qwen3.5:9b) + Barcode Lookup, Multi-Turn Nong Tee Sales Closing SSE, Decimal Cart/Orders, and MCP JSON-RPC.
+// Local Vision AI (gemma4:12b) + Barcode Lookup, Multi-Turn Nong Tee Sales Closing SSE, Decimal Cart/Orders, and MCP JSON-RPC.
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -213,7 +213,7 @@ await step("UAT-03", "Local Voice Engine E2E (OmniVoice GPU TTS -> WAV -> OpenTh
   const phrase = "ขอดูน้ำจิ้มไก่หน่อยครับ";
   const ttsRes = await fetch(`${BASE_URL}/api/voice/tts`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-skip-echo-record": "1" },
     body: JSON.stringify({ text: phrase }),
   });
   assert.equal(ttsRes.status, 200);
@@ -256,7 +256,7 @@ await step("UAT-04", "Visual Product Search E2E (/api/vision/identify) — Barco
   assert.equal(bcJson.ok && bcJson.hasProduct && bcJson.exactMatch, true);
   assert.ok(bcJson.cards.some((c) => c.slug === sampleWithBarcode.slug), "Barcode lookup must find exact product");
 
-  // 4B: Real Product Image -> Local qwen3.5:9b Vision AI -> MarketBrain Match
+  // 4B: Real Product Image -> Local gemma4:12b Vision AI -> MarketBrain Match
   const resolvedImgUrl = sampleWithBarcode.imageUrl!.startsWith("/")
     ? `${BASE_URL}${sampleWithBarcode.imageUrl}`
     : sampleWithBarcode.imageUrl!;
@@ -295,7 +295,7 @@ await step("UAT-04", "Visual Product Search E2E (/api/vision/identify) — Barco
 await step("UAT-05", "Multi-Turn Nong Tee Sales Closer E2E (Vision Turn -> Add Cart -> Update Qty -> Place Order)", async () => {
   const history: Array<{ role: "user" | "assistant"; content: string }> = [];
 
-  // Turn 1: Present Scanned Product from Vision (also verify model override is ignored and locked to deepseek-flash!)
+  // Turn 1: Present Scanned Product from Vision (also verify model override is ignored!)
   const t1Events = await collectSseEvents(
     await fetch(`${BASE_URL}/api/javis/chat`, {
       method: "POST",
@@ -310,9 +310,13 @@ await step("UAT-05", "Multi-Turn Nong Tee Sales Closer E2E (Vision Turn -> Add C
       }),
     }),
   );
-  const t1Done = t1Events.find((e) => e.type === "done") as { spokenText?: string; model?: string } | undefined;
+  const t1Done = t1Events.find((e) => e.type === "done") as { spokenText?: string; model?: string; provider?: string } | undefined;
   assert.ok(t1Done?.spokenText, "Turn 1 must complete with spoken Thai response");
-  assert.equal(t1Done?.model, "deepseek-flash", "Model must be strictly locked to deepseek-flash ONLY");
+  assert.notEqual(t1Done?.model, "deepseek-v4-pro", "Client model override must be ignored");
+  assert.ok(
+    t1Done?.model === "gemma4:12b" || t1Done?.model === "deepseek-flash",
+    `Expected gemma4:12b (local) or deepseek-flash (fallback), got: ${t1Done?.model}`,
+  );
   assert.ok(t1Events.some((e) => e.type === "cards"), "Turn 1 must emit product cards to visual stage");
   history.push(
     { role: "user", content: `ส่งรูปสินค้า ${scannedSummary}` },
@@ -390,7 +394,23 @@ await step("UAT-05", "Multi-Turn Nong Tee Sales Closer E2E (Vision Turn -> Add C
   const ordListJson = (await ordListRes.json()) as { orders: Array<{ orderNo: string }> };
   assert.ok(ordListJson.orders.some((o) => o.orderNo === t4OrderEv!.order.orderNo), "Order must be persisted in /api/orders");
 
-  return `4-Turn E2E Closed Sale #${t4OrderEv!.order.orderNo} (${t4OrderEv!.order.cart.grandTotalFormatted}, 6 ${scannedProductUnit})`;
+  // Verify Dev LLM Status & PII-masked Logs endpoint (/api/dev/llm)
+  const devRes = await fetch(`${BASE_URL}/api/dev/llm?limit=15`);
+  assert.equal(devRes.status, 200, "/api/dev/llm must return 200");
+  const devJson = (await devRes.json()) as {
+    ok: boolean;
+    primaryModel: string;
+    recentLogs: Array<{ model: string; query?: string }>;
+  };
+  assert.equal(devJson.ok, true);
+  assert.equal(devJson.primaryModel, "gemma4:12b");
+  assert.ok(devJson.recentLogs.length > 0, "/api/dev/llm must contain live turn logs");
+  assert.ok(
+    devJson.recentLogs.every((l) => !(l.query ?? "").includes("089-111-2233")),
+    "Dev LLM log must mask Thai phone PII",
+  );
+
+  return `4-Turn E2E Closed Sale #${t4OrderEv!.order.orderNo} (${t4OrderEv!.order.cart.grandTotalFormatted}, 6 ${scannedProductUnit}, engine=${t1Done?.provider || "?"}:${t1Done?.model})`;
 });
 
 // -------------------- UAT-06: MCP Server Protocol E2E (/mcp JSON-RPC 2.0) --------------------

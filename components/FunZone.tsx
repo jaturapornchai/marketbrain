@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CartSummary } from "@/lib/cart-order";
 import type { JavisProductCard, JavisTeamJob } from "@/lib/product-card";
 import { PROMOTIONS, formatBaht, type Promotion } from "@/lib/promotions";
+import ProductCardGrid, { type CardActionFx } from "./ProductCardGrid";
 
 Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
 
@@ -472,44 +473,53 @@ export function PayCountdown({ createdAt, minutes = 15 }: { createdAt: string; m
   );
 }
 
-/** "🔗 สมองแนะนำของที่เกี่ยวข้อง" row: brain-hub neighbours, tap to add. */
+/** "🔗 สมองแนะนำของที่เกี่ยวข้อง": reuses the exact same numbered ProductCardGrid as the home screen. */
 export function RelatedStrip({
   cards,
   reasons,
-  excludeSlugs,
+  totalCount,
+  startNo = 1,
+  title = "🔗 สมองแนะนำของที่เกี่ยวข้อง",
+  actionFx,
   onAdd,
+  onDetail,
   onShowAll,
 }: {
   cards: JavisProductCard[];
   reasons: Record<string, string>;
-  excludeSlugs: string[];
+  totalCount?: number;
+  startNo?: number;
+  title?: string;
+  actionFx?: CardActionFx[];
   onAdd: (c: JavisProductCard) => void;
+  onDetail: (c: JavisProductCard) => void;
   onShowAll: () => void;
 }) {
-  const shown = cards.filter((c) => !excludeSlugs.includes(c.slug)).slice(0, 6);
-  if (!shown.length) return null;
+  if (!cards.length) return null;
+  const hasMore = (totalCount ?? cards.length) > cards.length;
   return (
     <div className="fz-related">
       <div className="fz-related-head">
-        <b>🔗 สมองแนะนำของที่เกี่ยวข้อง</b>
-        <button type="button" className="btn-reset-sm" onClick={onShowAll}>
-          ดูบนจอทั้งหมด
-        </button>
-      </div>
-      <p className="fz-play-tip">พูดว่า “ดูของที่เกี่ยวข้อง” แล้วสั่งตามเบอร์ได้เลย</p>
-      <div className="fz-related-row">
-        {shown.map((c) => (
-          <button type="button" key={c.slug} className="fz-rel-card" data-slug={c.slug} onClick={() => onAdd(c)}>
-            <span className="fz-rel-img">{c.imageUrl ? <img src={c.imageUrl} alt={c.title} loading="lazy" /> : "📦"}</span>
-            <span className="fz-rel-title">{c.title}</span>
-            <span className="fz-rel-meta">
-              <b>{c.priceLabel}</b>
-              <small>{reasons[c.slug]}</small>
-            </span>
-            <span className="fz-rel-add">🛒 ใส่ตะกร้า</span>
+        <b>
+          {title} ({cards.length} รายการ)
+        </b>
+        {hasMore && (
+          <button type="button" className="btn-reset-sm" onClick={onShowAll}>
+            ดูบนจอทั้งหมด ({totalCount})
           </button>
-        ))}
+        )}
       </div>
+      <p className="fz-play-tip">
+        สั่งตามหมายเลขบนการ์ดได้เลย เช่น “เอาเบอร์ {startNo} สองชิ้น” หรือ “ดูเบอร์ {startNo + 1}”
+      </p>
+      <ProductCardGrid
+        cards={cards}
+        reasons={reasons}
+        startNo={startNo}
+        actionFx={actionFx}
+        onAdd={onAdd}
+        onDetail={onDetail}
+      />
     </div>
   );
 }

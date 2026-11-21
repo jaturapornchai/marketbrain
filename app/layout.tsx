@@ -21,7 +21,7 @@ export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: "MarketBrain — น้องตี๋ Javis เลขาหาสินค้า & สมองสินค้าไทย",
   description:
-    "คุยด้วยเสียงภาษาไทยกับน้องตี๋ (Javis Local OmniVoice + OpenThai ASR + DeepSeek) ค้นหาสินค้า เปลี่ยนภาพตามบริบท จัดตะกร้า และปิดการขายได้ทันที",
+    "คุยด้วยเสียงภาษาไทยกับน้องตี๋ (Javis Local OmniVoice + OpenThai ASR + Local Gemma 4) ค้นหาสินค้า เปลี่ยนภาพตามบริบท จัดตะกร้า และปิดการขายได้ทันที",
   alternates: { canonical: "/" },
   openGraph: {
     title: "MarketBrain — น้องตี๋ Javis เลขาหาสินค้า & ปิดการขาย",

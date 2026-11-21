@@ -9,7 +9,7 @@ const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://marketbrain.bcsmet
 
 export default function HomePage() {
   const st = brainStats();
-  const featured = searchProductsDetailed({ multiUnitOnly: true, pageSize: 12 }).items.map(toProductCard);
+  const featured = searchProductsDetailed({ multiUnitOnly: true, pageSize: 24 }).items.map(toProductCard);
 
   return (
     <>
@@ -29,7 +29,7 @@ export default function HomePage() {
             url: SITE_URL,
             inLanguage: "th",
             description:
-              "ผู้ช่วยเสียงภาษาไทย Javis น้องตี๋ (Local OmniVoice + OpenThai ASR + DeepSeek) ค้นหาสินค้า เปลี่ยนภาพตามบริบท จัดตะกร้า และปิดการขายได้ทันที",
+              "ผู้ช่วยเสียงภาษาไทย Javis น้องตี๋ (Local OmniVoice + OpenThai ASR + Local Gemma 4) ค้นหาสินค้า เปลี่ยนภาพตามบริบท จัดตะกร้า และปิดการขายได้ทันที",
           }).replace(/</g, "\\u003c"),
         }}
       />

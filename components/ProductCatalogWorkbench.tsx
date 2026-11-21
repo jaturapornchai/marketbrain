@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { formatThaiBaht } from "@/lib/decimal-money";
 import { toProductCard } from "@/lib/product-card";
 import type { CategoryFacetNode, ProductSearchResult } from "@/lib/vault";
@@ -569,10 +569,10 @@ export default function ProductCatalogWorkbench({ initialData, initialParams }: 
             </div>
           ) : viewMode === "grid" ? (
             <div className="prod-grid">
-              {data.items.map((p) => {
+              {data.items.map((p, pIdx) => {
                 const pCard = toProductCard(p);
                 return (
-                  <article key={p.slug} className="p-card">
+                  <article key={p.slug} className="p-card" style={{ "--card-i": Math.min(pIdx, 14) } as CSSProperties}>
                     <Link href={`/n/${encodeURIComponent(p.slug)}`} className="p-img-wrap">
                       {p.imageUrl ? (
                         <img src={p.imageUrl} alt={p.nameTh} loading="lazy" />

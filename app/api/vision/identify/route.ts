@@ -2,11 +2,14 @@ import { emitMcpEvent } from "@/lib/mcp-events";
 import { toProductCard, type JavisProductCard, type VisionDetectedProduct } from "@/lib/product-card";
 import type { BrainProductItem } from "@/lib/product-source";
 import { searchProductsDetailed } from "@/lib/vault";
+import { appendLlmDevLog } from "@/lib/voice-log";
 
 export const dynamic = "force-dynamic";
 
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
-const VISION_MODEL = process.env.VISION_MODEL || "qwen3.5:9b";
+const VISION_MODEL = process.env.VISION_MODEL?.trim() || process.env.LOCAL_LLM_MODEL?.trim() || "gemma4:12b";
+const LOCAL_LLM_NUM_CTX = Math.max(2048, Number(process.env.LOCAL_LLM_NUM_CTX || "4096") || 4096);
+const LOCAL_LLM_KEEP_ALIVE = process.env.LOCAL_LLM_KEEP_ALIVE?.trim() || "30m";
 const MAX_BODY_CHARS = 7_000_000;
 
 const VISION_SYSTEM_PROMPT = `คุณคือ AI ส่องค้นหาสินค้าของระบบสมองสินค้า MarketBrain สำหรับร้านค้าส่ง-ปลีกไทย
@@ -194,7 +197,9 @@ export async function POST(req: Request): Promise<Response> {
         stream: false,
         think: false,
         format: "json",
+        keep_alive: LOCAL_LLM_KEEP_ALIVE,
         options: {
+          num_ctx: LOCAL_LLM_NUM_CTX,
           temperature: 0.1,
           num_predict: 320,
         },
@@ -203,22 +208,55 @@ export async function POST(req: Request): Promise<Response> {
           { role: "user", content: VISION_USER_PROMPT, images: [base64Clean] },
         ],
       }),
-      signal: AbortSignal.timeout(25000),
+      signal: AbortSignal.timeout(35000),
     });
 
     if (!ollamaRes.ok) {
+      const errMs = Math.max(1, Math.round(performance.now() - t0));
+      appendLlmDevLog({
+        phase: "vision",
+        provider: "local",
+        model: VISION_MODEL,
+        ms: errMs,
+        ok: false,
+        error: `HTTP ${ollamaRes.status}`,
+      });
       return Response.json(
         { ok: false, error: `Local Vision (${VISION_MODEL}) ตอบกลับ HTTP ${ollamaRes.status}` },
         { status: 502 },
       );
     }
 
-    const ollamaJson = (await ollamaRes.json()) as { message?: { content?: string } };
+    const ollamaJson = (await ollamaRes.json()) as {
+      message?: { content?: string };
+      load_duration?: number;
+      prompt_eval_duration?: number;
+      eval_duration?: number;
+      prompt_eval_count?: number;
+      eval_count?: number;
+    };
     const content = ollamaJson.message?.content ?? "";
     const detected = parseVisionJson(content);
     const ms = Math.max(1, Math.round(performance.now() - t0));
+    const tps = ollamaJson.eval_duration
+      ? Number(((ollamaJson.eval_count ?? 0) / (ollamaJson.eval_duration / 1e9)).toFixed(1))
+      : undefined;
 
     if (!detected.hasProduct && !barcodeHint) {
+      appendLlmDevLog({
+        phase: "vision",
+        provider: "local",
+        model: VISION_MODEL,
+        ms,
+        loadMs: Math.round((ollamaJson.load_duration ?? 0) / 1e6),
+        promptMs: Math.round((ollamaJson.prompt_eval_duration ?? 0) / 1e6),
+        evalMs: Math.round((ollamaJson.eval_duration ?? 0) / 1e6),
+        promptTok: ollamaJson.prompt_eval_count,
+        evalTok: ollamaJson.eval_count,
+        tps,
+        query: "no_product",
+        ok: true,
+      });
       return Response.json({
         ok: true,
         hasProduct: false,
@@ -233,6 +271,21 @@ export async function POST(req: Request): Promise<Response> {
 
     const { items, exactMatch, matchedQuery } = matchBrainProducts(detected, barcodeHint);
     const cards = items.map(toProductCard);
+
+    appendLlmDevLog({
+      phase: "vision",
+      provider: "local",
+      model: VISION_MODEL,
+      ms,
+      loadMs: Math.round((ollamaJson.load_duration ?? 0) / 1e6),
+      promptMs: Math.round((ollamaJson.prompt_eval_duration ?? 0) / 1e6),
+      evalMs: Math.round((ollamaJson.eval_duration ?? 0) / 1e6),
+      promptTok: ollamaJson.prompt_eval_count,
+      evalTok: ollamaJson.eval_count,
+      tps,
+      query: matchedQuery || detected.summaryTh || "image",
+      ok: true,
+    });
 
     emitMcpEvent({
       tool: "vision_identify",
@@ -255,6 +308,14 @@ export async function POST(req: Request): Promise<Response> {
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Visionเชื่อมต่อไม่สำเร็จ";
+    appendLlmDevLog({
+      phase: "vision",
+      provider: "local",
+      model: VISION_MODEL,
+      ms: Math.max(1, Math.round(performance.now() - t0)),
+      ok: false,
+      error: msg,
+    });
     return Response.json(
       { ok: false, error: `ระบบวิเคราะห์ภาพสินค้าในเครื่องยังไม่พร้อม (${msg})` },
       { status: 502 },

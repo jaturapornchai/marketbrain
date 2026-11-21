@@ -39,6 +39,7 @@ export type JavisProductCard = {
 };
 
 import type { ScreenCommand } from "./voice-commands";
+import type { LlmProviderKind } from "./voice-log";
 
 export type JavisStageMode =
   | "welcome"
@@ -74,6 +75,7 @@ export type VisionDetectedProduct = {
 
 export type JavisStreamEvent =
   | { type: "status"; state: "searching" | "thinking" | "speaking" | "done" | "error"; text: string }
+  | { type: "engine"; provider: LlmProviderKind; model: string; label: string; ms?: number; tps?: number; fallbackReason?: string }
   | { type: "team"; job: JavisTeamJob }
   | { type: "cards"; cards: JavisProductCard[] }
   | { type: "stage"; mode: JavisStageMode; spotlight?: JavisProductCard | null; title?: string }
@@ -86,7 +88,16 @@ export type JavisStreamEvent =
   | { type: "order"; order: SalesOrder }
   | { type: "delta"; section: "speech" | "screen"; text: string }
   | { type: "sentence"; text: string }
-  | { type: "done"; spokenText: string; screenMarkdown: string; model: string }
+  | {
+      type: "done";
+      spokenText: string;
+      screenMarkdown: string;
+      model: string;
+      provider?: LlmProviderKind;
+      ms?: number;
+      tps?: number;
+      fallbackReason?: string;
+    }
   | { type: "error"; message: string };
 
 export function toProductCard(p: BrainProductItem): JavisProductCard {

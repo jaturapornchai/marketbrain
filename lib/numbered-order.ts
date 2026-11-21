@@ -11,17 +11,28 @@ const PICK_RE = new RegExp(`(?:เบอร์|หมายเลข|เลข�
 const QTY_AFTER_RE = new RegExp(`^(?:\\s|นะ|ครับ|ค่ะ|คะ|เอา|ขอ|รับ|จำนวน|อย่างละ)*${NUM}\\s*(.*)$`);
 const QTY_BEFORE_RE = new RegExp(`${NUM}\\s*([^\\d\\s]{0,12})\\s*$`);
 const BARE_QTY_RE = new RegExp(`^(?:เอา|ขอ|รับ|จำนวน|\\s)*${NUM}\\s*(.{0,16})$`);
-const ORDER_VERB_RE = /เอา|ขอ|รับ|สั่ง|ใส่|เพิ่ม|ซื้อ|หยิบ|จัด/;
+const ORDER_VERB_RE = /เอา|ขอ|รับ|สั่ง|ใส่|เพิ่ม|ซื้อ|หยิบ|จัด|เลือก|กด|จิ้ม/;
 // "เอาอันนี้สองชิ้น", "ใส่ตัวนี้ลงตะกร้า", "ใส่ตะกร้าเลย 3 แพ็ค": the product page that is open.
 const POINTED_RE = new RegExp(
-  `^(?:ขอ|ช่วย|งั้น|ก็|\\s)*(?:เอา|ใส่|หยิบ|รับ|สั่ง|ซื้อ|เพิ่ม|จัด)\\s*(?:(?:สินค้า|ของ)?(?:อัน|ตัว|ชิ้น|รายการ)?(?:นี้|นี่)|(?:ลง|ใส่|เข้า)?ตะกร้า)(?:แหละ|เลย|ด้วย|มา|ลงตะกร้า|ใส่ตะกร้า|เข้าตะกร้า|ครับ|ค่ะ|คะ|นะ|\\s)*(?:${NUM}\\s*(.{0,16}))?$`,
+  `^(?:ขอ|ช่วย|งั้น|ก็|\\s)*(?:เอา|ใส่|หยิบ|รับ|สั่ง|ซื้อ|เพิ่ม|จัด|เลือก)\\s*(?:(?:สินค้า|ของ)?(?:อัน|ตัว|ชิ้น|รายการ)?(?:นี้|นี่)|(?:ลง|ใส่|เข้า)?ตะกร้า)(?:แหละ|เลย|ด้วย|มา|ลงตะกร้า|ใส่ตะกร้า|เข้าตะกร้า|ครับ|ค่ะ|คะ|นะ|\\s)*(?:${NUM}\\s*(.{0,16}))?$`,
 );
 const POINTS_AT_OPEN_RE = /(?:อัน|ตัว|ชิ้น|สินค้า|ของ|รุ่น|ยี่ห้อ|แบบ)(?:นี้|นี่)/;
 // "สองร้อยบาท" is money, never a quantity.
 const MONEY_AFTER_RE = /^(?:บาท|฿|สตางค์|เปอร์เซ็นต์|%)/;
+// Strip polite trailing request endings ("ได้ไหมครับ") before checking question words so
+// "เอาเบอร์ 1 สองขวดได้ไหมครับ" is recognized as an order instead of a question.
+const POLITE_END_RE = /(?:ได้ไหม|ได้มั้ย|ได้เปล่า|หน่อย|ด้วย|นะครับ|นะค่ะ|นะคะ|ครับผม|ครับ|ค่ะ|คะ|นะ|\s)+$/i;
 // Questions, look-ups and removals are not "add to cart" orders -> leave them to the conversation.
-const NOT_ORDER_RE = /ไหม|มั้ย|เท่าไหร่|เท่าไร|กี่|อะไร|ยังไง|อย่างไร|เปล่า|ดู|เทียบ|รายละเอียด|ต่างกัน|ราคา|ออก|ลบ|ไม่เอา|ยกเลิก|เปลี่ยน|ลด/;
+const NOT_ORDER_RE = /ไหม|มั้ย|เท่าไหร่|เท่าไร|กี่|อะไร|ยังไง|อย่างไร|เปล่า|ดู|เทียบ|รายละเอียด|ต่างกัน|ราคา|ออก|ลบ|ไม่เอา|ยกเลิก|เปลี่ยน|ลดจำนวน|ลดเหลือ|ลดลง/;
 const MAX_CARD_NO = 99; // bigger numbers are product names ("เบอร์ 309"), not card numbers
+
+function normalizeOrderText(raw: string, cardsOnScreen: number): string {
+  let t = raw.trim().replace(/(?:อัน|ตัว|ชิ้น|รายการ|ใบ)แรก/g, "เบอร์ 1 ");
+  if (cardsOnScreen > 0) {
+    t = t.replace(/(?:อัน|ตัว|ชิ้น|รายการ|ใบ)สุดท้าย/g, `เบอร์ ${cardsOnScreen} `);
+  }
+  return t;
+}
 
 export type NumberedPick = {
   /** Card number the customer said (1-based). */
@@ -55,8 +66,10 @@ export function parseThaiNumber(text: string): number | null {
  * Finds card-number orders in a customer sentence.
  * Returns null when the sentence is not an order by number (question, removal, product name, ...).
  */
-export function parseNumberedOrder(text: string, cardsOnScreen: number): NumberedPick[] | null {
-  if (NOT_ORDER_RE.test(text)) return null;
+export function parseNumberedOrder(rawText: string, cardsOnScreen: number): NumberedPick[] | null {
+  const coreCheck = rawText.trim().replace(POLITE_END_RE, "");
+  if (NOT_ORDER_RE.test(coreCheck)) return null;
+  const text = normalizeOrderText(rawText.trim().replace(/(?:ได้ไหม|ได้มั้ย|ได้เปล่า)(?:ครับ|ค่ะ|คะ|นะ|\s)*$/i, "").trim(), cardsOnScreen);
   const matches = [...text.matchAll(PICK_RE)];
   if (matches.length === 0) return null;
 
@@ -117,7 +130,8 @@ export function mentionsCardNumber(text: string, cardsOnScreen: number): boolean
 
 /** Answer to "รับกี่แพ็คดีครับ": "10", "สิบแพ็คครับ", "เอา 2 ลัง". */
 export function parseBareQuantity(text: string): { qty: number; afterQty: string } | null {
-  if (NOT_ORDER_RE.test(text)) return null;
+  const coreCheck = text.trim().replace(POLITE_END_RE, "");
+  if (NOT_ORDER_RE.test(coreCheck)) return null;
   const m = text.trim().match(BARE_QTY_RE);
   const qty = m ? parseThaiNumber(m[1]) : null;
   return m && qty && qty > 0 && !MONEY_AFTER_RE.test(m[2].trim()) ? { qty: Math.min(qty, 9999), afterQty: m[2].trim() } : null;
@@ -125,7 +139,8 @@ export function parseBareQuantity(text: string): { qty: number; afterQty: string
 
 /** Order for the product page that is open: "เอาอันนี้สองชิ้น" -> qty 2, "ใส่ตะกร้าเลย" -> qty null (ask). */
 export function parsePointedOrder(text: string): { qty: number | null; afterQty: string } | null {
-  if (NOT_ORDER_RE.test(text)) return null;
+  const coreCheck = text.trim().replace(POLITE_END_RE, "");
+  if (NOT_ORDER_RE.test(coreCheck)) return null;
   const m = text.trim().match(POINTED_RE);
   if (!m) return null;
   const afterQty = (m[2] ?? "").trim();

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Decimal from "decimal.js";
 import { useJavis } from "./JavisContext";
 
@@ -8,10 +8,21 @@ Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
 
 const PRESET_QTYS = [1, 2, 3, 6, 12, 24];
 
+/** Tactile spring bump on the quantity field; skipped when the user prefers reduced motion. */
+function bumpQty(el: HTMLElement | null) {
+  if (!el || typeof el.animate !== "function") return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  el.animate(
+    [{ transform: "scale(1)" }, { transform: "scale(1.14)" }, { transform: "scale(0.97)" }, { transform: "scale(1)" }],
+    { duration: 320, easing: "cubic-bezier(0.34, 1.56, 0.64, 1)" },
+  );
+}
+
 export default function AddToCartModal() {
   const { qtyModalProduct, closeQtyModal, addToCart } = useJavis();
   const [qty, setQty] = useState(1);
   const [selectedUnitIdx, setSelectedUnitIdx] = useState(0);
+  const qtyInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (qtyModalProduct) {
@@ -111,7 +122,10 @@ export default function AddToCartModal() {
                 key={n}
                 type="button"
                 className={`qty-preset-btn${qty === n ? " active" : ""}`}
-                onClick={() => setQty(n)}
+                onClick={() => {
+                  setQty(n);
+                  bumpQty(qtyInputRef.current);
+                }}
               >
                 {n} {activeUnit.unitCode}
               </button>
@@ -122,12 +136,16 @@ export default function AddToCartModal() {
             <button
               type="button"
               className="qty-step-btn"
-              onClick={() => setQty((q) => Math.max(1, q - 1))}
+              onClick={() => {
+                setQty((q) => Math.max(1, q - 1));
+                bumpQty(qtyInputRef.current);
+              }}
               aria-label="ลดจำนวน"
             >
               −
             </button>
             <input
+              ref={qtyInputRef}
               type="number"
               min={1}
               max={9999}
@@ -139,7 +157,10 @@ export default function AddToCartModal() {
             <button
               type="button"
               className="qty-step-btn"
-              onClick={() => setQty((q) => Math.min(9999, q + 1))}
+              onClick={() => {
+                setQty((q) => Math.min(9999, q + 1));
+                bumpQty(qtyInputRef.current);
+              }}
               aria-label="เพิ่มจำนวน"
             >
               +
@@ -150,7 +171,9 @@ export default function AddToCartModal() {
         <div className="qty-summary-bar">
           <div>
             <span className="qty-sum-lbl">รวมเป็นเงิน ({qty} {activeUnit.unitCode})</span>
-            <strong className="qty-sum-val">{totalFormatted}</strong>
+            <strong key={totalFormatted} className="qty-sum-val mb-total-pulse">
+              {totalFormatted}
+            </strong>
           </div>
           <button
             type="button"

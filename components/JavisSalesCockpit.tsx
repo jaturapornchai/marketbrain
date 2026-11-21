@@ -11,7 +11,10 @@ import type {
   JavisStreamEvent,
   JavisTeamJob,
 } from "@/lib/product-card";
-import { BARGE_FRAMES, EchoGuard, playedLevel, wavEnvelope } from "@/lib/echo-guard";
+import type { LlmDevLogEntry, LlmDevStats, LlmProviderKind } from "@/lib/voice-log";
+import { AdaptiveNoiseGate, EchoGuard, isEchoTranscript, playedLevel, wavEnvelope } from "@/lib/echo-guard";
+import { BrowserSileroVad } from "@/lib/browser-vad";
+import { WebRtcAudioSink, type SinkableAudioEl } from "@/lib/webrtc-audio-sink";
 import { parseBudget, parseScreenCommand, screenCommandHelp, type ScreenCommand } from "@/lib/voice-commands";
 import { parseThaiNumber } from "@/lib/numbered-order";
 import { RelatedStrip,
@@ -32,14 +35,14 @@ import { RelatedStrip,
 } from "./FunZone";
 import { useRouter } from "next/navigation";
 import DevicePickerPopover from "./DevicePickerPopover";
+import FloatingJavisHud from "./FloatingJavisHud";
 import { useJavis } from "./JavisContext";
 import CouponStrip from "./CouponStrip";
 import { PROMOTIONS, applyCoupon, bestPromotion, findPromotion, parseCouponCommand, type CouponCommand } from "@/lib/promotions";
 import ProductVisionScanner, { identifyProductFromFile, type VisionLookupResult } from "./ProductVisionScanner";
+import ProductCardGrid from "./ProductCardGrid";
 
-type SinkableAudio = HTMLAudioElement & {
-  setSinkId?: (sinkId: string) => Promise<void>;
-};
+type SinkableAudio = SinkableAudioEl;
 
 type TurnEntry = {
   id: string;
@@ -50,20 +53,77 @@ type TurnEntry = {
   cards: JavisProductCard[];
   jobs: JavisTeamJob[];
   model: string;
+  provider?: LlmProviderKind;
+  ms?: number;
+  tps?: number;
+  fallbackReason?: string;
   error?: string;
   /** Screen-control command ("ถอยกลับไป"), kept out of the conversation history sent to the AI. */
   isCommand?: boolean;
 };
+
+type LiveLlmStatus = {
+  primaryModel: string;
+  fallbackModel: string;
+  localOnline: boolean;
+  modelInstalled: boolean;
+  modelLoaded: boolean;
+  hasFallback: boolean;
+  activeProvider: LlmProviderKind;
+  activeModel: string;
+  lastMs: number;
+  lastTps?: number;
+  lastFallbackReason?: string;
+  stats: LlmDevStats;
+};
+
+const EMPTY_LLM_STATS: LlmDevStats = {
+  localTurns: 0,
+  fallbackTurns: 0,
+  ramTurns: 0,
+  visionLocalCalls: 0,
+  errorCount: 0,
+  lastProvider: null,
+  lastModel: "",
+  lastMs: 0,
+  lastAt: null,
+};
+
+const DEFAULT_LLM_STATUS: LiveLlmStatus = {
+  primaryModel: "gemma4:12b",
+  fallbackModel: "deepseek-flash",
+  localOnline: true,
+  modelInstalled: true,
+  modelLoaded: false,
+  hasFallback: true,
+  activeProvider: "local",
+  activeModel: "gemma4:12b",
+  lastMs: 0,
+  stats: EMPTY_LLM_STATS,
+};
+
+const PHASE_LABEL_TH: Record<string, string> = {
+  planner: "วางแผน",
+  chat_round: "แชท",
+  vision: "กล้อง",
+  turn_summary: "สรุปเทิร์น",
+};
+
+function fmtMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+}
 
 type HudState = "idle" | "listening" | "searching" | "thinking" | "speaking" | "error";
 
 const GREETING_TEXT =
   "สวัสดีครับ ผมน้องตี๋ เลขาช่วยหาสินค้าและรับออเดอร์ครับ อยากดูสินค้าตัวไหน พูด ส่องกล้องรูปสินค้า หรือพิมพ์บอกตี๋ได้เลยนะครับ";
 
+// 46-byte silent PCM WAV (8kHz 16-bit mono) to prime the single reusable <audio> element on first mobile tap.
+const SILENT_WAV_DATA_URI = "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+
 const ECHO_TAIL_MS = 400; // room reverb + output latency after Nong Tee stops speaking
 
 const ACTION_FX_MS = 3600; // how long the "what I just did" banner stays
-const ACTION_PICK_MS = 1300; // time to show the picked card before switching to the cart
 
 type ActionFx = { id: string; kind: "add" | "ask" | "unknown" | "cmd"; slug?: string; text: string };
 
@@ -90,7 +150,7 @@ const MODE_LABEL: Record<JavisStageMode, string> = {
 
 function snapKey(x: ScreenSnap): string {
   const mode = x.mode === "welcome" ? "showcase" : x.mode;
-  const cards = x.cards.slice(0, 12).map((c) => c.slug).join(",");
+  const cards = x.cards.slice(0, 36).map((c) => c.slug).join(",");
   return `${mode}|${mode === "spotlight" ? (x.spotlight?.slug ?? "") : ""}|${cards}`;
 }
 
@@ -126,10 +186,10 @@ function renderSafeMd(md: string): string {
 type RelatedSet = { cards: JavisProductCard[]; reasons: Record<string, string> };
 
 /** Brain synapse neighbours (similarity, not purchase data). */
-async function fetchRelated(seeds: string[]): Promise<RelatedSet | null> {
+async function fetchRelated(seeds: string[], limit = 24): Promise<RelatedSet | null> {
   if (!seeds.length) return null;
   try {
-    const r = await fetch(`/api/products/related?slugs=${encodeURIComponent(seeds.slice(0, 6).join(","))}`);
+    const r = await fetch(`/api/products/related?slugs=${encodeURIComponent(seeds.slice(0, 8).join(","))}&limit=${limit}`);
     return r.ok ? ((await r.json()) as RelatedSet) : null;
   } catch {
     return null;
@@ -182,7 +242,7 @@ export default function JavisSalesCockpit({
   const [couponPulse, setCouponPulse] = useState(0);
   const [wheelOpen, setWheelOpen] = useState(false);
   const [wheelSpinKey, setWheelSpinKey] = useState(0);
-  const [playOpen, setPlayOpen] = useState(true);
+  const [playOpen, setPlayOpen] = useState(false);
   const [missions, setMissions] = useState<Partial<Record<MissionKey, boolean>>>({});
   const [budget, setBudget] = useState("");
   const [duel, setDuel] = useState<{ a: JavisProductCard; b: JavisProductCard; noA: number; noB: number } | null>(null);
@@ -190,6 +250,56 @@ export default function JavisSalesCockpit({
   const prevPiecesRef = useRef<Map<string, number> | null>(null);
   const [related, setRelated] = useState<RelatedSet | null>(null);
   const [spotRelated, setSpotRelated] = useState<{ slug: string; set: RelatedSet } | null>(null);
+  const [stageRelated, setStageRelated] = useState<{ key: string; set: RelatedSet } | null>(null);
+  // Visible related cards shown in the shared numbered ProductCardGrid across showcase/spotlight/cart screens.
+  const stageRelatedKey = useMemo(
+    () =>
+      (stageMode === "welcome" || stageMode === "showcase") && stageTitle !== "🔗 สมองแนะนำของที่เกี่ยวข้อง"
+        ? stageCards.slice(0, 6).map((c) => c.slug).join(",")
+        : "",
+    [stageMode, stageTitle, stageCards],
+  );
+  const showcaseRelatedAll = useMemo(() => {
+    if (!stageRelatedKey || stageRelated?.key !== stageRelatedKey) return [];
+    const shownSet = new Set(stageCards.map((c) => c.slug));
+    return stageRelated.set.cards.filter((c) => !shownSet.has(c.slug));
+  }, [stageRelatedKey, stageRelated, stageCards]);
+  const showcaseRelatedShown = useMemo(() => showcaseRelatedAll.slice(0, 16), [showcaseRelatedAll]);
+  const spotRelatedAll = useMemo(
+    () =>
+      stageMode === "spotlight" && spotlight && spotRelated?.slug === spotlight.slug
+        ? spotRelated.set.cards.filter((c) => c.slug !== spotlight.slug)
+        : [],
+    [stageMode, spotlight, spotRelated],
+  );
+  const spotRelatedShown = useMemo(() => spotRelatedAll.slice(0, 16), [spotRelatedAll]);
+  const cartRelatedAll = useMemo(() => {
+    if (stageMode !== "cart" || !related) return [];
+    const inCart = new Set(cart.items.map((it) => it.slug));
+    return related.cards.filter((c) => !inCart.has(c.slug));
+  }, [stageMode, related, cart.items]);
+  const cartRelatedShown = useMemo(() => cartRelatedAll.slice(0, 16), [cartRelatedAll]);
+  // Single source of truth for numbered voice/text orders ("เอาเบอร์ 2 สองชิ้น", "ดูเบอร์ 3"):
+  // always matches the exact numbered ProductCardGrid the customer sees right now.
+  const activeNumberedCards = useMemo(() => {
+    if (stageMode === "spotlight" && spotRelatedShown.length > 0) return spotRelatedShown;
+    if (stageMode === "cart" && cartRelatedShown.length > 0) return cartRelatedShown;
+    if ((stageMode === "welcome" || stageMode === "showcase") && showcaseRelatedShown.length > 0) {
+      return [...stageCards, ...showcaseRelatedShown];
+    }
+    return stageCards;
+  }, [stageMode, spotRelatedShown, cartRelatedShown, showcaseRelatedShown, stageCards]);
+  const activeNumberedCardsRef = useRef(activeNumberedCards);
+  activeNumberedCardsRef.current = activeNumberedCards;
+  const openProductSpotlight = useCallback((card: JavisProductCard) => {
+    setSpotlight(card);
+    setStageMode("spotlight");
+    setStageTitle(card.title);
+    setMobileTab("stage");
+    const body = document.querySelector<HTMLElement>(".jc-stage-body");
+    if (body && body.scrollHeight > body.clientHeight + 4) body.scrollTo({ top: 0, behavior: "smooth" });
+    else window.scrollTo({ top: 0, behavior: "smooth" });
+  }, []);
   // Continuous cross-sell: the item Nong Tee offered last ("เอาด้วย" takes it) + everything offered so far.
   const suggestRef = useRef<{ card: JavisProductCard | null; offered: Set<string> }>({ card: null, offered: new Set() });
   const nextSuggestion = (cards: JavisProductCard[]) => {
@@ -236,6 +346,14 @@ export default function JavisSalesCockpit({
   const [hudState, setHudState] = useState<HudState>("listening");
   const [statusText, setStatusText] = useState("🟢 น้องตี๋เริ่มทำงานแล้วครับ พูดคุย ส่องรูปสินค้า หรือพิมพ์สั่งได้เลย");
   const [voiceEngineOnline, setVoiceEngineOnline] = useState(false);
+  const [llmStatus, setLlmStatus] = useState<LiveLlmStatus>(DEFAULT_LLM_STATUS);
+  const [devLogOpen, setDevLogOpen] = useState(false);
+  const [devLogs, setDevLogs] = useState<LlmDevLogEntry[]>([]);
+  const [devLogsLoading, setDevLogsLoading] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const devLogOpenRef = useRef(false);
+  devLogOpenRef.current = devLogOpen;
+  const dockPopRef = useRef<HTMLDivElement>(null);
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [callActive, setCallActive] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
@@ -243,6 +361,39 @@ export default function JavisSalesCockpit({
   const [visionUploading, setVisionUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [activeMicStreamState, setActiveMicStreamState] = useState<MediaStream | null>(null);
+  const [hudSatEvent, setHudSatEvent] = useState<{ id: string; color: string } | null>(null);
+  const [mobileTab, setMobileTab] = useState<"stage" | "cart">("stage");
+  const stageModeInitRef = useRef(true);
+  useEffect(() => {
+    if (stageModeInitRef.current) {
+      stageModeInitRef.current = false;
+      return;
+    }
+    if (stageMode === "cart") setMobileTab("cart");
+    else if (stageMode !== "welcome") setMobileTab("stage");
+  }, [stageMode]);
+
+  useEffect(() => {
+    if (!chatOpen && !devLogOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (dockPopRef.current && !dockPopRef.current.contains(e.target as Node)) {
+        setChatOpen(false);
+        setDevLogOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setChatOpen(false);
+        setDevLogOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [chatOpen, devLogOpen]);
 
   const [input, setInput] = useState("");
   const [liveUserHeard, setLiveUserHeard] = useState("");
@@ -256,13 +407,52 @@ export default function JavisSalesCockpit({
   const quickPhotoInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const autoStartedRef = useRef(false);
-  const blockedAudioRef = useRef<SinkableAudio | null>(null);
 
-  // Audio playback queue for Local OmniVoice sentences
-  const audioQueueRef = useRef<Array<{ text: string; promise: Promise<{ url: string; dur: number } | null> }>>([]);
-  const playingAudioRef = useRef<SinkableAudio | null>(null);
+  // Audio playback queue for Local OmniVoice sentences.
+  // Routes TTS through a local WebRTC loopback AEC3 sink + master GainNode (smooth ducking)
+  // on Chromium/Firefox, and direct unlocked AudioContext (VoiceProcessingIO AEC) on iOS Safari.
+  const audioQueueRef = useRef<Array<{ text: string; promise: Promise<{ url: string; dur: number; buf: ArrayBuffer } | null> }>>([]);
+  const stagePaintGateRef = useRef<Promise<void>>(Promise.resolve());
+  const markStagePaintedSoon = useCallback(() => {
+    stagePaintGateRef.current = new Promise<void>((resolve) => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      } else {
+        resolve();
+      }
+    });
+  }, []);
+  const ttsAudioRef = useRef<SinkableAudio | null>(null);
+  const ttsSinkRef = useRef<WebRtcAudioSink | null>(null);
+  const getTtsSink = useCallback(() => {
+    if (!ttsSinkRef.current) ttsSinkRef.current = new WebRtcAudioSink();
+    if (ttsAudioRef.current) ttsSinkRef.current.attachElement(ttsAudioRef.current);
+    return ttsSinkRef.current;
+  }, []);
+  const audioUnlockedRef = useRef(false);
+  const unlockResumeRef = useRef<(() => void) | null>(null);
+  const activeCancelRef = useRef<(() => void) | null>(null);
+  const playbackGenRef = useRef(0);
   const isPlayingLoopRef = useRef(false);
   const playingEnvRef = useRef<Float32Array | null>(null); // loudness envelope of the sentence being played
+  const recentBotSpokenRef = useRef<Array<{ text: string; at: number }>>([]);
+  const lastBotAudioMsRef = useRef(0);
+  const userLevelRef = useRef(0);
+  const currentBotTimeSec = (): number | null => {
+    const sinkSec = ttsSinkRef.current?.currentTimeSec() ?? null;
+    if (sinkSec !== null) return sinkSec;
+    const audio = ttsAudioRef.current;
+    if (audio && !audio.srcObject && !audio.paused && audio.src && audio.src !== SILENT_WAV_DATA_URI) {
+      return audio.currentTime;
+    }
+    return null;
+  };
+  const botLevelGetterRef = useRef<() => number>(() => 0);
+  botLevelGetterRef.current = () => {
+    if (!isPlayingLoopRef.current) return 0;
+    const t = currentBotTimeSec();
+    return t !== null ? playedLevel(playingEnvRef.current, t) : 0;
+  };
   const ttsEnabledRef = useRef(ttsEnabled);
   ttsEnabledRef.current = ttsEnabled;
   const speakerDeviceIdRef = useRef(speakerDeviceId);
@@ -274,11 +464,13 @@ export default function JavisSalesCockpit({
   const busyRef = useRef(busy);
   busyRef.current = busy;
 
-  // WebAudio Mic + Local OpenThai ASR Streaming refs
+  // WebAudio Mic + AudioWorklet + Client-Side Silero VAD v5 + Local OpenThai ASR refs
   const callActiveRef = useRef(callActive);
   callActiveRef.current = callActive;
   const micStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const micGraphGenRef = useRef(0);
+  const vadRef = useRef<BrowserSileroVad | null>(null);
   const pcmChunksRef = useRef<Float32Array[]>([]);
   const speakingDetectedRef = useRef(false);
   const speechStartMsRef = useRef(0);
@@ -286,34 +478,152 @@ export default function JavisSalesCockpit({
   const lastPartialMsRef = useRef(0);
   const sendingSttRef = useRef(false);
 
+  const refreshDevLogs = useCallback(async () => {
+    setDevLogsLoading(true);
+    try {
+      const res = await fetch("/api/dev/llm?limit=25", { cache: "no-store" });
+      if (!res.ok) return;
+      const d = (await res.json()) as {
+        primaryModel?: string;
+        fallbackModel?: string;
+        ollamaOnline?: boolean;
+        modelInstalled?: boolean;
+        modelLoaded?: boolean;
+        hasFallback?: boolean;
+        stats?: LlmDevStats;
+        recentLogs?: LlmDevLogEntry[];
+      };
+      if (Array.isArray(d.recentLogs)) setDevLogs(d.recentLogs);
+      setLlmStatus((prev) => ({
+        ...prev,
+        primaryModel: d.primaryModel || prev.primaryModel,
+        fallbackModel: d.fallbackModel || prev.fallbackModel,
+        localOnline: d.ollamaOnline ?? prev.localOnline,
+        modelInstalled: d.modelInstalled ?? prev.modelInstalled,
+        modelLoaded: d.modelLoaded ?? prev.modelLoaded,
+        hasFallback: d.hasFallback ?? prev.hasFallback,
+        stats: d.stats ?? prev.stats,
+        activeProvider: d.stats?.lastProvider ?? prev.activeProvider,
+        activeModel: d.stats?.lastModel || prev.activeModel,
+        lastMs: d.stats?.lastMs ?? prev.lastMs,
+        lastTps: d.stats?.lastTps ?? prev.lastTps,
+        lastFallbackReason: d.stats?.lastFallbackReason ?? prev.lastFallbackReason,
+      }));
+    } catch {
+      // ignore dev log fetch failure
+    } finally {
+      setDevLogsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    fetch("/api/voice/status")
+    fetch("/api/voice/status", { cache: "no-store" })
       .then((r) => r.json())
-      .then((d: { ok?: boolean }) => setVoiceEngineOnline(Boolean(d.ok)))
+      .then(
+        (d: {
+          ok?: boolean;
+          llm?: {
+            localOnline?: boolean;
+            modelInstalled?: boolean;
+            modelLoaded?: boolean;
+            primaryModel?: string;
+            fallbackModel?: string;
+            hasFallback?: boolean;
+            stats?: LlmDevStats;
+          };
+        }) => {
+          setVoiceEngineOnline(Boolean(d.ok));
+          if (d.llm) {
+            const st = d.llm.stats;
+            setLlmStatus((prev) => ({
+              ...prev,
+              primaryModel: d.llm?.primaryModel || prev.primaryModel,
+              fallbackModel: d.llm?.fallbackModel || prev.fallbackModel,
+              localOnline: d.llm?.localOnline ?? prev.localOnline,
+              modelInstalled: d.llm?.modelInstalled ?? prev.modelInstalled,
+              modelLoaded: d.llm?.modelLoaded ?? prev.modelLoaded,
+              hasFallback: d.llm?.hasFallback ?? prev.hasFallback,
+              stats: st ?? prev.stats,
+              activeProvider: st?.lastProvider ?? prev.activeProvider,
+              activeModel: st?.lastModel || d.llm?.primaryModel || prev.activeModel,
+              lastMs: st?.lastMs ?? prev.lastMs,
+              lastTps: st?.lastTps ?? prev.lastTps,
+              lastFallbackReason: st?.lastFallbackReason ?? prev.lastFallbackReason,
+            }));
+          }
+        },
+      )
       .catch(() => setVoiceEngineOnline(false));
   }, []);
 
   // Dynamically switch active audio output sink if user changes speaker mid-speech
   useEffect(() => {
-    const cur = playingAudioRef.current;
-    if (cur && cur.setSinkId) {
-      void cur.setSinkId(speakerDeviceId).catch(() => {});
+    void getTtsSink().setSinkId(speakerDeviceId);
+  }, [speakerDeviceId, getTtsSink]);
+
+  /**
+   * Unlocks audio playback once per session on mobile Safari / Android Chrome:
+   * resumes the TTS AudioContext (stays unlocked for all async future TTS turns)
+   * and primes the single reusable <audio> element inside the same user gesture.
+   */
+  const unlockAudioPlayback = useCallback(() => {
+    audioUnlockedRef.current = true;
+    void audioCtxRef.current?.resume().catch(() => {});
+
+    const sink = getTtsSink();
+    sink.unlock();
+
+    if (unlockResumeRef.current) {
+      const resume = unlockResumeRef.current;
+      unlockResumeRef.current = null;
+      setAudioUnlockNeeded(false);
+      resume();
+      return;
     }
-  }, [speakerDeviceId]);
+
+    const audio = ttsAudioRef.current;
+    if (audio && !sink.isLoopbackActive && !audio.srcObject && !isPlayingLoopRef.current && (!audio.src || audio.paused)) {
+      audio.src = SILENT_WAV_DATA_URI;
+      void audio.play().catch(() => {});
+    }
+  }, [getTtsSink]);
+
+  // Capture the user's very first tap/click/key anywhere so future async TTS turns play without ever asking again.
+  useEffect(() => {
+    const events: Array<keyof WindowEventMap> = ["touchstart", "touchend", "pointerdown", "click", "keydown"];
+    const onFirstGesture = () => {
+      unlockAudioPlayback();
+      // On iOS Safari, touchstart may not finish resuming until touchend/click; detach only once AudioContext is running.
+      if (ttsSinkRef.current?.contextState === "running" && !unlockResumeRef.current) {
+        for (const ev of events) window.removeEventListener(ev, onFirstGesture, true);
+      }
+    };
+    for (const ev of events) window.addEventListener(ev, onFirstGesture, true);
+    return () => {
+      for (const ev of events) window.removeEventListener(ev, onFirstGesture, true);
+    };
+  }, [unlockAudioPlayback]);
 
   const stopAllAudioPlayback = useCallback(() => {
+    playbackGenRef.current += 1;
     audioQueueRef.current = [];
-    if (blockedAudioRef.current) {
-      blockedAudioRef.current.pause();
-      blockedAudioRef.current.src = "";
-      blockedAudioRef.current = null;
+    unlockResumeRef.current = null;
+    ttsSinkRef.current?.stopActive();
+    const audio = ttsAudioRef.current;
+    if (audio && !ttsSinkRef.current?.isLoopbackActive && !audio.srcObject) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.volume = 1;
     }
-    if (playingAudioRef.current) {
-      playingAudioRef.current.pause();
-      playingAudioRef.current.src = "";
-      playingAudioRef.current = null;
+    const cancel = activeCancelRef.current;
+    activeCancelRef.current = null;
+    cancel?.();
+    if (isPlayingLoopRef.current) {
+      lastBotAudioMsRef.current = performance.now();
     }
     isPlayingLoopRef.current = false;
+    playingEnvRef.current = null;
     setAudioUnlockNeeded(false);
     setKaraokeProgress(100);
   }, []);
@@ -321,27 +631,36 @@ export default function JavisSalesCockpit({
   const drainAudioQueue = useCallback(async () => {
     if (isPlayingLoopRef.current) return;
     isPlayingLoopRef.current = true;
+    const gen = playbackGenRef.current;
     try {
-      while (audioQueueRef.current.length > 0) {
+      while (audioQueueRef.current.length > 0 && playbackGenRef.current === gen) {
         const item = audioQueueRef.current.shift()!;
         if (!ttsEnabledRef.current) continue;
         const resolved = await item.promise;
-        if (!resolved || !ttsEnabledRef.current) continue;
+        if (!resolved || !ttsEnabledRef.current || playbackGenRef.current !== gen) {
+          if (resolved) URL.revokeObjectURL(resolved.url);
+          continue;
+        }
+        await stagePaintGateRef.current;
+        if (!ttsEnabledRef.current || playbackGenRef.current !== gen) {
+          URL.revokeObjectURL(resolved.url);
+          continue;
+        }
+
+        const nowSpoken = performance.now();
+        recentBotSpokenRef.current = [
+          ...recentBotSpokenRef.current.filter((e) => nowSpoken - e.at < 15000),
+          { text: item.text, at: nowSpoken },
+        ];
+        lastBotAudioMsRef.current = nowSpoken;
 
         setHudState("speaking");
         setLiveKaraokeText(item.text);
         setKaraokeProgress(0);
+        playingEnvRef.current = wavEnvelope(resolved.buf);
 
         await new Promise<void>((resolve) => {
-          const audio = new Audio(resolved.url) as SinkableAudio;
-          playingAudioRef.current = audio;
-          playingEnvRef.current = null;
-          void fetch(resolved.url)
-            .then((r) => r.arrayBuffer())
-            .then((b) => {
-              if (playingAudioRef.current === audio) playingEnvRef.current = wavEnvelope(b);
-            })
-            .catch(() => {});
+          let settled = false;
           const durMs = Math.max(400, resolved.dur * 1000);
           let tStart = performance.now();
           let anim: ReturnType<typeof setInterval> | null = null;
@@ -356,62 +675,102 @@ export default function JavisSalesCockpit({
           };
 
           const finish = () => {
+            if (settled) return;
+            settled = true;
             if (anim) clearInterval(anim);
             setKaraokeProgress(100);
+            lastBotAudioMsRef.current = performance.now();
             URL.revokeObjectURL(resolved.url);
-            if (playingAudioRef.current === audio) playingAudioRef.current = null;
-            if (blockedAudioRef.current === audio) blockedAudioRef.current = null;
+            if (activeCancelRef.current === finish) activeCancelRef.current = null;
+            if (unlockResumeRef.current === resumePlayback) unlockResumeRef.current = null;
             resolve();
           };
+          activeCancelRef.current = finish;
 
-          audio.onended = finish;
-          audio.onerror = finish;
-
-          (async () => {
-            if (audio.setSinkId && speakerDeviceIdRef.current) {
-              await audio.setSinkId(speakerDeviceIdRef.current).catch(() => {});
+          const playViaSink = async (): Promise<boolean> => {
+            const sink = getTtsSink();
+            if (speakerDeviceIdRef.current) {
+              await sink.setSinkId(speakerDeviceIdRef.current);
             }
+            const started = await sink.playBuffer(
+              resolved.buf,
+              finish,
+              () => !settled && playbackGenRef.current === gen,
+            );
+            if (!started) return false;
+            if (!settled && playbackGenRef.current === gen) {
+              startProgressAnim();
+              setAudioUnlockNeeded(false);
+            }
+            return true;
+          };
+
+          const playViaElement = async (): Promise<boolean> => {
+            const audio = ttsAudioRef.current;
+            if (!audio) return false;
             try {
+              audio.onended = null;
+              audio.onerror = null;
+              audio.pause();
+              if (audio.srcObject) audio.srcObject = null;
+              audio.volume = 1;
+              if (audio.setSinkId && speakerDeviceIdRef.current) {
+                await audio.setSinkId(speakerDeviceIdRef.current).catch(() => {});
+              }
+              if (settled || playbackGenRef.current !== gen) return true;
+              audio.src = resolved.url;
+              audio.currentTime = 0;
+              audio.onended = finish;
+              audio.onerror = finish;
               startProgressAnim();
               await audio.play();
               setAudioUnlockNeeded(false);
+              return true;
             } catch {
-              // Browser paused autoplay before first gesture: keep audio ready & play on first tap anywhere!
               if (anim) clearInterval(anim);
-              blockedAudioRef.current = audio;
-              setAudioUnlockNeeded(true);
-              const unlockOnce = () => {
-                window.removeEventListener("pointerdown", unlockOnce, true);
-                window.removeEventListener("keydown", unlockOnce, true);
-                setAudioUnlockNeeded(false);
-                void audioCtxRef.current?.resume().catch(() => {});
-                if (blockedAudioRef.current === audio) {
-                  startProgressAnim();
-                  audio.play().catch(finish);
-                } else {
-                  finish();
-                }
-              };
-              window.addEventListener("pointerdown", unlockOnce, { once: true, capture: true });
-              window.addEventListener("keydown", unlockOnce, { once: true, capture: true });
+              audio.onended = null;
+              audio.onerror = null;
+              return false;
             }
-          })();
+          };
+
+          const playNow = async () => {
+            if (settled || playbackGenRef.current !== gen) return;
+            if (await playViaSink()) return;
+            if (await playViaElement()) return;
+
+            // Still blocked only before the very first gesture on mobile/desktop: wait once for any tap/click/key.
+            if (anim) clearInterval(anim);
+            unlockResumeRef.current = resumePlayback;
+            setAudioUnlockNeeded(true);
+          };
+
+          const resumePlayback = () => {
+            void playNow();
+          };
+
+          void playNow();
         });
       }
     } finally {
-      isPlayingLoopRef.current = false;
-      if (!busyRef.current) {
-        setHudState("listening");
-        setStatusText(
-          callActiveRef.current
-            ? micMutedRef.current
-              ? "🔇 ปิดไมค์ชั่วคราว (พิมพ์คุยหรือส่องรูปสินค้าได้ตลอดครับ)"
-              : "🟢 น้องตี๋กำลังทำงานและฟังเสียงของคุณอยู่ครับ…"
-            : "🟢 น้องตี๋พร้อมทำงานครับ พิมพ์คุย ส่องรูปสินค้า หรือกดเปิดไมค์สดได้เลย",
-        );
+      if (playbackGenRef.current === gen) {
+        isPlayingLoopRef.current = false;
+        playingEnvRef.current = null;
+        lastBotAudioMsRef.current = performance.now();
+        ttsSinkRef.current?.setDuck(false);
+        if (!busyRef.current && !speakingDetectedRef.current) {
+          setHudState("listening");
+          setStatusText(
+            callActiveRef.current
+              ? micMutedRef.current
+                ? "🔇 ปิดไมค์ชั่วคราว (พิมพ์คุยหรือส่องรูปสินค้าได้ตลอดครับ)"
+                : "🟢 น้องตี๋กำลังทำงานและฟังเสียงของคุณอยู่ครับ…"
+              : "🟢 น้องตี๋พร้อมทำงานครับ พิมพ์คุย ส่องรูปสินค้า หรือกดเปิดไมค์สดได้เลย",
+          );
+        }
       }
     }
-  }, []);
+  }, [getTtsSink]);
 
   const enqueueOmniVoiceSentence = useCallback(
     (sentence: string) => {
@@ -425,8 +784,9 @@ export default function JavisSalesCockpit({
         .then(async (res) => {
           if (!res.ok) return null;
           const dur = Number(res.headers.get("X-Audio-Duration") || "2.2") || 2.2;
-          const blob = await res.blob();
-          return { url: URL.createObjectURL(blob), dur };
+          const buf = await res.arrayBuffer();
+          const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+          return { url, dur, buf };
         })
         .catch(() => null);
 
@@ -442,15 +802,24 @@ export default function JavisSalesCockpit({
       .then(async (r) => {
         if (!r.ok) return null;
         const dur = Number(r.headers.get("X-Audio-Duration") || "5") || 5;
-        const blob = await r.blob();
-        return { url: URL.createObjectURL(blob), dur };
+        const buf = await r.arrayBuffer();
+        const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+        return { url, dur, buf };
       })
       .catch(() => null);
     audioQueueRef.current.push({ text: GREETING_TEXT, promise });
     void drainAudioQueue();
   }, [drainAudioQueue]);
 
-  const sendTurnRef = useRef<(text: string) => Promise<void> | void>(() => {});
+  const logVoiceClient = useCallback((payload: { kind: "screen_cmd" | "budget_cmd" | "coupon_cmd" | "echo_drop"; heard: string; cmd?: string; reply?: string; stage?: string }) => {
+    void fetch("/api/voice/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  }, []);
+  const lastSentTurnRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
+  const sendTurnRef = useRef<(text: string, extra?: { altHeard?: string }) => Promise<void> | void>(() => {});
   const sendTurn = useCallback(
     async (
       rawText: string,
@@ -459,9 +828,17 @@ export default function JavisSalesCockpit({
         imagePreview?: string;
         visionSlugs?: string[];
         visionSummary?: string;
+        altHeard?: string;
       },
     ) => {
       const q = rawText.trim();
+      if (!q) return;
+      const nowTurn = performance.now();
+      if (!extra?.visionSlugs && lastSentTurnRef.current.text === q && nowTurn - lastSentTurnRef.current.at < 450) {
+        return;
+      }
+      lastSentTurnRef.current = { text: q, at: nowTurn };
+
       // "ถอยกลับไป", "ดูเบอร์ 3", "เลื่อนลง" ... run on the screen at once (no AI, works even while busy).
       const screenCmd =
         q && !extra?.visionSlugs
@@ -470,6 +847,7 @@ export default function JavisSalesCockpit({
       if (screenCmd) {
         setInput("");
         setLiveUserHeard("");
+        logVoiceClient({ kind: "screen_cmd", heard: q, cmd: `${screenCmd.id}${screenCmd.no ? "#" + screenCmd.no : ""}`, stage: stageMode });
         runScreenCommandRef.current(screenCmd, q);
         return;
       }
@@ -478,6 +856,7 @@ export default function JavisSalesCockpit({
       if (budgetCmd !== null) {
         setInput("");
         setLiveUserHeard("");
+        logVoiceClient({ kind: "budget_cmd", heard: q, cmd: `budget:${budgetCmd}`, stage: stageMode });
         runBudgetRef.current(budgetCmd, q);
         return;
       }
@@ -486,10 +865,16 @@ export default function JavisSalesCockpit({
       if (couponCmd) {
         setInput("");
         setLiveUserHeard("");
+        logVoiceClient({ kind: "coupon_cmd", heard: q, cmd: `coupon:${couponCmd.action}`, stage: stageMode });
         runCouponCommandRef.current(couponCmd, q);
         return;
       }
-      if (!q || busyRef.current) return;
+      // Never drop a new customer command while a previous turn is still finishing: abort the stale turn and run this one immediately.
+      if (busyRef.current && abortRef.current) {
+        const stale = abortRef.current;
+        abortRef.current = null;
+        stale.abort();
+      }
       setWheelOpen(false);
       setDuel(null);
 
@@ -513,8 +898,8 @@ export default function JavisSalesCockpit({
       ]);
 
       // What the customer is looking at right now, so "อันนั้น/ตัวแรก" in the next sentence still means something
-      // Card numbers the customer sees = position in this list, so "เบอร์ 5" means focusSlugs[4].
-      const focusSlugs = stageCardsRef.current.slice(0, 12).map((c) => c.slug);
+      // Card numbers the customer sees right now (home showcase OR related grid on spotlight/cart) = focusSlugs[no - 1].
+      const focusSlugs = activeNumberedCardsRef.current.slice(0, 36).map((c) => c.slug);
 
       setTurns((prev) => [
         ...prev,
@@ -526,7 +911,8 @@ export default function JavisSalesCockpit({
           screenMarkdown: "",
           cards: [],
           jobs: [],
-          model: "deepseek-flash",
+          model: llmStatus.primaryModel || "gemma4:12b",
+          provider: "local",
         },
       ]);
 
@@ -544,6 +930,7 @@ export default function JavisSalesCockpit({
             customer,
             visionSlugs: extra?.visionSlugs,
             visionSummary: extra?.visionSummary,
+            altHeard: extra?.altHeard,
             focusSlugs,
             pendingSlug: qtyModalSlugRef.current || undefined,
             viewingSlug: viewingSlugRef.current || undefined,
@@ -563,10 +950,9 @@ export default function JavisSalesCockpit({
 
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const blocks = buf.split("\n\n");
-          buf = blocks.pop() ?? "";
+          if (value) buf += decoder.decode(value, { stream: !done });
+          const blocks = done ? buf.split("\n\n") : (() => { const parts = buf.split("\n\n"); buf = parts.pop() ?? ""; return parts; })();
+          if (done) buf = "";
 
           for (const b of blocks) {
             const line = b.split("\n").find((l) => l.startsWith("data: "));
@@ -584,6 +970,15 @@ export default function JavisSalesCockpit({
                 setHudState(ev.state);
               }
             } else if (ev.type === "team") {
+              const satColor =
+                ev.job.worker === "calc" || ev.job.worker === "order" || ev.job.worker === "cart"
+                  ? "#e879f9"
+                  : ev.job.worker === "vision"
+                    ? "#2dd4bf"
+                    : ev.job.worker === "planner"
+                      ? "#60a5fa"
+                      : "#fb923c";
+              setHudSatEvent({ id: `${turnId}-${ev.job.id}-${ev.job.state}`, color: satColor });
               setTurns((prev) =>
                 prev.map((t) => {
                   if (t.id !== turnId) return t;
@@ -595,8 +990,21 @@ export default function JavisSalesCockpit({
                 }),
               );
             } else if (ev.type === "cards") {
+              const prevSlugs = stageCardsRef.current.map((c) => c.slug).join(",");
+              const nextSlugs = ev.cards.map((c) => c.slug).join(",");
+              const isNewCardSet = Boolean(ev.cards[0]?.slug && nextSlugs !== prevSlugs);
               setStageCards(ev.cards);
-              if (ev.cards.length > 0) markMission("search");
+              if (ev.cards.length > 0) {
+                markMission("search");
+                setMobileTab("stage");
+                // Always switch the right-hand stage to showcase when a brand-new search result arrives
+                // so products never stay hidden behind welcome/camera/compare/old spotlight screens.
+                if (isNewCardSet) {
+                  setStageMode((m) => (m === "cart" || m === "checkout" ? m : "showcase"));
+                  document.querySelector(".st-showcase")?.scrollTo({ top: 0, behavior: "smooth" });
+                }
+              }
+              markStagePaintedSoon();
               // The customer moved on to other products: a "how many?" box for an old one must not cover them.
               if (qtyModalSlugRef.current && !ev.cards.some((c) => c.slug === qtyModalSlugRef.current)) closeQtyModal();
               // Same cards again (follow-up turn): stay on the product the customer has open.
@@ -606,6 +1014,8 @@ export default function JavisSalesCockpit({
               setStageMode(ev.mode);
               if (ev.title) setStageTitle(ev.title);
               if (ev.spotlight) setSpotlight(ev.spotlight);
+              setMobileTab(ev.mode === "cart" ? "cart" : "stage");
+              markStagePaintedSoon();
             } else if (ev.type === "cart") {
               replaceServerCart(ev.cart);
               if (ev.lastChangedSlug) setLastChangedSlug(ev.lastChangedSlug);
@@ -620,8 +1030,11 @@ export default function JavisSalesCockpit({
               actionFxTimersRef.current.push(
                 setTimeout(() => setActionFx((prev) => prev.filter((x) => x.id !== fx.id)), ACTION_FX_MS),
               );
-              // Always show the numbered cards so the customer sees which one the system means.
-              setStageMode("showcase");
+              // Keep the current view when the picked numbered card is already visible (e.g. related grid on spotlight/cart).
+              const cardOnCurrentView = ev.slug
+                ? activeNumberedCardsRef.current.some((c) => c.slug === ev.slug)
+                : false;
+              if (!cardOnCurrentView) setStageMode("showcase");
               actionFxTimersRef.current.push(
                 setTimeout(
                   () => document.querySelector(`.st-card.fx-${ev.kind}`)?.scrollIntoView({ block: "center", behavior: "smooth" }),
@@ -629,14 +1042,8 @@ export default function JavisSalesCockpit({
                 ),
               );
               if (ev.kind === "add") {
-                // Show which numbered card was picked first, then move to the cart.
+                // Keep the customer on the product screen so they can keep shopping immediately (live cart updates in place).
                 closeQtyModal();
-                actionFxTimersRef.current.push(
-                  setTimeout(() => {
-                    setStageMode("cart");
-                    setStageTitle("อัปเดตตะกร้าสินค้าแล้ว");
-                  }, ACTION_PICK_MS),
-                );
               }
             } else if (ev.type === "customer") {
               updateCustomer(ev.customer);
@@ -654,7 +1061,55 @@ export default function JavisSalesCockpit({
                     : { ...t, screenMarkdown: t.screenMarkdown + ev.text };
                 }),
               );
+            } else if (ev.type === "engine") {
+              setLlmStatus((prev) => ({
+                ...prev,
+                localOnline: ev.provider === "local" ? true : ev.provider === "fallback" ? false : prev.localOnline,
+                modelLoaded: ev.provider === "local" ? true : prev.modelLoaded,
+                activeProvider: ev.provider,
+                activeModel: ev.model,
+                lastMs: ev.ms ?? prev.lastMs,
+                lastTps: ev.tps ?? prev.lastTps,
+                lastFallbackReason: ev.fallbackReason,
+              }));
+              setTurns((prev) =>
+                prev.map((t) =>
+                  t.id === turnId
+                    ? {
+                        ...t,
+                        model: ev.model,
+                        provider: ev.provider,
+                        ms: ev.ms ?? t.ms,
+                        tps: ev.tps ?? t.tps,
+                        fallbackReason: ev.fallbackReason,
+                      }
+                    : t,
+                ),
+              );
             } else if (ev.type === "done") {
+              const prov: LlmProviderKind = ev.provider ?? "local";
+              setLlmStatus((prev) => ({
+                ...prev,
+                localOnline: prov === "local" ? true : prov === "fallback" ? false : prev.localOnline,
+                modelLoaded: prov === "local" ? true : prev.modelLoaded,
+                activeProvider: prov,
+                activeModel: ev.model,
+                lastMs: ev.ms ?? prev.lastMs,
+                lastTps: ev.tps ?? prev.lastTps,
+                lastFallbackReason: ev.fallbackReason,
+                stats: {
+                  ...prev.stats,
+                  localTurns: prev.stats.localTurns + (prov === "local" ? 1 : 0),
+                  fallbackTurns: prev.stats.fallbackTurns + (prov === "fallback" ? 1 : 0),
+                  ramTurns: prev.stats.ramTurns + (prov === "ram" ? 1 : 0),
+                  lastProvider: prov,
+                  lastModel: ev.model,
+                  lastMs: ev.ms ?? prev.stats.lastMs,
+                  lastTps: ev.tps ?? prev.stats.lastTps,
+                  lastFallbackReason: ev.fallbackReason,
+                  lastAt: new Date().toISOString(),
+                },
+              }));
               setTurns((prev) =>
                 prev.map((t) =>
                   t.id === turnId
@@ -663,16 +1118,22 @@ export default function JavisSalesCockpit({
                         spokenText: ev.spokenText || t.spokenText,
                         screenMarkdown: ev.screenMarkdown || t.screenMarkdown,
                         model: ev.model,
+                        provider: prov,
+                        ms: ev.ms ?? t.ms,
+                        tps: ev.tps ?? t.tps,
+                        fallbackReason: ev.fallbackReason,
                       }
                     : t,
                 ),
               );
+              if (devLogOpenRef.current) void refreshDevLogs();
             } else if (ev.type === "error") {
               setHudState("error");
               setStatusText(ev.message);
               setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, error: ev.message } : t)));
             }
           }
+          if (done) break;
         }
       } catch (err) {
         if ((err as { name?: string }).name !== "AbortError") {
@@ -682,10 +1143,12 @@ export default function JavisSalesCockpit({
           setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, error: msg } : t)));
         }
       } finally {
-        setBusy(false);
-        busyRef.current = false;
-        abortRef.current = null;
-        if (!isPlayingLoopRef.current) {
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+          setBusy(false);
+          busyRef.current = false;
+        }
+        if (!isPlayingLoopRef.current && !speakingDetectedRef.current && !busyRef.current) {
           setHudState("listening");
           setStatusText(
             callActiveRef.current
@@ -695,7 +1158,7 @@ export default function JavisSalesCockpit({
         }
       }
     },
-    [cart.items, closeQtyModal, customer, enqueueOmniVoiceSentence, promptAddToCart, replaceServerCart, stopAllAudioPlayback, turns, updateCustomer],
+    [cart.items, closeQtyModal, customer, enqueueOmniVoiceSentence, logVoiceClient, markStagePaintedSoon, promptAddToCart, replaceServerCart, stageMode, stopAllAudioPlayback, turns, updateCustomer],
   );
   sendTurnRef.current = sendTurn;
 
@@ -732,12 +1195,19 @@ export default function JavisSalesCockpit({
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
-  }, [turns, liveUserHeard]);
+  }, [turns, liveUserHeard, chatOpen]);
 
-  // ---------- Local OpenThai 2.0 ASR Live Call Loop (with Device Selection, Mute, Barge-in & Auto-Start) ----------
+  // ---------- Full-Duplex Mic Pipeline (HPF 95 Hz + AudioWorklet 32 ms + Silero VAD v5 + WebRTC AEC3 + 2-Stage Barge-in) ----------
   const teardownMicGraph = useCallback(() => {
+    micGraphGenRef.current += 1;
     pcmChunksRef.current = [];
     speakingDetectedRef.current = false;
+    ttsSinkRef.current?.setDuck(false);
+    if (vadRef.current) {
+      const oldVad = vadRef.current;
+      vadRef.current = null;
+      void oldVad.release();
+    }
     if (audioCtxRef.current) {
       void audioCtxRef.current.close().catch(() => {});
       audioCtxRef.current = null;
@@ -765,32 +1235,58 @@ export default function JavisSalesCockpit({
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
         throw new Error("NO_MEDIA_DEVICES");
       }
-      const baseAudio = {
-        echoCancellation: true,
+      // Prefer W3C echoCancellation: "all" (Chrome 130+ system/all AEC), falling back cleanly to boolean true.
+      const buildConstraints = (ec: boolean | "all", deviceId?: string): MediaTrackConstraints => ({
+        echoCancellation: ec as unknown as boolean,
         noiseSuppression: true,
         autoGainControl: true,
         channelCount: 1,
-      };
+        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+      });
       let stream: MediaStream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: preferredMicId ? { ...baseAudio, deviceId: { exact: preferredMicId } } : baseAudio,
-        });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: buildConstraints("all", preferredMicId || undefined) });
       } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: buildConstraints(true, preferredMicId || undefined) });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: buildConstraints(true) });
+        }
       }
 
       teardownMicGraph();
+      const graphGen = micGraphGenRef.current;
       stream.getAudioTracks().forEach((t) => {
         t.enabled = !micMutedRef.current;
       });
       micStreamRef.current = stream;
       setActiveMicStreamState(stream);
 
-      const ctx = new AudioContext({ sampleRate: 16000 });
+      // Let the OS choose its native hardware sample rate (avoids iOS Safari 16 kHz mismatch bugs);
+      // the AudioWorklet downsamples cleanly to 16 kHz / 512-sample (32 ms) frames.
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      const ctx = new AudioCtx();
       audioCtxRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
-      const proc = ctx.createScriptProcessor(4096, 1, 1);
+
+      // High-Pass Filter at 95 Hz: strips AC hum, fan rumble, breath pops & table knocks before VAD/STT.
+      const hpf = ctx.createBiquadFilter();
+      hpf.type = "highpass";
+      hpf.frequency.value = 95;
+      hpf.Q.value = 0.707;
+      source.connect(hpf);
+
+      // Load self-hosted Silero VAD v5 WASM asynchronously; Tier-A adaptive gate runs immediately until ready.
+      void BrowserSileroVad.create().then((vad) => {
+        if (!vad) return;
+        if (micGraphGenRef.current !== graphGen) {
+          void vad.release();
+          return;
+        }
+        vadRef.current = vad;
+      });
 
       const mergePcm = (chunks: Float32Array[]) => {
         const total = chunks.reduce((acc, c) => acc + c.length, 0);
@@ -803,148 +1299,374 @@ export default function JavisSalesCockpit({
         return out;
       };
 
-      // Echo guard: the speaker's own sound must never be heard as the customer (see lib/echo-guard.ts).
+      const IDLE_PREROLL_FRAMES = 10; // 320 ms ring buffer so first syllables are never clipped
+      const MIN_ONSET_FRAMES = 5; // 160 ms of real voice before opening STT (blocks clicks/knocks)
+      const MIN_FINAL_VOICED_FRAMES = 7; // ~224 ms minimum voiced speech to finalize a turn
+      const EARLY_STT_SILENCE_MS = 240; // start speculative GPU Whisper STT early (0 ms wait at turn end)
+      const SILENCE_END_MS = 540; // snappy end-of-turn confirmation after silence
+      const MAX_UTTERANCE_FRAMES = 480; // ~15 s safety cap so ambient noise never builds huge STT buffers
+
       const echoGuard = new EchoGuard();
+      const noiseGate = new AdaptiveNoiseGate();
       let wasPlaying = false;
-      let preroll: Float32Array[] = [];
+      let idlePreroll: Float32Array[] = [];
+      let bargePreroll: Float32Array[] = [];
+      let onsetFrames = 0;
+      let onsetMisses = 0;
+      let voicedFrames = 0;
       let echoTailUntil = 0;
       let lastPlayed = 0;
       let lastSoundingMs = 0;
+      let partialCtrl: AbortController | null = null;
+      const cancelPartialStt = () => {
+        if (partialCtrl) {
+          partialCtrl.abort();
+          partialCtrl = null;
+          sendingSttRef.current = false;
+        }
+      };
+      type FinalSttRes = {
+        text?: string;
+        altText?: string;
+        picked?: string;
+        voiced?: boolean;
+        gate?: { allow: boolean; prob: number; reason: string; ms: number };
+      };
+      let earlyStt: {
+        ctrl: AbortController;
+        promise: Promise<FinalSttRes | null>;
+      } | null = null;
+      const cancelEarlyStt = () => {
+        if (earlyStt) {
+          earlyStt.ctrl.abort();
+          earlyStt = null;
+        }
+      };
+      const postFinalStt = (pcm: Float32Array, signal?: AbortSignal) =>
+        fetch("/api/voice/stt", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "x-sample-rate": "16000",
+            "x-audio-format": "f32le",
+            "x-partial": "0",
+            "x-pending": qtyModalSlugRef.current ? "1" : "0",
+            "x-focus": activeNumberedCardsRef.current.length > 0 || viewingSlugRef.current ? "1" : "0",
+          },
+          body: pcm.buffer as ArrayBuffer,
+          signal,
+        })
+          .then((r) => (r.ok ? (r.json() as Promise<FinalSttRes>) : null))
+          .catch(() => null);
 
-      proc.onaudioprocess = (ev) => {
-        if (!callActiveRef.current || micMutedRef.current) return;
-        const inputData = ev.inputBuffer.getChannelData(0);
-        let sumSq = 0;
-        for (let i = 0; i < inputData.length; i++) sumSq += inputData[i] * inputData[i];
-        const rms = Math.sqrt(sumSq / inputData.length);
+      const handleFrame = async (frame512: Float32Array, rms: number) => {
+        if (micGraphGenRef.current !== graphGen) return;
+        if (!callActiveRef.current || micMutedRef.current) {
+          userLevelRef.current = 0;
+          return;
+        }
+        userLevelRef.current = rms;
         const now = performance.now();
+        const vad = vadRef.current;
+        const speechProb = vad ? await vad.process(frame512) : null;
+        if (micGraphGenRef.current !== graphGen) return;
 
         const playing = isPlayingLoopRef.current;
         if (playing !== wasPlaying) {
           wasPlaying = playing;
           echoGuard.resetRun();
-          preroll = [];
+          ttsSinkRef.current?.setDuck(false);
+          bargePreroll = [];
+          onsetFrames = 0;
+          onsetMisses = 0;
           if (playing) {
+            cancelPartialStt();
+            cancelEarlyStt();
             pcmChunksRef.current = [];
+            idlePreroll = [];
             speakingDetectedRef.current = false;
+            voicedFrames = 0;
             setLiveUserHeard("");
           } else {
-            echoTailUntil = now + ECHO_TAIL_MS; // room reverb + output latency after he stops
+            echoTailUntil = now + ECHO_TAIL_MS; // room reverb + output latency after Nong Tee stops
           }
         }
 
         if (playing) {
-          const audio = playingAudioRef.current;
+          const botSec = currentBotTimeSec();
           let played = 0;
-          if (audio && !audio.paused) {
-            played = lastPlayed = playedLevel(playingEnvRef.current, audio.currentTime);
+          if (botSec !== null) {
+            played = lastPlayed = playedLevel(playingEnvRef.current, botSec);
             lastSoundingMs = now;
           } else if (now - lastSoundingMs < ECHO_TAIL_MS) {
             played = lastPlayed;
           }
-          const customerFrames = echoGuard.hear(rms, played);
-          if (customerFrames === 0) {
-            preroll = [];
+          const decision = echoGuard.hear(
+            rms,
+            played,
+            speechProb,
+            Boolean(ttsSinkRef.current?.isLoopbackActive),
+          );
+          if (decision === "echo") {
+            ttsSinkRef.current?.setDuck(false);
+            bargePreroll.push(frame512);
+            if (bargePreroll.length > 4) bargePreroll.shift();
             return;
           }
-          preroll.push(new Float32Array(inputData));
-          if (customerFrames < BARGE_FRAMES) return;
+          if (decision === "duck") {
+            // Stage 1 (~96 ms): smoothly duck Nong Tee to 15% without dropping his sentence yet.
+            ttsSinkRef.current?.setDuck(true);
+            bargePreroll.push(frame512);
+            if (bargePreroll.length > 18) bargePreroll.shift();
+            return;
+          }
 
-          // Barge-in: customer clearly louder than the echo for ~0.5s -> stop talking and listen.
+          // Stage 2 (~192–256 ms): confirmed barge-in -> hard-stop audio + abort in-flight LLM stream.
+          bargePreroll.push(frame512);
           stopAllAudioPlayback();
+          if (abortRef.current) {
+            const ac = abortRef.current;
+            abortRef.current = null;
+            ac.abort();
+            setBusy(false);
+            busyRef.current = false;
+          }
           wasPlaying = false;
           setHudState("listening");
           setStatusText("น้องตี๋หยุดฟังคุณพูดแทรกครับ…");
           speakingDetectedRef.current = true;
           speechStartMsRef.current = now;
           lastVoiceMsRef.current = now;
-          pcmChunksRef.current = preroll;
-          preroll = [];
+          voicedFrames = bargePreroll.length;
+          pcmChunksRef.current = bargePreroll;
+          bargePreroll = [];
+          idlePreroll = [];
           echoGuard.resetRun();
           return;
         }
         if (now < echoTailUntil) return;
 
-        if (rms > 0.014) {
-          if (!speakingDetectedRef.current) {
-            speakingDetectedRef.current = true;
-            speechStartMsRef.current = now;
-          }
-          lastVoiceMsRef.current = now;
-          pcmChunksRef.current.push(new Float32Array(inputData));
+        const isVoice = noiseGate.isVoiceFrame(rms, speechProb, speakingDetectedRef.current);
 
-          // Incremental live partial transcription every ~650ms
-          if (!sendingSttRef.current && now - lastPartialMsRef.current > 650 && pcmChunksRef.current.length >= 3) {
+        if (!speakingDetectedRef.current) {
+          idlePreroll.push(frame512);
+          if (idlePreroll.length > IDLE_PREROLL_FRAMES) idlePreroll.shift();
+
+          if (isVoice) {
+            onsetFrames += 1;
+            onsetMisses = 0;
+            if (onsetFrames >= MIN_ONSET_FRAMES) {
+              speakingDetectedRef.current = true;
+              speechStartMsRef.current = now;
+              lastVoiceMsRef.current = now;
+              voicedFrames = onsetFrames;
+              pcmChunksRef.current = [...idlePreroll];
+              idlePreroll = [];
+              onsetFrames = 0;
+            }
+          } else {
+            onsetMisses += 1;
+            if (onsetMisses >= 2) {
+              onsetFrames = 0;
+              onsetMisses = 0;
+            }
+          }
+          return;
+        }
+
+        if (pcmChunksRef.current.length < MAX_UTTERANCE_FRAMES) {
+          pcmChunksRef.current.push(frame512);
+        }
+
+        if (isVoice) {
+          cancelEarlyStt();
+          lastVoiceMsRef.current = now;
+          voicedFrames += 1;
+
+          // Incremental live partial transcription every ~650 ms (guarded by Silero VAD on both ends)
+          if (!sendingSttRef.current && now - lastPartialMsRef.current > 650 && voicedFrames >= 8) {
             lastPartialMsRef.current = now;
             const merged = mergePcm(pcmChunksRef.current);
+            const pCtrl = new AbortController();
+            partialCtrl = pCtrl;
             sendingSttRef.current = true;
             fetch("/api/voice/stt", {
               method: "POST",
               headers: {
                 "Content-Type": "application/octet-stream",
-                "x-sample-rate": String(ctx.sampleRate),
+                "x-sample-rate": "16000",
                 "x-audio-format": "f32le",
                 "x-partial": "1",
               },
               body: merged.buffer,
+              signal: pCtrl.signal,
             })
-              .then((r) => r.json())
+              .then((r) => (r.ok ? r.json() : { text: "" }))
               .then((d: { text?: string }) => {
                 if (d.text && speakingDetectedRef.current) setLiveUserHeard(d.text);
               })
               .catch(() => {})
               .finally(() => {
+                if (partialCtrl === pCtrl) partialCtrl = null;
                 sendingSttRef.current = false;
               });
           }
-        } else if (speakingDetectedRef.current) {
-          pcmChunksRef.current.push(new Float32Array(inputData));
-          const silenceMs = now - lastVoiceMsRef.current;
+          return;
+        }
 
-          if (silenceMs >= 950 && !busyRef.current) {
-            const captured = mergePcm(pcmChunksRef.current);
-            pcmChunksRef.current = [];
-            speakingDetectedRef.current = false;
+        const silenceMs = now - lastVoiceMsRef.current;
 
-            if (captured.length >= ctx.sampleRate * 0.35) {
-              setStatusText("กำลังถอดเสียงภาษาไทย…");
-              fetch("/api/voice/stt", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/octet-stream",
-                  "x-sample-rate": String(ctx.sampleRate),
-                  "x-audio-format": "f32le",
-                  "x-partial": "0",
-                },
-                body: captured.buffer,
-              })
-                .then((r) => r.json())
-                .then((d: { text?: string; voiced?: boolean }) => {
-                  const finalWords = (d.text ?? "").trim();
-                  setLiveUserHeard("");
-                  if (d.voiced && finalWords) {
-                    // Latest sendTurn, not the one captured when the mic started (stale cart/history wiped the cart).
-                    void sendTurnRef.current(finalWords);
-                  } else {
+        // Speculative early final STT at 240 ms silence so GPU Whisper finishes before SILENCE_END_MS (540 ms).
+        if (
+          silenceMs >= EARLY_STT_SILENCE_MS &&
+          !earlyStt &&
+          voicedFrames >= MIN_FINAL_VOICED_FRAMES &&
+          pcmChunksRef.current.length >= 11
+        ) {
+          cancelPartialStt();
+          const snap = mergePcm(pcmChunksRef.current);
+          const ctrl = new AbortController();
+          earlyStt = { ctrl, promise: postFinalStt(snap, ctrl.signal) };
+        }
+
+        if (silenceMs >= SILENCE_END_MS) {
+          cancelPartialStt();
+          const pendingSpec = earlyStt;
+          earlyStt = null;
+          const captured = pendingSpec ? null : mergePcm(pcmChunksRef.current);
+          const spokenFrames = voicedFrames;
+          pcmChunksRef.current = [];
+          speakingDetectedRef.current = false;
+          voicedFrames = 0;
+          vadRef.current?.reset();
+
+          const sttPromise =
+            pendingSpec?.promise ??
+            (spokenFrames >= MIN_FINAL_VOICED_FRAMES && captured && captured.length >= 16000 * 0.35
+              ? postFinalStt(captured)
+              : null);
+
+          if (sttPromise) {
+            setStatusText("กำลังถอดเสียงภาษาไทย…");
+            void sttPromise
+              .then((d) => {
+                const finalWords = (d?.text ?? "").trim();
+                setLiveUserHeard("");
+                if (d?.voiced && finalWords) {
+                  // Layer-3 text echo guard: drop residual echo sentences mirroring what Nong Tee just spoke.
+                  const nowDone = performance.now();
+                  if (nowDone - lastBotAudioMsRef.current < 8000) {
+                    const recentSpoken = recentBotSpokenRef.current
+                      .filter((e) => nowDone - e.at < 15000)
+                      .map((e) => e.text)
+                      .join(" ");
+                    if (isEchoTranscript(finalWords, recentSpoken)) {
+                      logVoiceClient({ kind: "echo_drop", heard: finalWords });
+                      setHudState("listening");
+                      setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
+                      return;
+                    }
+                  }
+                  // Zero-latency micro-noise filter drops only blank/filler ("อืม", "..."); all customer speech goes straight to Nong Tee.
+                  if (d.gate && d.gate.allow === false) {
                     setHudState("listening");
                     setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
+                    return;
                   }
-                })
-                .catch(() => {
-                  setLiveUserHeard("");
+                  const altWords = typeof d.altText === "string" ? d.altText.trim() : "";
+                  // Latest sendTurn, not the one captured when the mic started (stale cart/history wiped the cart).
+                  void sendTurnRef.current(finalWords, altWords && altWords !== finalWords ? { altHeard: altWords } : undefined);
+                } else {
                   setHudState("listening");
-                });
-            } else {
-              setLiveUserHeard("");
-            }
+                  setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
+                }
+              })
+              .catch(() => {
+                setLiveUserHeard("");
+                setHudState("listening");
+              });
+          } else {
+            setLiveUserHeard("");
           }
         }
       };
 
-      source.connect(proc);
-      proc.connect(ctx.destination);
+      // Strictly serialize async Silero VAD frame processing while capping backlog so latency never builds up.
+      const pendingFrames: Array<{ frame: Float32Array; rms: number }> = [];
+      let drainingFrames = false;
+      const enqueueFrame = (frame: Float32Array, rms: number) => {
+        if (pendingFrames.length >= 4) pendingFrames.shift();
+        pendingFrames.push({ frame, rms });
+        if (drainingFrames) return;
+        drainingFrames = true;
+        void (async () => {
+          try {
+            while (pendingFrames.length > 0 && micGraphGenRef.current === graphGen) {
+              const next = pendingFrames.shift()!;
+              await handleFrame(next.frame, next.rms);
+            }
+          } finally {
+            drainingFrames = false;
+          }
+        })();
+      };
+
+      // Silent sink keeps AudioWorklet / ScriptProcessor active across browsers without ever outputting audio.
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
+      silentGain.connect(ctx.destination);
+
+      let workletAttached = false;
+      if (ctx.audioWorklet && typeof AudioWorkletNode === "function") {
+        try {
+          await ctx.audioWorklet.addModule("/vad/mic-capture.worklet.js");
+          if (micGraphGenRef.current !== graphGen) return;
+          const worklet = new AudioWorkletNode(ctx, "mb-mic-capture", {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            channelCount: 1,
+          });
+          worklet.port.onmessage = (ev: MessageEvent<{ frame: Float32Array; rms: number }>) => {
+            if (ev.data?.frame) enqueueFrame(ev.data.frame, ev.data.rms);
+          };
+          hpf.connect(worklet);
+          worklet.connect(silentGain);
+          workletAttached = true;
+        } catch {
+          workletAttached = false;
+        }
+      }
+
+      if (!workletAttached) {
+        // Fallback for older browsers without AudioWorklet: downsample to 16 kHz / 512-sample frames inline.
+        const proc = ctx.createScriptProcessor(2048, 1, 1);
+        const ratio = ctx.sampleRate / 16000;
+        let outFrame = new Float32Array(512);
+        let outIdx = 0;
+        let phase = 0;
+        proc.onaudioprocess = (ev) => {
+          const ch = ev.inputBuffer.getChannelData(0);
+          while (phase < ch.length) {
+            const i0 = Math.floor(phase);
+            const i1 = Math.min(ch.length - 1, i0 + 1);
+            const frac = phase - i0;
+            outFrame[outIdx++] = ch[i0] * (1 - frac) + ch[i1] * frac;
+            phase += ratio;
+            if (outIdx === 512) {
+              let sumSq = 0;
+              for (let i = 0; i < 512; i++) sumSq += outFrame[i] * outFrame[i];
+              enqueueFrame(outFrame, Math.sqrt(sumSq / 512));
+              outFrame = new Float32Array(512);
+              outIdx = 0;
+            }
+          }
+          phase -= ch.length;
+        };
+        hpf.connect(proc);
+        proc.connect(silentGain);
+      }
     },
-    [stopAllAudioPlayback, teardownMicGraph],
+    [logVoiceClient, stopAllAudioPlayback, teardownMicGraph],
   );
 
   const startLiveCall = useCallback(
@@ -1002,6 +1724,8 @@ export default function JavisSalesCockpit({
   useEffect(() => {
     return () => {
       stopAllAudioPlayback();
+      ttsSinkRef.current?.dispose();
+      ttsSinkRef.current = null;
       if (callActiveRef.current) teardownMicGraph();
     };
   }, [stopAllAudioPlayback, teardownMicGraph]);
@@ -1193,20 +1917,20 @@ export default function JavisSalesCockpit({
   }, []);
 
   const runScreenCommand = (cmd: ScreenCommand, heard?: string) => {
-    const cards = stageCardsRef.current;
+    const cards = activeNumberedCardsRef.current;
+    const navCards = stageCardsRef.current;
     let reply = "";
     let speak = true;
-    const showCard = (idx: number) => {
-      const c = cards[idx];
+    const showCardFrom = (list: JavisProductCard[], idx: number) => {
+      const c = list[idx];
       if (!c) return false;
-      setSpotlight(c);
-      setStageMode("spotlight");
-      setStageTitle(c.title);
+      openProductSpotlight(c);
       const price = c.bestPrice ? `ราคา ${c.bestPrice.replace(/\.00$/, "")} บาท ต่อ${c.unitLabel}` : "";
       reply = `เบอร์ ${idx + 1} ${c.title} ${price}ครับ`;
       return true;
     };
-    const spotIdx = () => cards.findIndex((c) => c.slug === spotlight?.slug);
+    const showCard = (idx: number) => showCardFrom(cards, idx);
+    const spotIdx = () => navCards.findIndex((c) => c.slug === spotlight?.slug);
     const moveHistory = (dir: -1 | 1) => {
       const steps = Math.min(cmd.no ?? 1, 20);
       const snap = goScreenHistory(dir * steps);
@@ -1216,7 +1940,7 @@ export default function JavisSalesCockpit({
     const moveItem = (dir: -1 | 1) => {
       const cur = stageMode === "spotlight" ? spotIdx() : -1;
       const next = cur < 0 ? 0 : cur + dir;
-      if (!showCard(next)) reply = dir > 0 ? `นี่คือตัวสุดท้ายแล้วครับ บนจอมี ${cards.length} เบอร์` : "นี่คือเบอร์ 1 ตัวแรกแล้วครับ";
+      if (!showCardFrom(navCards, next)) reply = dir > 0 ? `นี่คือตัวสุดท้ายแล้วครับ บนจอมี ${navCards.length} เบอร์` : "นี่คือเบอร์ 1 ตัวแรกแล้วครับ";
     };
 
     // Moving anywhere else closes the wheel / duel, so voice alone never gets stuck behind an overlay.
@@ -1282,7 +2006,7 @@ export default function JavisSalesCockpit({
         break;
       case "showcase":
         setStageMode("showcase");
-        reply = `บนจอมีสินค้า ${cards.length} เบอร์ครับ พูดว่า ดูเบอร์ไหน หรือ เอาเบอร์ไหนกี่ชิ้น ได้เลย`;
+        reply = `บนจอมีสินค้า ${navCards.length} เบอร์ครับ พูดว่า ดูเบอร์ไหน หรือ เอาเบอร์ไหนกี่ชิ้น ได้เลย`;
         break;
       case "open_no":
         markMission("open");
@@ -1291,7 +2015,7 @@ export default function JavisSalesCockpit({
       case "details": {
         // Never guess: open the product already in spotlight, or the only card, else ask for the number.
         const cur = stageMode === "spotlight" ? spotIdx() : -1;
-        if (cur >= 0) showCard(cur);
+        if (cur >= 0) showCardFrom(navCards, cur);
         else if (cards.length === 1) showCard(0);
         else reply = cards.length > 1 ? `ดูรายละเอียดเบอร์ไหนครับ บนจอมีเบอร์ 1 ถึง ${cards.length}` : "ยังไม่มีสินค้าบนจอครับ บอกชื่อสินค้าที่อยากดูได้เลยครับ";
         break;
@@ -1316,7 +2040,7 @@ export default function JavisSalesCockpit({
           setStageMode("checkout");
           reply = `ยอดรวม ${bahtSpoken(cart.grandTotalFormatted)}ครับ บอกชื่อ เบอร์โทร และวิธีจ่ายเงินได้เลยครับ`;
           const last = related ? nextSuggestion(related.cards) : null;
-          if (last) reply += ` ก่อนจ่าย ตี๋แนะนำ ${last.title} ราคา ${bahtSpoken(last.priceLabel)} รับด้วยไหมครับ พูดว่า เอาด้วย ได้เลยครับ`;
+          if (last) reportCommand(`🔗 แนะนำ: ${last.title}`, undefined, false);
         }
         break;
       case "camera":
@@ -1418,16 +2142,16 @@ export default function JavisSalesCockpit({
   /** "ดูของที่เกี่ยวข้อง": neighbours of the product in view (else the cart, else the cards) as numbered cards. */
   const showRelated = async (heard: string | undefined) => {
     const inView = stageMode === "spotlight" && spotlight ? [spotlight.slug] : [];
-    const seeds = inView.length ? inView : cart.items.length ? cart.items.map((it) => it.slug) : stageCardsRef.current.slice(0, 3).map((c) => c.slug);
+    const seeds = inView.length ? inView : cart.items.length ? cart.items.map((it) => it.slug) : stageCardsRef.current.slice(0, 6).map((c) => c.slug);
     if (!seeds.length) return reportCommand("ยังไม่มีสินค้าให้สมองหาของเกี่ยวข้องครับ บอกชื่อสินค้าก่อนนะครับ", heard, true);
-    const r = await fetchRelated(seeds);
-    if (!r?.cards.length) return reportCommand("สมองยังไม่เจอของที่เกี่ยวข้องกับตัวนี้ครับ", heard, true);
+    const r = await fetchRelated(seeds, 32);
+    if (!r?.cards.length) return reportCommand("สมองยังไม่พบของที่เกี่ยวข้องกับตัวนี้ครับ", heard, true);
     setRelated(r);
     setStageCards(r.cards);
     setSpotlight(r.cards[0]);
     setStageMode("showcase");
     setStageTitle("🔗 สมองแนะนำของที่เกี่ยวข้อง");
-    reportCommand(`สมองเจอของที่เกี่ยวข้อง ${r.cards.length} รายการครับ พูดว่า ใส่เบอร์ 1 หรือ ดูเบอร์ 2 ได้เลยครับ`, heard, true);
+    reportCommand(`สมองพบของที่เกี่ยวข้อง ${r.cards.length} รายการครับ พูดว่า ใส่เบอร์ 1 หรือ ดูเบอร์ 2 ได้เลยครับ`, heard, true);
   };
 
   /** Chip + chat line + spoken answer for a command run on the screen (no AI). */
@@ -1496,24 +2220,33 @@ export default function JavisSalesCockpit({
     flyToCart(grown.slug);
     playTing("add");
     markMission("add");
-    // Always suggest one related item after an add (no AI call): picked from brain hubs, spoken once per item.
+    // Show related recommendations visually on screen (silent — never speak cross-sell aloud).
     void fetchRelated([grown.slug]).then((r) => {
       if (!r?.cards.length) return;
       setRelated(r);
       const pick = nextSuggestion(r.cards);
       if (!pick) return;
-      const say = `ตี๋แนะนำ ${pick.title} ราคา ${bahtSpoken(pick.priceLabel)} รับด้วยไหมครับ พูดว่า เอาด้วย ได้เลยครับ`;
       reportCommand(`🔗 แนะนำ: ${pick.title}`, undefined, false);
-      enqueueOmniVoiceSentence(say);
     });
   }, [cart.items, markMission]);
+
+  useEffect(() => {
+    if (!stageRelatedKey || stageRelated?.key === stageRelatedKey) return;
+    const seeds = stageRelatedKey.split(",").filter(Boolean);
+    if (!seeds.length) return;
+    let alive = true;
+    void fetchRelated(seeds, 24).then((r) => alive && r && setStageRelated({ key: stageRelatedKey, set: r }));
+    return () => {
+      alive = false;
+    };
+  }, [stageRelatedKey, stageRelated?.key]);
 
   useEffect(() => {
     if (stageMode !== "spotlight" || !spotlight) return;
     const slug = spotlight.slug;
     if (spotRelated?.slug === slug) return;
     let alive = true;
-    void fetchRelated([slug]).then((r) => alive && r && setSpotRelated({ slug, set: r }));
+    void fetchRelated([slug], 24).then((r) => alive && r && setSpotRelated({ slug, set: r }));
     return () => {
       alive = false;
     };
@@ -1586,214 +2319,99 @@ export default function JavisSalesCockpit({
         <button
           type="button"
           className="jc-unlock-banner"
-          onClick={() => {
-            setAudioUnlockNeeded(false);
-            void audioCtxRef.current?.resume().catch(() => {});
-            void blockedAudioRef.current?.play().catch(() => {});
-          }}
+          onClick={unlockAudioPlayback}
         >
           🔊 น้องตี๋เริ่มทำงานแล้วครับ — แตะตรงไหนก็ได้ 1 ครั้งเพื่อเปิดเสียงพูดของน้องตี๋
         </button>
       )}
 
-      <div className="jc-grid">
-        {/* ==================== LEFT COLUMN: NONG TEE VOICE & CHAT ==================== */}
-        <section className="jc-left" aria-label="สนทนากับเลขาน้องตี๋">
-          <div className="jc-agent-bar">
-            <div className="jm-hud" data-state={hudState}>
-              <svg viewBox="0 0 44 44">
-                <circle cx="22" cy="22" r="19" className="jm-ring-bg" />
-                <circle cx="22" cy="22" r="19" className="jm-ring-spin" />
-              </svg>
-              <span>🧑‍💼</span>
-            </div>
-            <div className="jc-agent-meta">
-              <div className="jc-agent-title-row">
-                <h1>น้องตี๋ · Javis ปิดการขาย</h1>
-                <span className={`jc-voice-pill${voiceEngineOnline ? " online" : ""}`}>
-                  {voiceEngineOnline ? "OmniVoice GPU" : "Active"}
-                </span>
-              </div>
-              <p className="jc-status-line" data-state={hudState}>
-                {statusText}
-              </p>
-            </div>
-          </div>
+      <h1 className="sr-only">น้องตี๋ · Javis ปิดการขาย MarketBrain</h1>
 
-          {/* Call, Mic Mute, Speaker, Device Picker & Model Controls — single clean baseline */}
-          <div className="jc-call-controls">
+      {/* ==================== TOP NONG TEE COMMAND DOCK (REPLACES LEFT SIDEBAR) ==================== */}
+      <div className="jc-top-dock" ref={dockPopRef} role="region" aria-label="แถบควบคุมเลขาน้องตี๋และค้นหาด้วยเสียง">
+        <div className="jc-dock-row">
+          <button
+            type="button"
+            className="jc-dock-orb jm-hud"
+            data-state={hudState}
+            aria-expanded={chatOpen}
+            aria-label="เปิดประวัติสนทนากับเลขาน้องตี๋"
+            title={`น้องตี๋ · ${statusText}`}
+            onClick={() => {
+              setDevLogOpen(false);
+              setChatOpen((v) => !v);
+            }}
+          >
+            <svg viewBox="0 0 44 44" aria-hidden="true">
+              <circle cx="22" cy="22" r="19" className="jm-ring-bg" />
+              <circle cx="22" cy="22" r="19" className="jm-ring-spin" />
+            </svg>
+            <span aria-hidden="true">🧑‍💼</span>
+          </button>
+
+          <span
+            className="mb-wave jc-dock-wave"
+            data-state={hudState}
+            title={voiceEngineOnline ? "OmniVoice GPU พร้อมทำงาน" : statusText}
+            aria-hidden="true"
+          >
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+          </span>
+
+          <div className="jc-dock-icons" role="group" aria-label="ควบคุมเสียงและอุปกรณ์">
             <button
               type="button"
-              className={`jc-call-btn${callActive ? " active" : ""}`}
+              className={`jc-icon-btn is-call${callActive ? " active" : ""}`}
+              aria-pressed={callActive}
+              aria-label={callActive ? "พักสายไมค์สด" : "เปิดไมค์สดคุยกับน้องตี๋"}
+              title={callActive ? "พักสายไมค์สด" : "เปิดไมค์สดคุยกับน้องตี๋"}
               onClick={() => void startLiveCall()}
             >
-              {callActive ? "📴 พักสาย" : "📞 เปิดไมค์สด"}
+              <span aria-hidden="true">{callActive ? "📴" : "📞"}</span>
             </button>
 
             {callActive && (
               <button
                 type="button"
-                className={`jc-ctrl-pill${micMuted ? " muted" : ""}`}
+                className={`jc-icon-btn is-mic${micMuted ? " muted" : ""}`}
                 aria-pressed={micMuted}
+                aria-label={micMuted ? "เปิดไมค์" : "ปิดไมค์ชั่วคราว"}
+                title={micMuted ? "เปิดไมค์" : "ปิดไมค์ชั่วคราวโดยสายไม่หลุด"}
                 onClick={toggleMicMute}
-                title="เปิดหรือปิดไมโครโฟนชั่วคราวโดยสายไม่หลุด"
               >
-                {micMuted ? "🔇 เปิดไมค์" : "🎙️ ปิดไมค์"}
+                <span aria-hidden="true">{micMuted ? "🔇" : "🎙️"}</span>
               </button>
             )}
 
             <button
               type="button"
-              className="jc-ctrl-pill"
+              className={`jc-icon-btn is-spk${ttsEnabled ? " on" : " muted"}${ttsEnabled && hudState === "speaking" ? " speaking" : ""}`}
               aria-pressed={ttsEnabled}
+              aria-label={ttsEnabled ? "ปิดเสียงพูดของน้องตี๋" : "เปิดเสียงพูดของน้องตี๋"}
+              title={ttsEnabled ? "ปิดเสียงพูดของน้องตี๋" : "เปิดเสียงพูดของน้องตี๋"}
               onClick={() => {
                 if (ttsEnabled) stopAllAudioPlayback();
                 setTtsEnabled((v) => !v);
               }}
-              title="เปิดหรือปิดเสียงพูดของน้องตี๋"
             >
-              {ttsEnabled ? "🔊 เสียง" : "🔇 เงียบ"}
+              <span aria-hidden="true">{ttsEnabled ? "🔊" : "🔇"}</span>
             </button>
 
             <DevicePickerPopover
+              iconOnly
+              buttonClassName="jc-icon-btn is-gear"
               activeMicStream={activeMicStreamState}
               onOpenCameraScanner={() => setStageMode("camera")}
               onSelectPhotoFile={(f) => void handleQuickPhotoFile(f)}
             />
           </div>
 
-          {(liveKaraokeText || liveUserHeard) && (
-            <div className="jc-karaoke-box">
-              {liveUserHeard ? (
-                <p className="jc-k-user">🎤 ได้ยินว่า: “{liveUserHeard}”</p>
-              ) : (
-                <KaraokeWords text={liveKaraokeText} pct={karaokeProgress} />
-              )}
-            </div>
-          )}
-
-          {latestJobs.length > 0 && (
-            <div className="jc-workers-strip">
-              {latestJobs.slice(-4).map((j) => (
-                <span key={j.id} className={`jc-wchip st-${j.state}`}>
-                  <i className="jm-dot" />
-                  <b>{j.label}</b>
-                  {j.ms !== undefined && <small>{j.ms}ms</small>}
-                </span>
-              ))}
-            </div>
-          )}
-
-          <div className="jc-chat-stream" ref={chatScrollRef}>
-            {turns.length === 0 ? (
-              <div className="jc-chat-welcome">
-                <p className="jc-greet-bubble">
-                  <strong>🟢 สวัสดีครับ! น้องตี๋พร้อมรับคำสั่งแล้วครับ 🙏</strong>
-                  <br />
-                  พูดสั่งด้วยเสียงได้เลย หรือกด <b>📷 ส่องกล้อง / ส่งรูปสินค้า</b> ถ้าน้องตี๋เห็นรูปสินค้าจะวิ่งค้นในสมองและหยิบมาให้เลือกใส่ตะกร้าทันทีครับ!
-                </p>
-
-                <div className="jc-vision-quick-row">
-                  <button
-                    type="button"
-                    className="btn primary jc-vbtn-main"
-                    onClick={() => setStageMode("camera")}
-                  >
-                    📷 เปิดกล้องส่องหาสินค้า
-                  </button>
-                  <button
-                    type="button"
-                    className="btn jc-vbtn-sub"
-                    disabled={visionUploading}
-                    onClick={() => quickPhotoInputRef.current?.click()}
-                  >
-                    {visionUploading ? "🔍 กำลังค้นรูป…" : "🖼️ เลือกรูปสินค้าไปหาเลย"}
-                  </button>
-                </div>
-
-                <div className="jc-scenario-list">
-                  {QUICK_SCENARIOS.map((sc) => (
-                    <button
-                      key={sc.label}
-                      type="button"
-                      className="jc-scenario-btn"
-                      onClick={() => void sendTurn(sc.prompt)}
-                    >
-                      <span>{sc.icon}</span>
-                      <span>{sc.label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              turns.map((t) => (
-                <article key={t.id} className="jc-turn-card">
-                  <div className="jc-u-msg">
-                    {t.imagePreview && (
-                      <img src={t.imagePreview} alt="รูปสินค้าที่ค้นหา" className="jc-u-thumb" />
-                    )}
-                    <div>
-                      <span>คุณ:</span> {t.userText}
-                    </div>
-                  </div>
-                  <div className="jc-b-msg">
-                    <div className="jc-b-head">
-                      <b>🧑‍💼 น้องตี๋</b>
-                      {t.spokenText && (
-                        <button
-                          type="button"
-                          className="jc-replay-sm"
-                          onClick={() => enqueueOmniVoiceSentence(t.spokenText)}
-                        >
-                          🔊 ฟังเสียง
-                        </button>
-                      )}
-                    </div>
-                    {t.error ? (
-                      <p className="jm-error">{t.error}</p>
-                    ) : (
-                      <p className="jc-b-spoken">
-                        {t.spokenText || "น้องตี๋กำลังค้นสมองและเตรียมคำตอบสักครู่ครับ…"}
-                      </p>
-                    )}
-
-                    {t.cards.length > 0 && (
-                      <div className="jc-ans-products">
-                        <div className="jc-ans-lbl">กดเลือกใส่ตะกร้า (ระบุจำนวนได้) หรือแตะดูภาพใหญ่:</div>
-                        {t.cards.slice(0, 5).map((c) => (
-                          <div key={c.slug} className="jc-ans-item">
-                            <button
-                              type="button"
-                              className="jc-ans-pick"
-                              onClick={() => {
-                                setSpotlight(c);
-                                setStageMode("spotlight");
-                                setStageTitle(c.title);
-                              }}
-                            >
-                              {c.imageUrl ? <img src={c.imageUrl} alt="" /> : <span>📦</span>}
-                              <span className="jc-ans-name">{c.title}</span>
-                              <strong className="jc-ans-price">{c.priceLabel}</strong>
-                            </button>
-                            <button
-                              type="button"
-                              className="jc-ans-addbtn"
-                              onClick={() => promptAddToCart(c)}
-                            >
-                              🛒 ใส่ตะกร้า
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </article>
-              ))
-            )}
-          </div>
-
           <form
-            className="jc-input-bar"
+            className="jc-dock-form"
             onSubmit={(e) => {
               e.preventDefault();
               void sendTurn(input);
@@ -1801,7 +2419,7 @@ export default function JavisSalesCockpit({
           >
             <button
               type="button"
-              className={`jc-cam-icon-btn${stageMode === "camera" ? " active" : ""}`}
+              className={`jc-dock-in-btn${stageMode === "camera" ? " active" : ""}`}
               onClick={() => setStageMode(stageMode === "camera" ? "showcase" : "camera")}
               title="เปิดกล้องส่องหาสินค้า"
               aria-label="เปิดกล้องส่องหาสินค้า"
@@ -1810,7 +2428,7 @@ export default function JavisSalesCockpit({
             </button>
             <button
               type="button"
-              className="jc-cam-icon-btn"
+              className={`jc-dock-in-btn${visionUploading ? " spinning" : ""}`}
               disabled={visionUploading}
               onClick={() => quickPhotoInputRef.current?.click()}
               title="เลือกรูปสินค้าหรือวางรูป (Ctrl+V) เพื่อค้นหาทันที"
@@ -1822,22 +2440,382 @@ export default function JavisSalesCockpit({
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="พิมพ์คุย วางรูป (Ctrl+V) หรือสั่ง เช่น เอาไฮคิว 5 กล่อง…"
+              placeholder="พูดหรือพิมพ์คุย วางรูป (Ctrl+V) เช่น เอาไฮคิว 5 กล่อง…"
               aria-label="พิมพ์ข้อความคุยกับน้องตี๋"
               disabled={busy}
             />
             {busy ? (
-              <button type="button" className="jm-stop-btn" onClick={() => abortRef.current?.abort()}>
-                หยุด
+              <button
+                type="button"
+                className="jc-dock-stop-btn"
+                onClick={() => abortRef.current?.abort()}
+                title="หยุดการตอบ"
+                aria-label="หยุดการตอบ"
+              >
+                ⏹ หยุด
               </button>
             ) : (
-              <button type="submit" className="jc-send-btn" disabled={!input.trim()}>
-                ส่ง
+              <button
+                type="submit"
+                className="jc-dock-send-btn"
+                disabled={!input.trim()}
+                title="ส่งข้อความ"
+                aria-label="ส่งข้อความ"
+              >
+                ➤
               </button>
             )}
           </form>
-        </section>
 
+          <div className="jc-dock-right">
+            <button
+              type="button"
+              className="jc-dock-engine-pill"
+              data-provider={
+                llmStatus.activeProvider === "fallback"
+                  ? "fallback"
+                  : !llmStatus.localOnline
+                    ? "offline"
+                    : llmStatus.activeProvider === "ram"
+                      ? "ram"
+                      : "local"
+              }
+              title={
+                llmStatus.lastFallbackReason
+                  ? `สลับสำรองเพราะ: ${llmStatus.lastFallbackReason}`
+                  : `${voiceEngineOnline ? "OmniVoice GPU · " : ""}หลัก: ${llmStatus.primaryModel}${llmStatus.lastTps ? ` (${llmStatus.lastTps} t/s)` : ""} · L:${llmStatus.stats.localTurns} R:${llmStatus.stats.ramTurns} B:${llmStatus.stats.fallbackTurns}`
+              }
+              aria-expanded={devLogOpen}
+              onClick={() => {
+                const next = !devLogOpen;
+                setChatOpen(false);
+                setDevLogOpen(next);
+                if (next) void refreshDevLogs();
+              }}
+            >
+              <span className="jc-led" aria-hidden="true" />
+              <span className="jc-dock-engine-txt">
+                {llmStatus.activeProvider === "fallback"
+                  ? `สำรอง DeepSeek${llmStatus.lastMs ? ` · ${fmtMs(llmStatus.lastMs)}` : ""}`
+                  : !llmStatus.localOnline
+                    ? "Local ออฟไลน์"
+                    : llmStatus.activeProvider === "ram"
+                      ? `สมองด่วน${llmStatus.lastMs ? ` · ${fmtMs(llmStatus.lastMs)}` : ""}`
+                      : `gemma4${
+                          llmStatus.lastMs
+                            ? ` · ${fmtMs(llmStatus.lastMs)}`
+                            : llmStatus.modelLoaded
+                              ? " · พร้อม"
+                              : " · อุ่น"
+                        }`}
+              </span>
+              {voiceEngineOnline && <span className="jc-gpu-dot" title="OmniVoice GPU พร้อม" aria-hidden="true" />}
+            </button>
+
+            <button
+              type="button"
+              className={`jc-icon-btn is-chat${chatOpen ? " active" : ""}`}
+              aria-expanded={chatOpen}
+              aria-label="ประวัติคุยกับน้องตี๋"
+              title="ประวัติคุยกับน้องตี๋"
+              onClick={() => {
+                setDevLogOpen(false);
+                setChatOpen((v) => !v);
+              }}
+            >
+              <span aria-hidden="true">💬</span>
+              {turns.length > 0 && <span className="jc-icon-badge">{turns.length}</span>}
+            </button>
+
+            <button
+              type="button"
+              className={`jc-icon-btn is-log${devLogOpen ? " active" : ""}`}
+              aria-expanded={devLogOpen}
+              aria-label="บันทึกการทำงาน AI (Dev Log)"
+              title={`บันทึกการทำงาน AI (L:${llmStatus.stats.localTurns} R:${llmStatus.stats.ramTurns} B:${llmStatus.stats.fallbackTurns})`}
+              onClick={() => {
+                const next = !devLogOpen;
+                setChatOpen(false);
+                setDevLogOpen(next);
+                if (next) void refreshDevLogs();
+              }}
+            >
+              <span aria-hidden="true">📋</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="jc-dock-ticker" role="status" aria-live="polite">
+          {liveUserHeard ? (
+            <p className="jc-tick-heard">🎤 ได้ยินว่า: “{liveUserHeard}”</p>
+          ) : liveKaraokeText ? (
+            <div className="jc-tick-karaoke">
+              <span aria-hidden="true">🔊</span>
+              <KaraokeWords text={liveKaraokeText} pct={karaokeProgress} />
+            </div>
+          ) : busy && latestJobs.length > 0 ? (
+            <div className="jc-tick-jobs">
+              <span className="jc-tick-status">{statusText}</span>
+              {latestJobs.slice(-3).map((j) => (
+                <span key={j.id} className={`jc-wchip st-${j.state}`}>
+                  <i className="jm-dot" />
+                  <b>{j.label}</b>
+                  {j.ms !== undefined && <small>{j.ms}ms</small>}
+                </span>
+              ))}
+            </div>
+          ) : latestTurn?.spokenText ? (
+            <div className="jc-tick-reply">
+              <button
+                type="button"
+                className="jc-tick-reply-btn"
+                onClick={() => {
+                  setDevLogOpen(false);
+                  setChatOpen(true);
+                }}
+                title="คลิกเพื่อดูประวัติสนทนาทั้งหมด"
+              >
+                <span aria-hidden="true">🧑‍💼</span>
+                <span className="jc-tick-text">{latestTurn.spokenText}</span>
+              </button>
+              <div className="jc-tick-actions">
+                {latestTurn.model && (
+                  <span className={`jc-turn-engine p-${latestTurn.provider || "local"}`}>
+                    {latestTurn.provider === "ram"
+                      ? "⚡ สมองด่วน"
+                      : latestTurn.provider === "fallback"
+                        ? "🟡 สำรอง"
+                        : "🟢 gemma4"}
+                    {latestTurn.ms !== undefined ? ` · ${fmtMs(latestTurn.ms)}` : ""}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="jc-tick-speak"
+                  onClick={() => enqueueOmniVoiceSentence(latestTurn.spokenText)}
+                  title="ฟังคำตอบนี้อีกครั้ง"
+                  aria-label="ฟังคำตอบนี้อีกครั้ง"
+                >
+                  🔊
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="jc-tick-idle">
+              <span className="jc-tick-status">{statusText}</span>
+              <div className="jc-tick-chips">
+                {QUICK_SCENARIOS.slice(0, 3).map((sc) => (
+                  <button
+                    key={sc.label}
+                    type="button"
+                    className="jc-tick-chip"
+                    onClick={() => void sendTurn(sc.prompt)}
+                  >
+                    <span>{sc.icon}</span>
+                    <span>{sc.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {chatOpen && (
+          <div className="jc-chat-popover" role="dialog" aria-label="ประวัติสนทนากับเลขาน้องตี๋">
+            <div className="jc-pop-head">
+              <div className="jc-pop-title">
+                <b>🧑‍💼 น้องตี๋ · ประวัติสนทนา</b>
+                <span className={`jc-voice-pill${voiceEngineOnline ? " online" : ""}`}>
+                  {voiceEngineOnline ? "OmniVoice GPU" : "Active"}
+                </span>
+              </div>
+              <button type="button" className="jm-close-btn" onClick={() => setChatOpen(false)} aria-label="ปิดหน้าต่างแชท">
+                ✕
+              </button>
+            </div>
+            <div className="jc-chat-stream" ref={chatScrollRef}>
+              {turns.length === 0 ? (
+                <div className="jc-chat-welcome">
+                  <p className="jc-greet-bubble">
+                    <strong>🟢 สวัสดีครับ! น้องตี๋พร้อมรับคำสั่งแล้วครับ 🙏</strong>
+                    <br />
+                    พูดสั่งด้วยเสียงได้เลย หรือกด <b>📷 ส่องกล้อง / ส่งรูปสินค้า</b> ถ้าน้องตี๋เห็นรูปสินค้าจะวิ่งค้นในสมองและหยิบมาให้เลือกใส่ตะกร้าทันทีครับ!
+                  </p>
+                  <div className="jc-vision-quick-row">
+                    <button
+                      type="button"
+                      className="btn primary jc-vbtn-main"
+                      onClick={() => {
+                        setChatOpen(false);
+                        setStageMode("camera");
+                      }}
+                    >
+                      📷 เปิดกล้องส่องหาสินค้า
+                    </button>
+                    <button
+                      type="button"
+                      className="btn jc-vbtn-sub"
+                      disabled={visionUploading}
+                      onClick={() => quickPhotoInputRef.current?.click()}
+                    >
+                      {visionUploading ? "🔍 กำลังค้นรูป…" : "🖼️ เลือกรูปสินค้าไปหาเลย"}
+                    </button>
+                  </div>
+                  <div className="jc-scenario-list">
+                    {QUICK_SCENARIOS.map((sc) => (
+                      <button
+                        key={sc.label}
+                        type="button"
+                        className="jc-scenario-btn"
+                        onClick={() => {
+                          setChatOpen(false);
+                          void sendTurn(sc.prompt);
+                        }}
+                      >
+                        <span>{sc.icon}</span>
+                        <span>{sc.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                turns.map((t) => (
+                  <article key={t.id} className="jc-turn-card">
+                    <div className="jc-u-msg">
+                      {t.imagePreview && (
+                        <img src={t.imagePreview} alt="รูปสินค้าที่ค้นหา" className="jc-u-thumb" />
+                      )}
+                      <div>
+                        <span>คุณ:</span> {t.userText}
+                      </div>
+                    </div>
+                    <div className="jc-b-msg">
+                      <div className="jc-b-head">
+                        <div className="jc-b-head-left">
+                          <b>🧑‍💼 น้องตี๋</b>
+                          {(t.spokenText || t.error) && t.model && (
+                            <span
+                              className={`jc-turn-engine p-${t.provider || "local"}`}
+                              title={
+                                t.fallbackReason
+                                  ? `${t.model} (สำรองเพราะ: ${t.fallbackReason})`
+                                  : `${t.model}${t.tps ? ` · ${t.tps} t/s` : ""}`
+                              }
+                            >
+                              {t.provider === "ram"
+                                ? "⚡ สมองด่วน"
+                                : t.provider === "fallback"
+                                  ? "🟡 สำรอง"
+                                  : "🟢 gemma4"}
+                              {t.ms !== undefined ? ` · ${fmtMs(t.ms)}` : ""}
+                            </span>
+                          )}
+                        </div>
+                        {t.spokenText && (
+                          <button
+                            type="button"
+                            className="jc-replay-sm"
+                            onClick={() => enqueueOmniVoiceSentence(t.spokenText)}
+                          >
+                            🔊 ฟังเสียง
+                          </button>
+                        )}
+                      </div>
+                      {t.error ? (
+                        <p className="jm-error">{t.error}</p>
+                      ) : (
+                        <p className="jc-b-spoken">
+                          {t.spokenText || "น้องตี๋กำลังค้นสมองและเตรียมคำตอบสักครู่ครับ…"}
+                        </p>
+                      )}
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {devLogOpen && (
+          <div className="jc-dev-popover" role="region" aria-label="บันทึกการทำงาน AI (Dev Log)">
+            <div className="jc-dev-drawer-head">
+              <b>
+                บันทึกการทำงาน AI (.data/llm-dev.jsonl) · L:{llmStatus.stats.localTurns} R:{llmStatus.stats.ramTurns} B:{llmStatus.stats.fallbackTurns}
+              </b>
+              <div className="jc-dev-drawer-acts">
+                <button
+                  type="button"
+                  className="jc-dev-mini-btn"
+                  disabled={devLogsLoading}
+                  onClick={() => void refreshDevLogs()}
+                >
+                  {devLogsLoading ? "…" : "รีเฟรช"}
+                </button>
+                <button type="button" className="jc-dev-mini-btn" onClick={() => setDevLogOpen(false)}>
+                  ปิด
+                </button>
+              </div>
+            </div>
+            <div className="jc-dev-log-list">
+              {devLogs.length === 0 ? (
+                <p className="jc-dev-empty">ยังไม่มีรายการบันทึก AI ล่าสุด (ลองค้นหาหรือคุยกับน้องตี๋ครับ)</p>
+              ) : (
+                devLogs.map((row, idx) => (
+                  <div key={`${row.ts || idx}-${row.phase}-${idx}`} className="jc-dev-row" data-err={row.ok === false ? "1" : undefined}>
+                    <span className="jc-dev-time">
+                      {row.ts ? new Date(row.ts).toLocaleTimeString("th-TH", { hour12: false }) : "--:--:--"}
+                    </span>
+                    <span className="jc-dev-phase">{PHASE_LABEL_TH[row.phase] || row.phase}</span>
+                    <span className={`jc-dev-prov p-${row.provider}`}>
+                      {row.provider === "local" ? "Local" : row.provider === "fallback" ? "สำรอง" : "RAM"}
+                    </span>
+                    <span className="jc-dev-model">{row.model}</span>
+                    <span className="jc-dev-ms">
+                      {row.ms}ms{row.tps ? ` · ${row.tps}t/s` : ""}
+                    </span>
+                    {row.query && <span className="jc-dev-q">“{row.query}”</span>}
+                    {row.toolCalls && row.toolCalls.length > 0 && (
+                      <span className="jc-dev-tools">[{row.toolCalls.join(", ")}]</span>
+                    )}
+                    {row.fallbackReason && <span className="jc-dev-warn">สำรอง: {row.fallbackReason}</span>}
+                    {row.error && <span className="jc-dev-err">ERR: {row.error}</span>}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Mobile-only View Switcher (< 768px): Products vs Cart */}
+      <nav className="jc-mobile-tabs" aria-label="สลับมุมมองบนมือถือ">
+        <button
+          type="button"
+          className={`jc-mtab${mobileTab === "stage" ? " active" : ""}`}
+          aria-pressed={mobileTab === "stage"}
+          onClick={() => setMobileTab("stage")}
+        >
+          🛍️ สินค้า{stageCards.length > 0 ? ` (${stageCards.length})` : ""}
+        </button>
+        <button
+          type="button"
+          className={`jc-mtab${mobileTab === "cart" ? " active" : ""}`}
+          aria-pressed={mobileTab === "cart"}
+          onClick={() => setMobileTab("cart")}
+        >
+          🛒 ตะกร้า
+          {cart.itemCount > 0 && (
+            <>
+              {" "}
+              <span key={cart.itemCount} className="mb-count-bump">
+                ({cart.itemCount})
+              </span>
+            </>
+          )}
+        </button>
+      </nav>
+
+      <div className="jc-grid" data-mtab={mobileTab}>
         {/* ==================== CENTER COLUMN: CONTEXT-DRIVEN VISUAL STAGE ==================== */}
         <section className="jc-stage" aria-label="หน้าจอแสดงภาพตามบริบทการสนทนา">
           <div className="jc-hist-nav" aria-label="ประวัติหน้าจอ">
@@ -1920,7 +2898,10 @@ export default function JavisSalesCockpit({
               onClick={() => setStageMode("cart")}
               data-cart-target
             >
-              🛒 ตะกร้า ({cart.itemCount})
+              🛒 ตะกร้า
+              <span key={cart.itemCount} className="mb-count-bump">
+                ({cart.itemCount})
+              </span>
             </button>
             <button
               type="button"
@@ -2018,6 +2999,9 @@ export default function JavisSalesCockpit({
                     </p>
                   </div>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button type="button" className="btn" onClick={() => void showRelated(undefined)}>
+                      🔗 สินค้าเกี่ยวข้องทั้งหมด
+                    </button>
                     <button type="button" className="btn" onClick={() => setStageMode("camera")}>
                       📷 ส่องกล้องหาสินค้า
                     </button>
@@ -2029,82 +3013,27 @@ export default function JavisSalesCockpit({
                   </div>
                 </div>
 
-                <div className="st-cards-grid">
-                  {stageCards.map((c, cardIdx) => (
-                    <article
-                      key={c.slug}
-                      data-slug={c.slug}
-                      className={`st-card${actionFx.some((fx) => fx.slug === c.slug) ? ` fx-${actionFx.findLast((fx) => fx.slug === c.slug)!.kind}` : ""}`}
-                    >
-                      <button
-                        type="button"
-                        className="st-img-btn"
-                        onClick={() => {
-                          setSpotlight(c);
-                          setStageMode("spotlight");
-                        }}
-                      >
-                        {c.imageUrl ? <img src={c.imageUrl} alt={c.title} loading="lazy" /> : <span>📦</span>}
-                        <span className="p-no-badge" aria-label={`เบอร์ ${cardIdx + 1}`}>
-                          {cardIdx + 1}
-                        </span>
-                        {c.unitOptions.length > 1 && (
-                          <span className="p-multi-badge">{c.unitOptions.length} หน่วยนับ</span>
-                        )}
-                      </button>
+                <ProductCardGrid
+                  cards={stageCards}
+                  reasons={stageTitle === "🔗 สมองแนะนำของที่เกี่ยวข้อง" ? related?.reasons : undefined}
+                  actionFx={actionFx}
+                  onAdd={promptAddToCart}
+                  onDetail={openProductSpotlight}
+                />
 
-                      <div className="st-card-body">
-                        <div className="p-meta-top">
-                          <span className="p-brand">{c.brand}</span>
-                          <span className="p-unit-chip">{c.unitLabel}</span>
-                        </div>
-                        <h3
-                          onClick={() => {
-                            setSpotlight(c);
-                            setStageMode("spotlight");
-                          }}
-                        >
-                          {c.title}
-                        </h3>
-                        <div className="p-price-row">
-                          <span className="p-price">{c.priceLabel}</span>
-                          <span className="p-per-unit">/{c.unitCode}</span>
-                          {c.pricePerBaseLabel && <span className="p-base-calc">({c.pricePerBaseLabel})</span>}
-                        </div>
-
-                        {c.traits.length > 0 && (
-                          <div className="p-traits">
-                            {c.traits.slice(0, 3).map((tr, idx) => (
-                              <span key={`${tr}-${idx}`} className="p-trait-tag">
-                                {tr}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-
-                        <div className="st-card-actions">
-                          <button
-                            type="button"
-                            className="btn primary st-add-btn"
-                            onClick={() => promptAddToCart(c)}
-                          >
-                            🛒 ใส่ตะกร้า (เลือกจำนวน)
-                          </button>
-                          <button
-                            type="button"
-                            className="p-btn-detail"
-                            onClick={() => {
-                              setSpotlight(c);
-                              setStageMode("spotlight");
-                            }}
-                          >
-                            ดูละเอียด
-                          </button>
-                        </div>
-                      </div>
-                    </article>
-                  ))}
-                </div>
+                {showcaseRelatedShown.length > 0 && stageRelated && (
+                  <RelatedStrip
+                    title="🔗 สินค้าที่เกี่ยวข้องจากสมอง"
+                    startNo={stageCards.length + 1}
+                    cards={showcaseRelatedShown}
+                    reasons={stageRelated.set.reasons}
+                    totalCount={showcaseRelatedAll.length}
+                    actionFx={actionFx}
+                    onAdd={promptAddToCart}
+                    onDetail={openProductSpotlight}
+                    onShowAll={() => void showRelated(undefined)}
+                  />
+                )}
               </div>
             )}
 
@@ -2198,12 +3127,14 @@ export default function JavisSalesCockpit({
                   </div>
                 </div>
 
-                {spotRelated?.slug === spotlight.slug && (
+                {spotRelatedShown.length > 0 && spotRelated && (
                   <RelatedStrip
-                    cards={spotRelated.set.cards}
+                    cards={spotRelatedShown}
                     reasons={spotRelated.set.reasons}
-                    excludeSlugs={[spotlight.slug]}
+                    totalCount={spotRelatedAll.length}
+                    actionFx={actionFx}
                     onAdd={promptAddToCart}
+                    onDetail={openProductSpotlight}
                     onShowAll={() => void showRelated(undefined)}
                   />
                 )}
@@ -2359,12 +3290,14 @@ export default function JavisSalesCockpit({
                   </>
                 )}
 
-                {related && (
+                {cartRelatedShown.length > 0 && related && (
                   <RelatedStrip
-                    cards={related.cards}
+                    cards={cartRelatedShown}
                     reasons={related.reasons}
-                    excludeSlugs={cart.items.map((it) => it.slug)}
+                    totalCount={cartRelatedAll.length}
+                    actionFx={actionFx}
                     onAdd={promptAddToCart}
+                    onDetail={openProductSpotlight}
                     onShowAll={() => void showRelated(undefined)}
                   />
                 )}
@@ -2467,7 +3400,9 @@ export default function JavisSalesCockpit({
                       )}
                       <div className="chk-total-line">
                         <span>ยอดสุทธิทั้งสิ้น</span>
-                        <strong>{cart.grandTotalFormatted}</strong>
+                        <strong key={cart.grandTotalFormatted} className="mb-total-pulse">
+                          {cart.grandTotalFormatted}
+                        </strong>
                       </div>
                       <button
                         type="button"
@@ -2582,7 +3517,12 @@ export default function JavisSalesCockpit({
         {/* ==================== RIGHT COLUMN (DESKTOP): PERSISTENT LIVE CART ==================== */}
         <aside className="jc-right-cart" aria-label="ตะกร้าสินค้าสด">
           <div className="rcart-head">
-            <h3>🛒 ตะกร้าสด ({cart.itemCount})</h3>
+            <h3>
+              🛒 ตะกร้าสด{" "}
+              <span key={cart.itemCount} className="mb-count-bump">
+                ({cart.itemCount})
+              </span>
+            </h3>
             {cart.items.length > 0 && (
               <button type="button" className="btn-reset-sm" onClick={clearCart}>
                 ล้าง
@@ -2625,7 +3565,9 @@ export default function JavisSalesCockpit({
           <div className="rcart-foot">
             <div className="rcart-total">
               <span>ยอดรวมสุทธิ</span>
-              <strong>{cart.grandTotalFormatted}</strong>
+              <strong key={cart.grandTotalFormatted} className="mb-total-pulse">
+                {cart.grandTotalFormatted}
+              </strong>
             </div>
             <button
               type="button"
@@ -2698,6 +3640,21 @@ export default function JavisSalesCockpit({
           </div>
         </div>
       )}
+
+      <audio ref={ttsAudioRef} playsInline preload="auto" hidden />
+
+      <FloatingJavisHud
+        state={hudState}
+        micLive={callActive && !micMuted}
+        userLevelRef={userLevelRef}
+        botLevelGetterRef={botLevelGetterRef}
+        satelliteEvent={hudSatEvent}
+        onClickToggle={() => {
+          unlockAudioPlayback();
+          if (!callActiveRef.current) void startLiveCall();
+          else toggleMicMute();
+        }}
+      />
     </div>
   );
 }

@@ -17,11 +17,13 @@ export default function DevicePickerPopover({
   onOpenCameraScanner,
   onSelectPhotoFile,
   buttonClassName = "jc-ctrl-pill",
+  iconOnly = false,
 }: {
   activeMicStream?: MediaStream | null;
   onOpenCameraScanner?: () => void;
   onSelectPhotoFile?: (file: File) => void;
   buttonClassName?: string;
+  iconOnly?: boolean;
 }) {
   const {
     micDeviceId,
@@ -238,10 +240,11 @@ export default function DevicePickerPopover({
         type="button"
         className={`${buttonClassName}${open ? " active" : ""}`}
         aria-expanded={open}
-        aria-label="ตั้งค่าไมค์ ลำโพง และกล้องส่องสินค้า"
+        aria-label="ตั้งค่าอุปกรณ์ ไมค์ ลำโพง และกล้องส่องสินค้า"
+        title="ตั้งค่าอุปกรณ์ (ไมค์ · ลำโพง · กล้อง)"
         onClick={() => setOpen((v) => !v)}
       >
-        ⚙️ อุปกรณ์
+        {iconOnly ? <span aria-hidden="true">⚙️</span> : "⚙️ อุปกรณ์"}
       </button>
 
       <input

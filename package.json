@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "next dev -p 3090",
     "scan": "node scripts/scan-secrets.mjs",
-    "prebuild": "node scripts/scan-secrets.mjs",
+    "sync:vad": "node scripts/sync-vad-assets.mjs",
+    "postinstall": "node scripts/sync-vad-assets.mjs",
+    "prebuild": "node scripts/scan-secrets.mjs && node scripts/sync-vad-assets.mjs",
     "build": "next build",
     "start": "next start -p 3090",
     "typecheck": "tsc --noEmit",
@@ -19,6 +21,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
+    "@ricky0123/vad-web": "^0.0.31",
     "decimal.js": "^10.5.0",
     "marked": "18.1.2",
     "mongodb": "^6.16.0",

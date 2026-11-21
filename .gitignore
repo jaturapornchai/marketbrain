@@ -12,3 +12,6 @@ voice_sidecar/__pycache__/
 *.log
 next-env.d.ts
 *.tsbuildinfo
+public/vad/*.wasm
+public/vad/*.onnx
+public/vad/ort-*.mjs

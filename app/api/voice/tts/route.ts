@@ -1,3 +1,4 @@
+import { GREET_TEXT_CANONICAL, recordServerTts } from "@/lib/recent-tts";
 import { toSpokenThai } from "@/lib/spoken-thai";
 
 export const dynamic = "force-dynamic";
@@ -8,6 +9,7 @@ export async function GET(): Promise<Response> {
   try {
     const res = await fetch(`${VOICE_URL}/greet.wav`, { cache: "no-store" });
     if (!res.ok) return Response.json({ error: "Voice service unavailable" }, { status: 503 });
+    recordServerTts(GREET_TEXT_CANONICAL);
     const dur = res.headers.get("X-Audio-Duration") || "3.5";
     return new Response(await res.arrayBuffer(), {
       headers: {
@@ -40,6 +42,10 @@ export async function POST(req: Request): Promise<Response> {
 
     const dur = res.headers.get("X-Audio-Duration") || "2.0";
     const genMs = res.headers.get("X-Gen-Ms") || "0";
+    // Skip recording synthetic UAT/test probes (x-skip-echo-record: 1) so automated TTS->STT round-trip tests pass cleanly.
+    if (req.headers.get("x-skip-echo-record") !== "1") {
+      recordServerTts(text);
+    }
     return new Response(await res.arrayBuffer(), {
       headers: {
         "Content-Type": "audio/wav",
