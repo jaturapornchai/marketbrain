@@ -2,8 +2,9 @@
 
 Uses the exact same local models and voice cloning setup as d:/bctest01 (javis01):
 - TTS: hotdogs/omnivoice-thai on CUDA fp16 cloned from ref_audio.wav (step=12, cfg=2.0, speed=1.0, RMS=0.16)
-- STT (live partial captions + fallback): iapp/OpenThai2.0-ASR-Streaming-ONNX on CPU ONNX Runtime + Silero VAD
-- STT (final transcript): typhoon-ai/typhoon-whisper-turbo (CTranslate2) on CUDA; falls back to OpenThai if it cannot load
+- STT Ear 1 (final transcript GPU): typhoon-ai/typhoon-whisper-turbo (CTranslate2) on CUDA
+- STT Ear 2 (live partial captions + CPU fallback): iapp/OpenThai2.0-ASR-Streaming-ONNX (th-TH) + Silero VAD
+- STT Ear 3 (batched CPU English/Thai mix): iapp/OpenThai2.0-ASR-Streaming-ONNX (th-mix) via B=2 encoder pass
 """
 import asyncio
 import gc
@@ -50,7 +51,7 @@ STT_MODEL_DIR = os.environ.get("STT_MODEL_DIR", r"d:\bctest01\models\openthai2_a
 STT_FINAL_MODEL_DIR = os.environ.get(
     "STT_FINAL_MODEL_DIR", os.path.join(os.path.dirname(HERE), ".data", "models", "typhoon-whisper-turbo-ct2")
 )
-WHISPER_BEAM_SIZE = max(1, int(os.environ.get("STT_BEAM_SIZE", "3")))
+WHISPER_BEAM_SIZE = max(1, int(os.environ.get("STT_BEAM_SIZE", "2")))
 WHISPER_INITIAL_PROMPT = os.environ.get(
     "STT_INITIAL_PROMPT",
     "ร้านค้าส่งปลีกไทย สว่านไฟฟ้า ข้องอ 4 หุน กระดาษชำระ น้ำมันพืช น้ำปลา ไม้จิ้มฟัน แชมพูขจัดรังแค คันหัว คันเท้า บรีสเอกเซล เครื่องปั่นไฟ",
@@ -172,15 +173,6 @@ print("[voice_service] Loading OpenThai 2.0 ASR Streaming (CPU ONNX)...", flush=
 stt_engine = OpenThaiASR(STT_MODEL_DIR, lang="th-TH", intra_threads=8)
 
 has_cuda = torch.cuda.is_available()
-print(f"[voice_service] Loading OmniVoice ({TTS_MODEL_ID}) on {'cuda:0' if has_cuda else 'cpu'}...", flush=True)
-kw = dict(device_map="cuda:0" if has_cuda else "cpu", dtype=torch.float16 if has_cuda else torch.float32)
-try:
-    tts_model = OmniVoice.from_pretrained(TTS_MODEL_ID, local_files_only=True, **kw)
-except Exception:
-    tts_model = OmniVoice.from_pretrained(TTS_MODEL_ID, **kw)
-
-voice_prompt = tts_model.create_voice_clone_prompt(ref_audio=REF_AUDIO_PATH, ref_text=REF_TEXT)
-tts_lock = threading.Lock()
 
 
 def load_final_stt():
@@ -200,12 +192,22 @@ def load_final_stt():
         return None
 
 
-# Loaded after TTS so the voice keeps VRAM priority when the GPU is nearly full.
+# Load Whisper CT2 FIRST so its ~950 MB int8_float16 weights stay in dedicated GPU VRAM (avoids WDDM shared-RAM 3.5s slowdown).
 final_stt = load_final_stt()
 final_stt_lock = threading.Lock()
 stt_partial_lock = threading.Lock()
 vad_lock = threading.Lock()
 stt_executor = ThreadPoolExecutor(max_workers=2)
+
+print(f"[voice_service] Loading OmniVoice ({TTS_MODEL_ID}) on {'cuda:0' if has_cuda else 'cpu'}...", flush=True)
+kw = dict(device_map="cuda:0" if has_cuda else "cpu", dtype=torch.float16 if has_cuda else torch.float32)
+try:
+    tts_model = OmniVoice.from_pretrained(TTS_MODEL_ID, local_files_only=True, **kw)
+except Exception:
+    tts_model = OmniVoice.from_pretrained(TTS_MODEL_ID, **kw)
+
+voice_prompt = tts_model.create_voice_clone_prompt(ref_audio=REF_AUDIO_PATH, ref_text=REF_TEXT)
+tts_lock = threading.Lock()
 
 
 def _clean_whisper_hallucination(text: str) -> str:
@@ -270,46 +272,76 @@ def _transcribe_whisper(pcm: np.ndarray) -> str:
         return ""
 
 
+def _normalize_asr_text(raw: str) -> str:
+    return unicodedata.normalize("NFC", _clean_whisper_hallucination(raw.strip()))
+
+
 def _transcribe_openthai(pcm: np.ndarray) -> str:
     try:
         with stt_partial_lock:
-            raw = stt_engine.transcribe(pcm).strip()
-        return unicodedata.normalize("NFC", _clean_whisper_hallucination(raw))
+            raw = stt_engine.transcribe(pcm)
+        return _normalize_asr_text(raw)
     except Exception as exc:
         print(f"[voice_service] OpenThai STT failed ({exc})", flush=True)
         return ""
 
 
-def transcribe_dual(pcm: np.ndarray) -> dict:
-    """Run GPU Typhoon-Whisper (Ear 1) concurrently with CPU OpenThai 2.0 (Ear 2)."""
+def _transcribe_openthai_pair(pcm: np.ndarray) -> tuple[str, str, int, int]:
+    try:
+        with stt_partial_lock:
+            raw_th, raw_mix, ms_th, ms_mix = stt_engine.transcribe_dual_prompts(pcm)
+        return _normalize_asr_text(raw_th), _normalize_asr_text(raw_mix), ms_th, ms_mix
+    except Exception as exc:
+        print(f"[voice_service] OpenThai dual-prompt STT failed ({exc})", flush=True)
+        return "", "", 0, 0
+
+
+def transcribe_triple(pcm: np.ndarray) -> dict:
+    """Run GPU Typhoon-Whisper (Ear 1) concurrently with batched CPU OpenThai th-TH (Ear 2) + th-mix (Ear 3)."""
     if final_stt is None:
-        t0 = time.perf_counter()
-        ear2 = _transcribe_openthai(pcm)
-        ms2 = round((time.perf_counter() - t0) * 1000)
-        return {"text": ear2, "altText": "", "ear1": "", "ear2": ear2, "ear1Ms": 0, "ear2Ms": ms2}
+        ear2, ear3, ms2, ms3 = _transcribe_openthai_pair(pcm)
+        primary = ear2 or ear3
+        alt = ear3 if ear2 and ear3 and ear3 != ear2 else ""
+        return {
+            "text": primary,
+            "altText": alt,
+            "ear1": "",
+            "ear2": ear2,
+            "ear3": ear3,
+            "ear1Ms": 0,
+            "ear2Ms": ms2,
+            "ear3Ms": ms3,
+        }
 
     def run_ear1() -> tuple[str, int]:
         t0 = time.perf_counter()
         return _transcribe_whisper(pcm), round((time.perf_counter() - t0) * 1000)
 
-    def run_ear2() -> tuple[str, int]:
-        t0 = time.perf_counter()
-        return _transcribe_openthai(pcm), round((time.perf_counter() - t0) * 1000)
+    def run_ear23() -> tuple[str, str, int, int]:
+        return _transcribe_openthai_pair(pcm)
 
     fut1 = stt_executor.submit(run_ear1)
-    fut2 = stt_executor.submit(run_ear2)
+    fut23 = stt_executor.submit(run_ear23)
     ear1, ear1_ms = fut1.result()
-    ear2, ear2_ms = fut2.result()
-    primary = ear1 or ear2
-    alt = ear2 if ear1 and ear2 and ear2 != ear1 else ""
+    ear2, ear3, ear2_ms, ear3_ms = fut23.result()
+    primary = ear1 or ear2 or ear3
+    alts: list[str] = []
+    for cand in (ear2, ear3):
+        if cand and cand != primary and cand not in alts:
+            alts.append(cand)
     return {
         "text": primary,
-        "altText": alt,
+        "altText": " / ".join(alts),
         "ear1": ear1,
         "ear2": ear2,
+        "ear3": ear3,
         "ear1Ms": ear1_ms,
         "ear2Ms": ear2_ms,
+        "ear3Ms": ear3_ms,
     }
+
+
+transcribe_dual = transcribe_triple
 
 
 def _trim_silence(arr: np.ndarray, top_db: float = 40.0) -> np.ndarray:
@@ -439,7 +471,11 @@ def health():
         "device": "cuda:0" if has_cuda else "cpu",
         "sttModel": "typhoon-whisper-turbo" if final_stt is not None else "OpenThai2.0-ASR-Streaming-ONNX",
         "sttPartialModel": "OpenThai2.0-ASR-Streaming-ONNX",
+        "sttEar2Model": "OpenThai2.0-ASR-Streaming-ONNX (th-TH)",
+        "sttEar3Model": "OpenThai2.0-ASR-Streaming-ONNX (th-mix)",
         "sttDualEar": final_stt is not None,
+        "sttTripleEar": final_stt is not None,
+        "sttEarCount": 3 if final_stt is not None else 2,
         "sttBeamSize": WHISPER_BEAM_SIZE,
         "greetText": GREET_TEXT,
         "greetDur": GREET_DUR,
@@ -529,11 +565,11 @@ def _process_stt(raw: bytes, sr_header: int, fmt: str, is_partial: bool) -> dict
         finally:
             stt_partial_lock.release()
     else:
-        # Dual-Ear final STT: run GPU Typhoon-Whisper (Ear 1) in parallel with CPU OpenThai 2.0 (Ear 2).
-        dual = transcribe_dual(pcm)
+        # Triple-Ear final STT: GPU Typhoon-Whisper (Ear 1) concurrent with batched CPU OpenThai th-TH (Ear 2) + th-mix (Ear 3).
+        triple = transcribe_triple(pcm)
         return {
-            **dual,
-            "voiced": bool(dual["text"] or dual["ear2"]),
+            **triple,
+            "voiced": bool(triple["text"] or triple["ear2"] or triple["ear3"]),
         }
     text = unicodedata.normalize("NFC", _clean_whisper_hallucination(text))
     return {"text": text, "voiced": bool(text)}

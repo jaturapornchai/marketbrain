@@ -699,7 +699,7 @@ function markLocalLlmCold(): void {
   w.checkedPsAt = Date.now();
 }
 
-async function isLocalModelLoadedNow(cfg: LlmConfig): Promise<boolean> {
+export async function isLocalModelLoadedNow(cfg: LlmConfig): Promise<boolean> {
   const w = warmStore();
   const now = Date.now();
   if (now - w.checkedPsAt < 5000) return w.warmed;
@@ -932,7 +932,7 @@ async function planSwarmQueries(
   const recentTalk = history
     .slice(-2)
     .map((m) => `${m.role === "user" ? "ล" : "ต"}: ${m.content.split(SCREEN_MARK)[0].trim().slice(0, 90)}`);
-  const altHint = altTrimmed && altTrimmed !== trimmed ? [`หูที่สองได้ยินว่า: ${altTrimmed.slice(0, 160)}`] : [];
+  const altHint = altTrimmed && altTrimmed !== trimmed ? [`หูสำรองได้ยินว่า: ${altTrimmed.slice(0, 160)}`] : [];
   const plannerUserContent = [...recentTalk, `ล่าสุด: ${trimmed.slice(0, 160)}`, ...altHint].join("\n");
 
   const tLocal = performance.now();
@@ -2008,7 +2008,7 @@ export async function* runNongTeeTurn(opts: {
     .filter(Boolean)
     .join("\n");
 
-  const altHeardNote = altText && altText !== userText ? `\n(หมายเหตุหูที่สองได้ยิน: ${altText.slice(0, 160)})` : "";
+  const altHeardNote = altText && altText !== userText ? `\n(หมายเหตุหูสำรองได้ยิน: ${altText.slice(0, 160)})` : "";
   const llmMessages: Array<Record<string, unknown>> = [
     { role: "system", content: NONG_TEE_SYSTEM_PROMPT },
     ...history,

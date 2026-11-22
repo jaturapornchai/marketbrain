@@ -235,6 +235,7 @@ export type ProductSearchQuery = {
   dietary?: DietaryTagId[];
   scope?: SearchScope;
   noAutoCorrect?: boolean;
+  skipFacets?: boolean;
   sort?: "relevance" | "price_asc" | "price_desc" | "unit_price_asc" | "pack_desc";
   page?: number;
   pageSize?: number;
@@ -2531,7 +2532,9 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
 
   const allowedCatSet = category ? (b.categoryDescendantSlugs.get(category) ?? new Set([category])) : null;
 
-  // Filter and simultaneously aggregate dynamic facet counts
+  const skipFacets = Boolean(params.skipFacets) && sort === "relevance";
+
+  // Filter and simultaneously aggregate dynamic facet counts (skipped cleanly on skipFacets fast-path)
   const catCounts = new Map<string, number>();
   const brandCounts = new Map<string, { label: string; count: number }>();
   const unitCounts = new Map<string, { label: string; count: number }>();
@@ -2540,6 +2543,9 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
   const badgeCounts = new Int32Array(SEMANTIC_BADGE_DEFS.length);
 
   const matchedIndices: number[] = [];
+  let fastTotal = 0;
+  let bestIdx = -1;
+  let bestScore = -1;
   const hasSizeTerm = qTerms.some((t) => t.startsWith("sz_"));
   const strictOnly = (sort !== "relevance" || hasSizeTerm) && strictCount > 0 ? strictMatch : null;
 
@@ -2589,6 +2595,23 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
     }
     if (!passDietary) continue;
 
+    const passAll = passBadges && passCat && passBrand && passUnit && passTraits && passSource;
+    if (skipFacets) {
+      if (passAll) {
+        fastTotal++;
+        const sc = scores ? scores[i] : p.confidenceScore;
+        if (
+          bestIdx < 0 ||
+          sc > bestScore ||
+          (sc === bestScore && p.confidenceScore > b.productsList[bestIdx].confidenceScore)
+        ) {
+          bestIdx = i;
+          bestScore = sc;
+        }
+      }
+      continue;
+    }
+
     // Count facets with contextual cross-filtering
     if (passBadges && passBrand && passUnit && passTraits && passSource) {
       for (const cs of p.categorySlugs) catCounts.set(cs, (catCounts.get(cs) ?? 0) + 1);
@@ -2627,9 +2650,23 @@ export function searchProductsDetailed(params: ProductSearchQuery): ProductSearc
       }
     }
 
-    if (passBadges && passCat && passBrand && passUnit && passTraits && passSource) {
+    if (passAll) {
       matchedIndices.push(i);
     }
+  }
+
+  if (skipFacets && (fastTotal > 0 || params.noAutoCorrect)) {
+    return {
+      total: fastTotal,
+      page: 1,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(fastTotal / pageSize)),
+      appliedTerms: qTerms,
+      topStrongMatch: !hasQuerySignals || (bestIdx >= 0 && Boolean(strongTitleMatch?.[bestIdx])),
+      elapsedMs: Math.max(1, Math.round(performance.now() - t0)),
+      items: bestIdx >= 0 ? [b.productsList[bestIdx]] : [],
+      facets: { categories: [], brands: [], units: [], traits: [], sources: [], badges: [] },
+    };
   }
 
   // Zero-result smart auto-recovery: keyboard layout flip -> bounded Damerau-Levenshtein/phonetic typo fix

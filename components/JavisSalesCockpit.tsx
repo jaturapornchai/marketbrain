@@ -1540,8 +1540,8 @@ export default function JavisSalesCockpit({
       const IDLE_PREROLL_FRAMES = 10; // 320 ms ring buffer so first syllables are never clipped
       const MIN_ONSET_FRAMES = 5; // 160 ms of real voice before opening STT (blocks clicks/knocks)
       const MIN_FINAL_VOICED_FRAMES = 7; // ~224 ms minimum voiced speech to finalize a turn
-      const EARLY_STT_SILENCE_MS = 240; // start speculative GPU Whisper STT early (0 ms wait at turn end)
-      const SILENCE_END_MS = 540; // snappy end-of-turn confirmation after silence
+      const EARLY_STT_SILENCE_MS = 200; // start speculative GPU Whisper STT early (0 ms wait at turn end)
+      const SILENCE_END_MS = 460; // snappy end-of-turn confirmation after silence
       const MAX_UTTERANCE_FRAMES = 480; // ~15 s safety cap so ambient noise never builds huge STT buffers
 
       const echoGuard = new EchoGuard();

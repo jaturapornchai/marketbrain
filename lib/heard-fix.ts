@@ -764,12 +764,18 @@ export function fixHeard(heard: string, vocab?: HeardVocab | null): string {
   return vocab ? snapLatinBrands(snapToCatalog(t, vocab), vocab) : t;
 }
 
+export function isProtectedCommandSpeech(text: string): boolean {
+  const clean = text.trim();
+  return Boolean(clean && (isDecision(clean) || fixCommandWords(clean)));
+}
+
+export type EarId = "ear1" | "ear2" | "ear3";
 export type DualEarScore = { strong: boolean; total: number };
 export type DualEarScoreFn = (q: string) => DualEarScore;
 export type DualEarChoice = {
   text: string;
   altText: string;
-  picked: "ear1" | "ear2";
+  picked: EarId;
 };
 
 const SPOKEN_MULTI_DIGIT_RE = /(?:หนึ่ง|เอ็ด|สอง|ยี่|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า){2,}/;
@@ -790,50 +796,114 @@ function maxCatalogBrandLen(text: string, vocab: HeardVocab): number {
   return best;
 }
 
+function buildAltHeardText(chosenText: string, ...others: string[]): string {
+  const chosenCompact = chosenText.replace(/\s+/g, "");
+  const out: string[] = [];
+  for (const o of others) {
+    if (!o) continue;
+    const oCompact = o.replace(/\s+/g, "");
+    if (oCompact === chosenCompact) continue;
+    if (out.some((prev) => prev.replace(/\s+/g, "") === oCompact)) continue;
+    out.push(o);
+  }
+  return out.join(" / ");
+}
+
 /**
- * Dual-Ear Smart Arbiter: fix both GPU Typhoon-Whisper (Ear 1) and CPU OpenThai 2.0 (Ear 2),
- * guard against Ear 2 fusing spoken digits (e.g. "หกสอง" -> "62"), and let stronger catalog match win.
+ * Triple-Ear Smart Arbiter: fix GPU Typhoon-Whisper (Ear 1), CPU OpenThai th-TH (Ear 2),
+ * and CPU OpenThai th-mix (Ear 3); guard against fused spoken digits on OpenThai ears;
+ * and pick the strongest catalog/brand/model match cleanly.
  */
 export function chooseBestHeard(
   ear1Raw: string,
   ear2Raw: string,
   vocab?: HeardVocab | null,
   scoreFn?: DualEarScoreFn,
+  ear3Raw = "",
 ): DualEarChoice {
   const cleanDup = (s: string) => s.replace(TRAILING_DUP_POLITE_RE, "$1").trim();
   const f1 = ear1Raw.trim() ? cleanDup(fixHeard(ear1Raw, vocab)) : "";
-  const f2 = ear2Raw.trim() ? cleanDup(fixHeard(ear2Raw, vocab)) : "";
+  const f2Raw = ear2Raw.trim() ? cleanDup(fixHeard(ear2Raw, vocab)) : "";
+  const f3Raw = ear3Raw.trim() ? cleanDup(fixHeard(ear3Raw, vocab)) : "";
 
-  if (!f1 && !f2) return { text: "", altText: "", picked: "ear1" };
-  if (!f1) return { text: f2, altText: "", picked: "ear2" };
-  if (!f2 || f1 === f2) return { text: f1, altText: "", picked: "ear1" };
+  const isFusedDigits = (cand: string) =>
+    Boolean(cand) && /\d{2,}/.test(cand) && !/\d{2,}/.test(f1) && SPOKEN_MULTI_DIGIT_RE.test(f1);
+  const f2 = isFusedDigits(f2Raw) ? "" : f2Raw;
+  const f3 = isFusedDigits(f3Raw) ? "" : f3Raw;
 
-  // Guard against OpenThai fusing separate spoken Thai digits ("รับเบอร์หกสองชิ้น" -> "รับเบอร์ 62 ชิ้น").
-  const fusedDigitsInEar2 = /\d{2,}/.test(f2) && !/\d{2,}/.test(f1) && SPOKEN_MULTI_DIGIT_RE.test(f1);
-  if (fusedDigitsInEar2) {
+  if (!f1 && !f2 && !f3) return { text: "", altText: "", picked: "ear1" };
+
+  // Keep explicit screen/cart decision commands on Ear 1 unless Ear 1 is empty.
+  if (f1 && (isDecision(f1) || fixCommandWords(f1))) {
     return { text: f1, altText: "", picked: "ear1" };
   }
 
-  // Keep explicit screen/cart decision commands on Ear 1 unless Ear 2 produces an unmatched catalog hit.
-  if (isDecision(f1) || fixCommandWords(f1)) {
-    return { text: f1, altText: "", picked: "ear1" };
-  }
+  const hasAlt = Boolean((f2 && f2 !== f1) || (f3 && f3 !== f1));
+  if (scoreFn && (hasAlt || !f1)) {
+    const scoreCache = new Map<string, DualEarScore>();
+    const evalScore = (t: string): DualEarScore => {
+      if (!t) return { strong: false, total: 0 };
+      let hit = scoreCache.get(t);
+      if (!hit) {
+        hit = scoreFn(t);
+        scoreCache.set(t, hit);
+      }
+      return hit;
+    };
 
-  if (scoreFn) {
-    const s1 = scoreFn(f1);
-    const s2 = scoreFn(f2);
-    if (s2.strong && !s1.strong) {
-      return { text: f2, altText: f1, picked: "ear2" };
-    }
-    if (s2.strong && vocab) {
-      const b1 = maxCatalogBrandLen(f1, vocab);
-      const b2 = maxCatalogBrandLen(f2, vocab);
-      if (b2 >= 4 && b2 > b1 && (!s1.strong || s2.total <= s1.total)) {
-        return { text: f2, altText: f1, picked: "ear2" };
+    const s1 = evalScore(f1);
+    const b1 = f1 && vocab ? maxCatalogBrandLen(f1, vocab) : 0;
+
+    type CandEval = {
+      id: EarId;
+      text: string;
+      sc: DualEarScore;
+      brandLen: number;
+      hasLatin: boolean;
+    };
+    const winners: CandEval[] = [];
+    for (const [id, text] of [
+      ["ear2", f2],
+      ["ear3", f3],
+    ] as const) {
+      if (!text) continue;
+      const sc = evalScore(text);
+      const brandLen = vocab ? maxCatalogBrandLen(text, vocab) : 0;
+      const hasLatin = /[a-z]{3,}/i.test(text) || /(?:[a-z]\d|\d[a-z])/i.test(text);
+      const beatsEar1 =
+        !f1 ||
+        (sc.strong && !s1.strong) ||
+        (sc.strong && vocab && brandLen >= 4 && brandLen > b1 && sc.total <= s1.total) ||
+        (id === "ear3" && sc.strong && hasLatin && s1.strong && sc.total > 0 && sc.total < s1.total);
+      if (beatsEar1) {
+        winners.push({ id, text, sc, brandLen, hasLatin });
       }
     }
+
+    if (winners.length > 0) {
+      winners.sort((a, b) => {
+        if (a.sc.strong !== b.sc.strong) return a.sc.strong ? -1 : 1;
+        if (a.brandLen !== b.brandLen) return b.brandLen - a.brandLen;
+        if (a.sc.strong && a.sc.total !== b.sc.total) {
+          return (a.sc.total || 1e9) - (b.sc.total || 1e9);
+        }
+        if (a.hasLatin !== b.hasLatin) return a.hasLatin ? -1 : 1;
+        return a.id === "ear3" && b.id === "ear2" ? -1 : 0;
+      });
+      const best = winners[0];
+      return {
+        text: best.text,
+        altText: buildAltHeardText(best.text, f1, f2, f3),
+        picked: best.id,
+      };
+    }
   }
 
-  const sameNoSpace = f1.replace(/\s+/g, "") === f2.replace(/\s+/g, "");
-  return { text: f1, altText: sameNoSpace ? "" : f2, picked: "ear1" };
+  if (!f1) {
+    const primary = f2 || f3;
+    const picked: EarId = f2 ? "ear2" : "ear3";
+    return { text: primary, altText: buildAltHeardText(primary, f2, f3), picked };
+  }
+
+  return { text: f1, altText: buildAltHeardText(f1, f2, f3), picked: "ear1" };
 }

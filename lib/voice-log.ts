@@ -15,7 +15,7 @@ export type LlmProviderKind = "local" | "fallback" | "ram";
 
 export type LlmDevLogEntry = {
   ts?: string;
-  phase: "planner" | "chat_round" | "vision" | "turn_summary";
+  phase: "planner" | "chat_round" | "vision" | "turn_summary" | "asr_merge";
   provider: LlmProviderKind;
   model: string;
   ms: number;

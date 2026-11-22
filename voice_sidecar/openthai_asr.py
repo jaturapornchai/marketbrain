@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import warnings
 from typing import Optional
 
@@ -76,14 +77,15 @@ class OpenThaiASR:
         power = (stft.real ** 2 + stft.imag ** 2).astype(np.float32)
         return np.log(self._mel_fb @ power + (2.0 ** -24)).astype(np.float32)[None, :, :]
 
-    def _encode(self, mel: np.ndarray) -> np.ndarray:
+    def _encode(self, mel: np.ndarray, prompt_id: Optional[int] = None) -> np.ndarray:
         n_frames = mel.shape[2]
         if n_frames == 0:
             return np.zeros((1, 0, 1024), dtype=np.float32)
         length = np.array([n_frames], dtype=np.int64)
+        p_vec = self.prompt_id if prompt_id is None else np.array([prompt_id], dtype=np.int64)
         with self._lock:
             encoded, enc_len = self._enc.run(
-                None, {"audio_signal": mel, "length": length, "prompt_index": self.prompt_id}
+                None, {"audio_signal": mel, "length": length, "prompt_index": p_vec}
             )
         return encoded[:, :int(enc_len[0]), :]
 
@@ -119,16 +121,19 @@ class OpenThaiASR:
         ]
         return display_text("".join(pieces).replace("▁", " "))
 
-    def decode_mel(self, mel: np.ndarray, audio_s: float) -> str:
-        """Decode precomputed log-mel features with iApp's shortclip blank-bias policy."""
-        if mel.shape[2] == 0:
-            return ""
-        encoded = self._encode(mel)
+    def _decode_with_policy(self, encoded: np.ndarray, audio_s: float) -> str:
         delta = -2.5 if audio_s < 2.0 else -1.0
         text = self._decode_encoded(encoded, delta=delta)
         if not text and audio_s >= 0.25:
             text = self._decode_encoded(encoded, delta=-4.0)
         return text
+
+    def decode_mel(self, mel: np.ndarray, audio_s: float) -> str:
+        """Decode precomputed log-mel features with iApp's shortclip blank-bias policy."""
+        if mel.shape[2] == 0:
+            return ""
+        encoded = self._encode(mel)
+        return self._decode_with_policy(encoded, audio_s)
 
     def transcribe(self, audio_16k: np.ndarray) -> str:
         """Transcribe a 16 kHz mono float32 utterance cleanly."""
@@ -136,6 +141,39 @@ class OpenThaiASR:
         if x.size < 800 or not np.any(x):
             return ""
         return self.decode_mel(self.log_mel(x), x.size / SAMPLE_RATE)
+
+    def transcribe_dual_prompts(self, audio_16k: np.ndarray) -> tuple[str, str, int, int]:
+        """Run one batched B=2 encoder pass for both th-TH and th-mix; returns (th_text, mix_text, ear2_ms, ear3_ms)."""
+        x = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
+        if x.size < 800 or not np.any(x):
+            return "", "", 0, 0
+        t0 = time.perf_counter()
+        mel = self.log_mel(x)
+        n_frames = mel.shape[2]
+        if n_frames == 0:
+            return "", "", 0, 0
+        audio_s = x.size / SAMPLE_RATE
+        mel2 = np.concatenate((mel, mel), axis=0)
+        lengths = np.array([n_frames, n_frames], dtype=np.int64)
+        prompts = np.array([PROMPTS["th-TH"], PROMPTS["th-mix"]], dtype=np.int64)
+        with self._lock:
+            encoded2, enc_len2 = self._enc.run(
+                None, {"audio_signal": mel2, "length": lengths, "prompt_index": prompts}
+            )
+        t_enc = time.perf_counter()
+        enc_th = encoded2[0:1, :int(enc_len2[0]), :]
+        enc_mix = encoded2[1:2, :int(enc_len2[1]), :]
+
+        t_dec1 = time.perf_counter()
+        text_th = self._decode_with_policy(enc_th, audio_s)
+        dec1_ms = (time.perf_counter() - t_dec1) * 1000.0
+
+        t_dec2 = time.perf_counter()
+        text_mix = self._decode_with_policy(enc_mix, audio_s)
+        dec2_ms = (time.perf_counter() - t_dec2) * 1000.0
+
+        enc_ms = (t_enc - t0) * 1000.0
+        return text_th, text_mix, round(enc_ms + dec1_ms), round(enc_ms + dec2_ms)
 
     def stream(self) -> "OpenThaiStream":
         """Create an incremental streaming session for one live utterance."""

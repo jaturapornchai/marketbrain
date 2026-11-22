@@ -1,10 +1,11 @@
+import { mergeTripleEarsWithGemma } from "@/lib/asr-merger";
 import { stripBotEcho } from "@/lib/echo-guard";
-import { chooseBestHeard, fixHeard } from "@/lib/heard-fix";
-import { cleanBrowseQuery } from "@/lib/nong-tee";
+import { chooseBestHeard, fixHeard, isProtectedCommandSpeech, type EarId, type HeardVocab } from "@/lib/heard-fix";
+import { cleanBrowseQuery, getLlmConfig, isLocalModelLoadedNow } from "@/lib/nong-tee";
 import { getRecentServerTts } from "@/lib/recent-tts";
 import { heardVocab, searchProductsDetailed } from "@/lib/vault";
 import { classifyVoiceIntent } from "@/lib/voice-gate";
-import { appendVoiceLog } from "@/lib/voice-log";
+import { appendLlmDevLog, appendVoiceLog } from "@/lib/voice-log";
 
 export const dynamic = "force-dynamic";
 
@@ -70,32 +71,90 @@ export async function POST(req: Request): Promise<Response> {
         });
         return Response.json({ ok: true, text: "", voiced: false, echoDropped: true });
       }
+      const stripAlternateEcho = (raw: string): string => {
+        if (!raw.trim()) return "";
+        if (skipEcho) return raw.trim();
+        const chk = stripBotEcho(raw, getRecentServerTts());
+        return chk.wasEcho ? "" : chk.text;
+      };
       const rawEar2 = typeof payload.ear2 === "string" ? payload.ear2 : "";
-      const echoCheck2 = !rawEar2.trim()
-        ? { text: "", wasEcho: false, stripped: false }
-        : skipEcho
-          ? { text: rawEar2.trim(), wasEcho: false, stripped: false }
-          : stripBotEcho(rawEar2, getRecentServerTts());
-      const cleanEar2 = echoCheck2.wasEcho ? "" : echoCheck2.text;
+      const rawEar3 = typeof payload.ear3 === "string" ? payload.ear3 : "";
+      const cleanEar2 = stripAlternateEcho(rawEar2);
+      const cleanEar3 = stripAlternateEcho(rawEar3);
+
+      const scoreCache = new Map<string, { strong: boolean; total: number }>();
+      const scoreSttQuery = (q: string) => {
+        const hit = scoreCache.get(q);
+        if (hit) return hit;
+        try {
+          const stripped = cleanBrowseQuery(q);
+          const qq = stripped.length >= 2 ? stripped : q;
+          const r = searchProductsDetailed({ q: qq, pageSize: 1, skipFacets: true, noAutoCorrect: true });
+          const res = { strong: Boolean(r.topStrongMatch && r.total > 0), total: r.total };
+          scoreCache.set(q, res);
+          return res;
+        } catch {
+          return { strong: false, total: 0 };
+        }
+      };
 
       const tFix = performance.now();
-      let chosen = { text: echoCheck.text, altText: "", picked: "ear1" as "ear1" | "ear2" };
+      let activeVocab: HeardVocab | null = null;
+      let chosen = { text: echoCheck.text, altText: "", picked: "ear1" as EarId };
       try {
-        const vocab = heardVocab();
-        chosen = chooseBestHeard(echoCheck.text, cleanEar2, vocab, (q) => {
-          try {
-            const stripped = cleanBrowseQuery(q);
-            const qq = stripped.length >= 2 ? stripped : q;
-            const r = searchProductsDetailed({ q: qq, pageSize: 3 });
-            return { strong: Boolean(r.topStrongMatch && r.items.length > 0), total: r.total };
-          } catch {
-            return { strong: false, total: 0 };
-          }
-        });
+        activeVocab = heardVocab();
+        chosen = chooseBestHeard(echoCheck.text, cleanEar2, activeVocab, scoreSttQuery, cleanEar3);
       } catch {
-        chosen = { text: correctHeard(echoCheck.text), altText: cleanEar2 ? correctHeard(cleanEar2) : "", picked: "ear1" };
+        const fixed1 = correctHeard(echoCheck.text);
+        const alts = [cleanEar2, cleanEar3]
+          .filter(Boolean)
+          .map((x) => correctHeard(x))
+          .filter((x) => x && x !== fixed1);
+        chosen = { text: fixed1, altText: [...new Set(alts)].join(" / "), picked: "ear1" };
       }
-      const text = chosen.text;
+
+      let text = chosen.text;
+      let picked: string = chosen.picked;
+      let asrMerged = false;
+      let asrMergeMs = 0;
+
+      if (!isProtectedCommandSpeech(text)) {
+        const chosenScore = scoreSttQuery(text);
+        const cfg = getLlmConfig();
+        const mergeRes = await mergeTripleEarsWithGemma({
+          ear1: echoCheck.text,
+          ear2: cleanEar2,
+          ear3: cleanEar3,
+          chosenText: text,
+          chosenStrong: chosenScore.strong,
+          cfg,
+          isLoaded: () => isLocalModelLoadedNow(cfg),
+          signal: req.signal,
+        });
+        asrMergeMs = mergeRes.ms;
+        if (req.signal.aborted) {
+          return new Response(null, { status: 499 });
+        }
+        if (mergeRes.merged) {
+          const mergedFixed = activeVocab ? fixHeard(mergeRes.merged, activeVocab) : correctHeard(mergeRes.merged);
+          const mergedScore = scoreSttQuery(mergedFixed);
+          if (!chosenScore.strong || mergedScore.strong) {
+            text = mergedFixed;
+            picked = "gemma";
+            asrMerged = true;
+            appendLlmDevLog({
+              phase: "asr_merge",
+              provider: "local",
+              model: cfg.localModel,
+              ms: mergeRes.ms,
+              query: `${echoCheck.text} | ${cleanEar2} | ${cleanEar3}`,
+              spoken: mergedFixed,
+              ok: true,
+            });
+          }
+        }
+      }
+
       const fixMs = Math.round(performance.now() - tFix);
       const gate = await classifyVoiceIntent(text, { pendingQty, hasFocus, signal: req.signal });
       if (req.signal.aborted) {
@@ -105,15 +164,19 @@ export async function POST(req: Request): Promise<Response> {
         kind: gate.allow ? "stt" : "chatter_drop",
         raw: payload.text,
         ear2: rawEar2 || undefined,
+        ear3: rawEar3 || undefined,
         fixed: text,
         altText: chosen.altText || undefined,
-        picked: chosen.picked,
+        picked,
+        asrMerged: asrMerged || undefined,
+        asrMergeMs: asrMergeMs || undefined,
         changed: text !== payload.text,
         echoStripped: echoCheck.stripped || undefined,
         gateAllow: gate.allow,
         gateReason: gate.reason,
         ear1Ms: typeof payload.ear1Ms === "number" ? payload.ear1Ms : undefined,
         ear2Ms: typeof payload.ear2Ms === "number" ? payload.ear2Ms : undefined,
+        ear3Ms: typeof payload.ear3Ms === "number" ? payload.ear3Ms : undefined,
         pcmSec,
         sidecarMs,
         fixMs,
@@ -124,7 +187,9 @@ export async function POST(req: Request): Promise<Response> {
         ...payload,
         text,
         altText: chosen.altText,
-        picked: chosen.picked,
+        picked,
+        asrMerged,
+        asrMergeMs,
         ...(text !== payload.text ? { heard: payload.text } : {}),
         gate,
       });

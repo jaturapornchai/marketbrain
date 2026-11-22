@@ -848,6 +848,68 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
   assert.equal(ear2StrongOnly.picked, "ear2", "pick Ear 2 when Ear 1 has no strong match and Ear 2 is strong");
   assert.equal(ear2StrongOnly.text, "เครื่องปั่นไฟ");
 
+  // Triple-Ear arbitration: Ear 3 (OpenThai th-mix) wins on Latin brand/model & obeys fused-digit guard
+  const ear3Win = chooseBestHeard("มากิเต้", "มากิเต้เอ็ม", vocab, dualScore, "MAKITA M9513B");
+  assert.equal(ear3Win.picked, "ear3", "pick Ear 3 when th-mix catches catalog Latin brand/model");
+  assert.match(ear3Win.text, /มากีต้า|MAKITA/i);
+  assert.ok(ear3Win.text.includes("M9513B"), "preserve model token M9513B");
+
+  const digitGuardTriple = chooseBestHeard("รับเบอร์หกสองชิ้น", "รับเบอร์ 62 ชิ้น", vocab, dualScore, "รับเบอร์ 62 ชิ้น");
+  assert.equal(digitGuardTriple.picked, "ear1", "keep Ear 1 when both Ear 2 and Ear 3 fuse spoken digits");
+  assert.equal(digitGuardTriple.altText, "");
+
+  const emptyEar1 = chooseBestHeard("", "เครื่องปันไฟ", vocab, dualScore, "MAKITA M9513B");
+  assert.equal(emptyEar1.picked, "ear3", "when Ear 1 is empty, pick stronger OpenThai ear");
+  assert.match(emptyEar1.text, /มากีต้า|MAKITA/i);
+  assert.ok(emptyEar1.text.includes("M9513B"));
+
+  const { shouldRunGemmaAsrMerge, validateMergedAsr } = await import("../lib/asr-merger.ts");
+  assert.equal(
+    shouldRunGemmaAsrMerge({
+      ears: ["ขอดูน้ำปลาครับ", "ขอดูน้ำปลา", "ขอดูน้ำปลาค่ะ"],
+      chosenText: "ขอดูน้ำปลา",
+      chosenStrong: true,
+    }),
+    false,
+    "skip Gemma ASR merge when all ears agree",
+  );
+  assert.equal(
+    shouldRunGemmaAsrMerge({
+      ears: ["สว่านไร้สายมากีเต้", "สว่านไร้สายมากีต้า", "สว่านไร้สาย M9513B"],
+      chosenText: "สว่านไร้สายมากีต้า",
+      chosenStrong: false,
+    }),
+    true,
+    "trigger Gemma ASR merge when ears disagree and no strong hit yet",
+  );
+  assert.equal(
+    shouldRunGemmaAsrMerge({
+      ears: ["เครื่องเจียรไฟฟ้า", "เครื่องเจียรไฟฟ้า", "เครื่องเจียรไฟฟ้า M9513B"],
+      chosenText: "เครื่องเจียรไฟฟ้า",
+      chosenStrong: true,
+    }),
+    true,
+    "trigger Gemma ASR merge when another ear contains missing Latin model M9513B",
+  );
+  assert.equal(
+    validateMergedAsr('  "ผลลัพธ์: ขอดูสว่าน Makita M9513B ราคาถูกสุด"  ', [
+      "ขอดูสว่านราคาถูกสุด",
+      "ขอดูสว่าน มากีต้า",
+      "Makita M9513B",
+    ]),
+    "ขอดูสว่าน Makita M9513B ราคาถูกสุด",
+    "clean quotes and prefix from valid merged utterance",
+  );
+  assert.equal(
+    validateMergedAsr("สวัสดีครับ ยินดีช่วยหาสินค้าให้ครับ สนใจชิ้นไหนดี", [
+      "สว่านไร้สาย",
+      "สว่านไร้สาด",
+      "สว่าน Makita",
+    ]),
+    null,
+    "reject hallucinated assistant greeting instead of customer transcript",
+  );
+
   // Everyday Thai and non-target products must stay untouched.
   for (const t of [
     "ขอดูขนมขบเคี้ยว",
