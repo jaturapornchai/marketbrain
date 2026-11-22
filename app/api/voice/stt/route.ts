@@ -54,6 +54,9 @@ export async function POST(req: Request): Promise<Response> {
       return Response.json({ ok: false, text: "", voiced: false, error: `STT ${res.status}` }, { status: 502 });
     }
     const payload = (await res.json()) as Record<string, unknown>;
+    if (partial === "1" && typeof payload.text === "string" && payload.text.trim()) {
+      payload.text = correctHeard(payload.text.trim());
+    }
     // Final transcripts only: partials are just the live caption and are replaced within a second.
     if (partial !== "1" && typeof payload.text === "string" && payload.text.trim()) {
       const skipEcho = req.headers.get("x-skip-echo-guard") === "1";

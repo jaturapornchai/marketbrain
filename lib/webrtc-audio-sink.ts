@@ -270,6 +270,11 @@ export class WebRtcAudioSink {
     return null;
   }
 
+  /** Returns decoded duration in seconds of the currently playing buffer, or null when idle. */
+  activeDurationSec(): number | null {
+    return this.activeSource?.buffer ? this.activeSource.buffer.duration : null;
+  }
+
   /**
    * Plays a WAV ArrayBuffer through WebRTC loopback AEC3 (or direct Web Audio on iOS/fallback).
    * Returns true if playback started, or false if the context is still locked waiting for user gesture.

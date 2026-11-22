@@ -11,6 +11,7 @@ import type { CartSummary } from "@/lib/cart-order";
 import type { DietaryTagId } from "@/lib/dietary-shield";
 import type { JavisProductCard, JavisTeamJob } from "@/lib/product-card";
 import { PROMOTIONS, formatBaht, type Promotion } from "@/lib/promotions";
+import { segmentKaraokeWords } from "@/lib/spoken-thai";
 import ProductCardGrid, { type CardActionFx } from "./ProductCardGrid";
 
 Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
@@ -397,28 +398,104 @@ export function ThinkingBrain({ jobs, cards }: { jobs: JavisTeamJob[]; cards: Ja
 
 /* ---------------- karaoke words ---------------- */
 
-/** Nong Tee's sentence lit word by word in time with his voice (pct = playback progress). */
-export function KaraokeWords({ text, pct }: { text: string; pct: number }) {
-  const words = useMemo(() => {
-    const seg =
-      typeof Intl !== "undefined" && "Segmenter" in Intl
-        ? [...new Intl.Segmenter("th", { granularity: "word" }).segment(text)].map((s) => s.segment)
-        : text.split(/(\s+)/);
-    const total = Math.max(1, text.length);
-    let acc = 0;
-    return seg.map((w) => {
-      const start = (acc / total) * 100;
-      acc += w.length;
-      return { w, start, end: (acc / total) * 100 };
-    });
-  }, [text]);
-  return (
-    <p className="jc-k-bot fz-kwords">
-      {words.map((x, i) => (
-        <span key={i} className={pct >= x.end ? "lit" : pct > x.start ? "now" : ""}>
-          {x.w}
+export type KaraokeSegment = {
+  id: number;
+  text: string;
+  state: "done" | "active" | "queued";
+};
+
+/** Nong Tee's reply lit word by word in time with his voice across all queued sentences (pct = active progress). */
+export function KaraokeWords({
+  segments,
+  text,
+  pct,
+}: {
+  segments?: KaraokeSegment[];
+  text?: string;
+  pct: number;
+}) {
+  const boxRef = useRef<HTMLParagraphElement>(null);
+  const nowRef = useRef<HTMLSpanElement>(null);
+
+  const normalized = useMemo<KaraokeSegment[]>(() => {
+    if (segments && segments.length > 0) return segments;
+    if (text && text.trim()) return [{ id: 0, text, state: "active" }];
+    return [];
+  }, [segments, text]);
+
+  const segmented = useMemo(
+    () =>
+      normalized.map((seg) => ({
+        ...seg,
+        words: seg.state === "active" ? segmentKaraokeWords(seg.text) : [],
+      })),
+    [normalized],
+  );
+
+  const firstSegId = normalized[0]?.id ?? 0;
+  useEffect(() => {
+    if (boxRef.current) boxRef.current.scrollTop = 0;
+  }, [firstSegId]);
+
+  let activeWordKey = "";
+  const body = segmented.map((seg, segIdx) => {
+    const sep = segIdx > 0 ? <span key={`sep-${seg.id}`} className={seg.state === "done" || seg.state === "active" ? "lit" : "up"}> </span> : null;
+    if (seg.state === "done") {
+      return (
+        <span key={seg.id}>
+          {sep}
+          <span className="lit">{seg.text}</span>
         </span>
-      ))}
+      );
+    }
+    if (seg.state === "queued") {
+      return (
+        <span key={seg.id}>
+          {sep}
+          <span className="up">{seg.text}</span>
+        </span>
+      );
+    }
+    return (
+      <span key={seg.id}>
+        {sep}
+        {seg.words.map((x, i) => {
+          const isLit = pct >= 99.5 || pct >= x.end;
+          const isNow = !isLit && !x.isSpace && pct > 0 && pct >= x.start;
+          let attachNow = false;
+          if (isNow && !activeWordKey) {
+            activeWordKey = `${seg.id}:${i}`;
+            attachNow = true;
+          }
+          return (
+            <span
+              key={i}
+              ref={attachNow ? nowRef : undefined}
+              className={isLit ? "lit" : isNow ? "now" : "up"}
+            >
+              {x.w}
+            </span>
+          );
+        })}
+      </span>
+    );
+  });
+
+  useEffect(() => {
+    const box = boxRef.current;
+    const nowEl = nowRef.current;
+    if (!box || !nowEl) return;
+    if (box.scrollHeight <= box.clientHeight + 2) return;
+    const relTop = nowEl.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
+    const targetTop = Math.max(0, relTop - Math.max(0, (box.clientHeight - nowEl.offsetHeight) / 2));
+    box.scrollTo({ top: targetTop, behavior: "smooth" });
+  }, [activeWordKey]);
+
+  if (segmented.length === 0) return null;
+
+  return (
+    <p className="jc-k-bot fz-kwords" ref={boxRef}>
+      {body}
     </p>
   );
 }

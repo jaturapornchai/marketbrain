@@ -26,6 +26,7 @@ import { RelatedStrip,
   CountUpBaht,
   DuelView,
   KaraokeWords,
+  type KaraokeSegment,
   LuckyWheel,
   MISSIONS,
   PayCountdown,
@@ -574,10 +575,12 @@ export default function JavisSalesCockpit({
     };
   }, [cart.items]);
 
+  type HeardPhase = "idle" | "listening" | "finalizing" | "final";
   const [input, setInput] = useState("");
   const [liveUserHeard, setLiveUserHeard] = useState("");
-  const [liveKaraokeText, setLiveKaraokeText] = useState("");
-  const [karaokeProgress, setKaraokeProgress] = useState(100);
+  const [liveHeardPhase, setLiveHeardPhase] = useState<HeardPhase>("idle");
+  const [karaokeSegments, setKaraokeSegments] = useState<KaraokeSegment[]>([]);
+  const [karaokeProgress, setKaraokeProgress] = useState(0);
   const [turns, setTurns] = useState<TurnEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [placingOrderManual, setPlacingOrderManual] = useState(false);
@@ -586,11 +589,17 @@ export default function JavisSalesCockpit({
   const quickPhotoInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const autoStartedRef = useRef(false);
+  const karaokeSeqRef = useRef(0);
+  const karaokeBurstRef = useRef<KaraokeSegment[]>([]);
+  const karaokeClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heardClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Audio playback queue for Local OmniVoice sentences.
   // Routes TTS through a local WebRTC loopback AEC3 sink + master GainNode (smooth ducking)
   // on Chromium/Firefox, and direct unlocked AudioContext (VoiceProcessingIO AEC) on iOS Safari.
-  const audioQueueRef = useRef<Array<{ text: string; promise: Promise<{ url: string; dur: number; buf: ArrayBuffer } | null> }>>([]);
+  const audioQueueRef = useRef<
+    Array<{ id: number; text: string; promise: Promise<{ url: string; dur: number; buf: ArrayBuffer } | null> }>
+  >([]);
   const stagePaintGateRef = useRef<Promise<void>>(Promise.resolve());
   const markStagePaintedSoon = useCallback(() => {
     stagePaintGateRef.current = new Promise<void>((resolve) => {
@@ -783,6 +792,52 @@ export default function JavisSalesCockpit({
     };
   }, [unlockAudioPlayback]);
 
+  const clearKaraokeNow = useCallback(() => {
+    if (karaokeClearTimerRef.current) {
+      clearTimeout(karaokeClearTimerRef.current);
+      karaokeClearTimerRef.current = null;
+    }
+    karaokeBurstRef.current = [];
+    setKaraokeSegments([]);
+    setKaraokeProgress(0);
+  }, []);
+
+  const scheduleKaraokeClear = useCallback((delayMs = 900) => {
+    if (karaokeClearTimerRef.current) {
+      clearTimeout(karaokeClearTimerRef.current);
+    }
+    karaokeClearTimerRef.current = setTimeout(() => {
+      karaokeClearTimerRef.current = null;
+      if (!isPlayingLoopRef.current && audioQueueRef.current.length === 0) {
+        karaokeBurstRef.current = [];
+        setKaraokeSegments([]);
+        setKaraokeProgress(0);
+      }
+    }, delayMs);
+  }, []);
+
+  const clearHeardNow = useCallback(() => {
+    if (heardClearTimerRef.current) {
+      clearTimeout(heardClearTimerRef.current);
+      heardClearTimerRef.current = null;
+    }
+    setLiveUserHeard("");
+    setLiveHeardPhase("idle");
+  }, []);
+
+  const scheduleHeardClear = useCallback((delayMs = 2000) => {
+    if (heardClearTimerRef.current) {
+      clearTimeout(heardClearTimerRef.current);
+    }
+    heardClearTimerRef.current = setTimeout(() => {
+      heardClearTimerRef.current = null;
+      if (!speakingDetectedRef.current) {
+        setLiveUserHeard("");
+        setLiveHeardPhase("idle");
+      }
+    }, delayMs);
+  }, []);
+
   const stopAllAudioPlayback = useCallback(() => {
     playbackGenRef.current += 1;
     audioQueueRef.current = [];
@@ -804,8 +859,8 @@ export default function JavisSalesCockpit({
     isPlayingLoopRef.current = false;
     playingEnvRef.current = null;
     setAudioUnlockNeeded(false);
-    setKaraokeProgress(100);
-  }, []);
+    clearKaraokeNow();
+  }, [clearKaraokeNow]);
 
   const drainAudioQueue = useCallback(async () => {
     if (isPlayingLoopRef.current) return;
@@ -814,15 +869,23 @@ export default function JavisSalesCockpit({
     try {
       while (audioQueueRef.current.length > 0 && playbackGenRef.current === gen) {
         const item = audioQueueRef.current.shift()!;
-        if (!ttsEnabledRef.current) continue;
+        if (!ttsEnabledRef.current) {
+          karaokeBurstRef.current = karaokeBurstRef.current.filter((s) => s.id !== item.id);
+          continue;
+        }
         const resolved = await item.promise;
         if (!resolved || !ttsEnabledRef.current || playbackGenRef.current !== gen) {
           if (resolved) URL.revokeObjectURL(resolved.url);
+          karaokeBurstRef.current = karaokeBurstRef.current.filter((s) => s.id !== item.id);
+          if (playbackGenRef.current === gen && isPlayingLoopRef.current) {
+            setKaraokeSegments([...karaokeBurstRef.current]);
+          }
           continue;
         }
         await stagePaintGateRef.current;
         if (!ttsEnabledRef.current || playbackGenRef.current !== gen) {
           URL.revokeObjectURL(resolved.url);
+          karaokeBurstRef.current = karaokeBurstRef.current.filter((s) => s.id !== item.id);
           continue;
         }
 
@@ -833,31 +896,85 @@ export default function JavisSalesCockpit({
         ];
         lastBotAudioMsRef.current = nowSpoken;
 
+        if (karaokeClearTimerRef.current) {
+          clearTimeout(karaokeClearTimerRef.current);
+          karaokeClearTimerRef.current = null;
+        }
+        clearHeardNow();
+        let passedActive = false;
+        karaokeBurstRef.current = karaokeBurstRef.current.map((s) => {
+          if (s.id === item.id) {
+            passedActive = true;
+            return { ...s, state: "active" as const };
+          }
+          return { ...s, state: passedActive ? ("queued" as const) : ("done" as const) };
+        });
+
         setHudState("speaking");
-        setLiveKaraokeText(item.text);
+        setKaraokeSegments([...karaokeBurstRef.current]);
         setKaraokeProgress(0);
         playingEnvRef.current = wavEnvelope(resolved.buf);
 
         await new Promise<void>((resolve) => {
           let settled = false;
-          const durMs = Math.max(400, resolved.dur * 1000);
-          let tStart = performance.now();
-          let anim: ReturnType<typeof setInterval> | null = null;
+          let rafId: number | null = null;
 
-          const startProgressAnim = () => {
-            tStart = performance.now();
-            if (anim) clearInterval(anim);
-            anim = setInterval(() => {
-              const pct = Math.min(100, ((performance.now() - tStart) / durMs) * 100);
+          const stopAnim = () => {
+            if (rafId !== null) {
+              cancelAnimationFrame(rafId);
+              rafId = null;
+            }
+          };
+
+          const startProgressAnim = (mode: "sink" | "element") => {
+            stopAnim();
+            const tStart = performance.now();
+            const tick = () => {
+              if (settled || playbackGenRef.current !== gen) {
+                rafId = null;
+                return;
+              }
+              let elapsed = (performance.now() - tStart) / 1000;
+              let total = Math.max(0.25, resolved.dur);
+              let leadIn = Math.min(total * 0.15, 0.06);
+              if (mode === "sink") {
+                const sink = ttsSinkRef.current;
+                const sinkSec = sink?.currentTimeSec();
+                const sinkDur = sink?.activeDurationSec();
+                if (sinkDur !== null && sinkDur !== undefined && sinkDur > 0.2) total = sinkDur;
+                if (sinkSec !== null && sinkSec !== undefined) elapsed = sinkSec;
+                leadIn = Math.min(total * 0.15, sink?.isLoopbackActive ? 0.1 : 0.06);
+              } else {
+                const audio = ttsAudioRef.current;
+                if (audio && Number.isFinite(audio.duration) && audio.duration > 0.2) {
+                  total = audio.duration;
+                }
+                if (audio) elapsed = audio.currentTime;
+              }
+              const leadOut = Math.min(total * 0.08, 0.07);
+              const span = Math.max(0.15, total - leadIn - leadOut);
+              const pct = Math.max(0, Math.min(100, ((elapsed - leadIn) / span) * 100));
               setKaraokeProgress(pct);
-            }, 45);
+              if (pct < 100 && !settled && playbackGenRef.current === gen) {
+                rafId = requestAnimationFrame(tick);
+              } else {
+                rafId = null;
+              }
+            };
+            rafId = requestAnimationFrame(tick);
           };
 
           const finish = () => {
             if (settled) return;
             settled = true;
-            if (anim) clearInterval(anim);
+            stopAnim();
             setKaraokeProgress(100);
+            karaokeBurstRef.current = karaokeBurstRef.current.map((s) =>
+              s.id === item.id ? { ...s, state: "done" as const } : s,
+            );
+            if (playbackGenRef.current === gen) {
+              setKaraokeSegments([...karaokeBurstRef.current]);
+            }
             lastBotAudioMsRef.current = performance.now();
             URL.revokeObjectURL(resolved.url);
             if (activeCancelRef.current === finish) activeCancelRef.current = null;
@@ -878,7 +995,7 @@ export default function JavisSalesCockpit({
             );
             if (!started) return false;
             if (!settled && playbackGenRef.current === gen) {
-              startProgressAnim();
+              startProgressAnim("sink");
               setAudioUnlockNeeded(false);
             }
             return true;
@@ -901,12 +1018,14 @@ export default function JavisSalesCockpit({
               audio.currentTime = 0;
               audio.onended = finish;
               audio.onerror = finish;
-              startProgressAnim();
               await audio.play();
-              setAudioUnlockNeeded(false);
+              if (!settled && playbackGenRef.current === gen) {
+                startProgressAnim("element");
+                setAudioUnlockNeeded(false);
+              }
               return true;
             } catch {
-              if (anim) clearInterval(anim);
+              stopAnim();
               audio.onended = null;
               audio.onerror = null;
               return false;
@@ -919,7 +1038,7 @@ export default function JavisSalesCockpit({
             if (await playViaElement()) return;
 
             // Still blocked only before the very first gesture on mobile/desktop: wait once for any tap/click/key.
-            if (anim) clearInterval(anim);
+            stopAnim();
             unlockResumeRef.current = resumePlayback;
             setAudioUnlockNeeded(true);
           };
@@ -937,6 +1056,12 @@ export default function JavisSalesCockpit({
         playingEnvRef.current = null;
         lastBotAudioMsRef.current = performance.now();
         ttsSinkRef.current?.setDuck(false);
+        if (karaokeBurstRef.current.length > 0) {
+          scheduleKaraokeClear(900);
+        } else {
+          clearKaraokeNow();
+          if (!speakingDetectedRef.current) scheduleHeardClear(1400);
+        }
         if (!busyRef.current && !speakingDetectedRef.current) {
           setHudState("listening");
           setStatusText(
@@ -949,12 +1074,26 @@ export default function JavisSalesCockpit({
         }
       }
     }
-  }, [getTtsSink]);
+  }, [clearHeardNow, clearKaraokeNow, getTtsSink, scheduleHeardClear, scheduleKaraokeClear]);
 
   const enqueueOmniVoiceSentence = useCallback(
     (sentence: string) => {
       if (!ttsEnabledRef.current || !sentence.trim()) return;
       const clean = sentence.trim();
+      const hasPendingTail = karaokeClearTimerRef.current !== null;
+      if (karaokeClearTimerRef.current) {
+        clearTimeout(karaokeClearTimerRef.current);
+        karaokeClearTimerRef.current = null;
+      }
+      if (!isPlayingLoopRef.current && audioQueueRef.current.length === 0 && !hasPendingTail) {
+        karaokeBurstRef.current = [];
+      }
+      const segId = ++karaokeSeqRef.current;
+      karaokeBurstRef.current = [...karaokeBurstRef.current, { id: segId, text: clean, state: "queued" }];
+      if (isPlayingLoopRef.current) {
+        setKaraokeSegments([...karaokeBurstRef.current]);
+      }
+
       const promise = (async () => {
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
@@ -978,7 +1117,7 @@ export default function JavisSalesCockpit({
         return null;
       })();
 
-      audioQueueRef.current.push({ text: clean, promise });
+      audioQueueRef.current.push({ id: segId, text: clean, promise });
       void drainAudioQueue();
     },
     [drainAudioQueue],
@@ -986,6 +1125,18 @@ export default function JavisSalesCockpit({
 
   const enqueuePrewarmedGreeting = useCallback(() => {
     if (!ttsEnabledRef.current) return;
+    if (karaokeClearTimerRef.current) {
+      clearTimeout(karaokeClearTimerRef.current);
+      karaokeClearTimerRef.current = null;
+    }
+    if (!isPlayingLoopRef.current && audioQueueRef.current.length === 0) {
+      karaokeBurstRef.current = [];
+    }
+    const segId = ++karaokeSeqRef.current;
+    karaokeBurstRef.current = [...karaokeBurstRef.current, { id: segId, text: GREETING_TEXT, state: "queued" }];
+    if (isPlayingLoopRef.current) {
+      setKaraokeSegments([...karaokeBurstRef.current]);
+    }
     const promise = fetch("/api/voice/tts")
       .then(async (r) => {
         if (!r.ok) return null;
@@ -995,7 +1146,7 @@ export default function JavisSalesCockpit({
         return { url, dur, buf };
       })
       .catch(() => null);
-    audioQueueRef.current.push({ text: GREETING_TEXT, promise });
+    audioQueueRef.current.push({ id: segId, text: GREETING_TEXT, promise });
     void drainAudioQueue();
   }, [drainAudioQueue]);
 
@@ -1007,7 +1158,7 @@ export default function JavisSalesCockpit({
     }).catch(() => {});
   }, []);
   const lastSentTurnRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
-  const sendTurnRef = useRef<(text: string, extra?: { altHeard?: string }) => Promise<void> | void>(() => {});
+  const sendTurnRef = useRef<(text: string, extra?: { altHeard?: string; keepHeard?: boolean }) => Promise<void> | void>(() => {});
   const sendTurn = useCallback(
     async (
       rawText: string,
@@ -1017,6 +1168,7 @@ export default function JavisSalesCockpit({
         visionSlugs?: string[];
         visionSummary?: string;
         altHeard?: string;
+        keepHeard?: boolean;
       },
     ) => {
       const q = rawText.trim();
@@ -1034,7 +1186,8 @@ export default function JavisSalesCockpit({
           : null;
       if (screenCmd) {
         setInput("");
-        setLiveUserHeard("");
+        if (extra?.keepHeard) scheduleHeardClear(2000);
+        else clearHeardNow();
         logVoiceClient({ kind: "screen_cmd", heard: q, cmd: `${screenCmd.id}${screenCmd.no ? "#" + screenCmd.no : ""}`, stage: stageMode });
         runScreenCommandRef.current(screenCmd, q);
         return;
@@ -1043,7 +1196,8 @@ export default function JavisSalesCockpit({
       const budgetCmd = q && !extra?.visionSlugs ? parseBudget(q, parseThaiNumber) : null;
       if (budgetCmd !== null) {
         setInput("");
-        setLiveUserHeard("");
+        if (extra?.keepHeard) scheduleHeardClear(2000);
+        else clearHeardNow();
         logVoiceClient({ kind: "budget_cmd", heard: q, cmd: `budget:${budgetCmd}`, stage: stageMode });
         runBudgetRef.current(budgetCmd, q);
         return;
@@ -1052,7 +1206,8 @@ export default function JavisSalesCockpit({
       const couponCmd = q && !extra?.visionSlugs ? parseCouponCommand(q) : null;
       if (couponCmd) {
         setInput("");
-        setLiveUserHeard("");
+        if (extra?.keepHeard) scheduleHeardClear(2000);
+        else clearHeardNow();
         logVoiceClient({ kind: "coupon_cmd", heard: q, cmd: `coupon:${couponCmd.action}`, stage: stageMode });
         runCouponCommandRef.current(couponCmd, q);
         return;
@@ -1061,7 +1216,8 @@ export default function JavisSalesCockpit({
       const dietaryCmd = q && !extra?.visionSlugs ? parseDietaryCommand(q) : null;
       if (dietaryCmd) {
         setInput("");
-        setLiveUserHeard("");
+        if (extra?.keepHeard) scheduleHeardClear(2000);
+        else clearHeardNow();
         let replyMsg = "";
         if (dietaryCmd.action === "clear") {
           clearDietaryTags();
@@ -1085,7 +1241,8 @@ export default function JavisSalesCockpit({
       const marginCmd = q && !extra?.visionSlugs ? parseMarginCommand(q, parseThaiNumber) : null;
       if (marginCmd !== null) {
         setInput("");
-        setLiveUserHeard("");
+        if (extra?.keepHeard) scheduleHeardClear(2000);
+        else clearHeardNow();
         setMarginPct(marginCmd);
         if (marginCmd > 0 && typeof window !== "undefined" && window.innerWidth < 768) {
           setStageMode("cart");
@@ -1110,7 +1267,7 @@ export default function JavisSalesCockpit({
       setBusy(true);
       busyRef.current = true;
       setInput("");
-      setLiveUserHeard("");
+      if (!extra?.keepHeard) clearHeardNow();
       setHudState("searching");
       setStatusText(
         extra?.visionSlugs?.length
@@ -1386,6 +1543,9 @@ export default function JavisSalesCockpit({
           setBusy(false);
           busyRef.current = false;
         }
+        if (extra?.keepHeard && !isPlayingLoopRef.current && audioQueueRef.current.length === 0 && !speakingDetectedRef.current) {
+          scheduleHeardClear(1400);
+        }
         if (!isPlayingLoopRef.current && !speakingDetectedRef.current && !busyRef.current) {
           setHudState("listening");
           setStatusText(
@@ -1396,7 +1556,7 @@ export default function JavisSalesCockpit({
         }
       }
     },
-    [cart.items, clearDietaryTags, closeQtyModal, customer, enqueueOmniVoiceSentence, logVoiceClient, markMission, markStagePaintedSoon, promptAddToCart, replaceServerCart, setDietaryTags, stageMode, stopAllAudioPlayback, turns, updateCustomer],
+    [cart.items, clearDietaryTags, clearHeardNow, closeQtyModal, customer, enqueueOmniVoiceSentence, logVoiceClient, markMission, markStagePaintedSoon, promptAddToCart, replaceServerCart, scheduleHeardClear, setDietaryTags, stageMode, stopAllAudioPlayback, turns, updateCustomer],
   );
   sendTurnRef.current = sendTurn;
 
@@ -1463,10 +1623,10 @@ export default function JavisSalesCockpit({
     setMicMuted(false);
     micMutedRef.current = false;
     teardownMicGraph();
-    setLiveUserHeard("");
+    clearHeardNow();
     setHudState("idle");
     setStatusText("พักสายไมค์แล้ว (พิมพ์คุย ส่องกล้องรูปสินค้า หรือกดเปิดไมค์ใหม่ได้ตลอดครับ)");
-  }, [teardownMicGraph]);
+  }, [clearHeardNow, teardownMicGraph]);
 
   const attachMicStream = useCallback(
     async (preferredMicId: string) => {
@@ -1624,7 +1784,7 @@ export default function JavisSalesCockpit({
             idlePreroll = [];
             speakingDetectedRef.current = false;
             voicedFrames = 0;
-            setLiveUserHeard("");
+            clearHeardNow();
           } else {
             echoTailUntil = now + ECHO_TAIL_MS; // room reverb + output latency after Nong Tee stops
           }
@@ -1672,6 +1832,12 @@ export default function JavisSalesCockpit({
           wasPlaying = false;
           setHudState("listening");
           setStatusText("น้องตี๋หยุดฟังคุณพูดแทรกครับ…");
+          if (heardClearTimerRef.current) {
+            clearTimeout(heardClearTimerRef.current);
+            heardClearTimerRef.current = null;
+          }
+          setLiveUserHeard("");
+          setLiveHeardPhase("listening");
           speakingDetectedRef.current = true;
           speechStartMsRef.current = now;
           lastVoiceMsRef.current = now;
@@ -1694,6 +1860,13 @@ export default function JavisSalesCockpit({
             onsetFrames += 1;
             onsetMisses = 0;
             if (onsetFrames >= MIN_ONSET_FRAMES) {
+              clearKaraokeNow();
+              if (heardClearTimerRef.current) {
+                clearTimeout(heardClearTimerRef.current);
+                heardClearTimerRef.current = null;
+              }
+              setLiveUserHeard("");
+              setLiveHeardPhase("listening");
               speakingDetectedRef.current = true;
               speechStartMsRef.current = now;
               lastVoiceMsRef.current = now;
@@ -1721,8 +1894,8 @@ export default function JavisSalesCockpit({
           lastVoiceMsRef.current = now;
           voicedFrames += 1;
 
-          // Incremental live partial transcription every ~650 ms (guarded by Silero VAD on both ends)
-          if (!sendingSttRef.current && now - lastPartialMsRef.current > 650 && voicedFrames >= 8) {
+          // Incremental live partial transcription every ~420 ms (guarded by Silero VAD on both ends)
+          if (!sendingSttRef.current && now - lastPartialMsRef.current > 420 && voicedFrames >= 5) {
             lastPartialMsRef.current = now;
             const merged = mergePcm(pcmChunksRef.current);
             const pCtrl = new AbortController();
@@ -1741,7 +1914,10 @@ export default function JavisSalesCockpit({
             })
               .then((r) => (r.ok ? r.json() : { text: "" }))
               .then((d: { text?: string }) => {
-                if (d.text && speakingDetectedRef.current) setLiveUserHeard(d.text);
+                if (d.text && speakingDetectedRef.current) {
+                  setLiveUserHeard(d.text);
+                  setLiveHeardPhase("listening");
+                }
               })
               .catch(() => {})
               .finally(() => {
@@ -1754,7 +1930,7 @@ export default function JavisSalesCockpit({
 
         const silenceMs = now - lastVoiceMsRef.current;
 
-        // Speculative early final STT at 240 ms silence so GPU Whisper finishes before SILENCE_END_MS (540 ms).
+        // Speculative early final STT at 200 ms silence so GPU Whisper finishes before SILENCE_END_MS (460 ms).
         if (
           silenceMs >= EARLY_STT_SILENCE_MS &&
           !earlyStt &&
@@ -1785,11 +1961,11 @@ export default function JavisSalesCockpit({
               : null);
 
           if (sttPromise) {
+            setLiveHeardPhase("finalizing");
             setStatusText("กำลังถอดเสียงภาษาไทย…");
             void sttPromise
               .then((d) => {
                 const finalWords = (d?.text ?? "").trim();
-                setLiveUserHeard("");
                 if (d?.voiced && finalWords) {
                   // Layer-3 text echo guard: drop residual echo sentences mirroring what Nong Tee just spoke.
                   const nowDone = performance.now();
@@ -1799,6 +1975,7 @@ export default function JavisSalesCockpit({
                       .map((e) => e.text)
                       .join(" ");
                     if (isEchoTranscript(finalWords, recentSpoken)) {
+                      clearHeardNow();
                       logVoiceClient({ kind: "echo_drop", heard: finalWords });
                       setHudState("listening");
                       setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
@@ -1807,24 +1984,35 @@ export default function JavisSalesCockpit({
                   }
                   // Zero-latency micro-noise filter drops only blank/filler ("อืม", "..."); all customer speech goes straight to Nong Tee.
                   if (d.gate && d.gate.allow === false) {
+                    clearHeardNow();
                     setHudState("listening");
                     setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
                     return;
                   }
+                  if (heardClearTimerRef.current) {
+                    clearTimeout(heardClearTimerRef.current);
+                    heardClearTimerRef.current = null;
+                  }
+                  setLiveUserHeard(finalWords);
+                  setLiveHeardPhase("final");
                   const altWords = typeof d.altText === "string" ? d.altText.trim() : "";
                   // Latest sendTurn, not the one captured when the mic started (stale cart/history wiped the cart).
-                  void sendTurnRef.current(finalWords, altWords && altWords !== finalWords ? { altHeard: altWords } : undefined);
+                  void sendTurnRef.current(finalWords, {
+                    keepHeard: true,
+                    ...(altWords && altWords !== finalWords ? { altHeard: altWords } : {}),
+                  });
                 } else {
+                  clearHeardNow();
                   setHudState("listening");
                   setStatusText("🟢 น้องตี๋กำลังฟังเสียงของคุณอยู่ครับ…");
                 }
               })
               .catch(() => {
-                setLiveUserHeard("");
+                clearHeardNow();
                 setHudState("listening");
               });
           } else {
-            setLiveUserHeard("");
+            clearHeardNow();
           }
         }
       };
@@ -1961,6 +2149,14 @@ export default function JavisSalesCockpit({
 
   useEffect(() => {
     return () => {
+      if (karaokeClearTimerRef.current) {
+        clearTimeout(karaokeClearTimerRef.current);
+        karaokeClearTimerRef.current = null;
+      }
+      if (heardClearTimerRef.current) {
+        clearTimeout(heardClearTimerRef.current);
+        heardClearTimerRef.current = null;
+      }
       stopAllAudioPlayback();
       ttsSinkRef.current?.dispose();
       ttsSinkRef.current = null;
@@ -2884,12 +3080,34 @@ export default function JavisSalesCockpit({
         </div>
 
         <div className="jc-dock-ticker" role="status" aria-live="polite">
-          {liveUserHeard ? (
-            <p className="jc-tick-heard">🎤 ได้ยินว่า: “{liveUserHeard}”</p>
-          ) : liveKaraokeText ? (
+          {liveHeardPhase !== "idle" ? (
+            <div className={`jc-tick-heard-row phase-${liveHeardPhase}`}>
+              <span className="jc-tick-mic-icon" aria-hidden="true">🎤</span>
+              <p className="jc-tick-heard">
+                {liveUserHeard ? (
+                  <>
+                    <span className="jc-tick-heard-label">
+                      {liveHeardPhase === "finalizing" ? "กำลังฟังว่า:" : "ได้ยินว่า:"}
+                    </span>{" "}
+                    “{liveUserHeard}”
+                    {liveHeardPhase === "listening" && <span className="jc-tick-caret" aria-hidden="true">|</span>}
+                  </>
+                ) : (
+                  <span className="jc-tick-heard-wait">
+                    {liveHeardPhase === "finalizing" ? "กำลังถอดเสียงภาษาไทย…" : "กำลังฟังเสียงคุณ…"}
+                  </span>
+                )}
+              </p>
+              {liveHeardPhase === "finalizing" ? (
+                <span className="jc-tick-heard-badge">กำลังสรุป 3 หู…</span>
+              ) : liveHeardPhase === "final" && busy ? (
+                <span className="jc-tick-heard-badge">🔍 กำลังค้นหา…</span>
+              ) : null}
+            </div>
+          ) : karaokeSegments.length > 0 ? (
             <div className="jc-tick-karaoke">
-              <span aria-hidden="true">🔊</span>
-              <KaraokeWords text={liveKaraokeText} pct={karaokeProgress} />
+              <span className="jc-tick-spk-icon" aria-hidden="true">🔊</span>
+              <KaraokeWords segments={karaokeSegments} pct={karaokeProgress} />
             </div>
           ) : busy && latestJobs.length > 0 ? (
             <div className="jc-tick-jobs">
@@ -2930,7 +3148,10 @@ export default function JavisSalesCockpit({
                 <button
                   type="button"
                   className="jc-tick-speak"
-                  onClick={() => enqueueOmniVoiceSentence(latestTurn.spokenText)}
+                  onClick={() => {
+                    stopAllAudioPlayback();
+                    enqueueOmniVoiceSentence(latestTurn.spokenText);
+                  }}
                   title="ฟังคำตอบนี้อีกครั้ง"
                   aria-label="ฟังคำตอบนี้อีกครั้ง"
                 >
@@ -3098,7 +3319,10 @@ export default function JavisSalesCockpit({
                           <button
                             type="button"
                             className="jc-replay-sm"
-                            onClick={() => enqueueOmniVoiceSentence(t.spokenText)}
+                            onClick={() => {
+                              stopAllAudioPlayback();
+                              enqueueOmniVoiceSentence(t.spokenText);
+                            }}
                           >
                             🔊 ฟังเสียง
                           </button>

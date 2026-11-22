@@ -1230,6 +1230,32 @@ assert.equal(testOrder.cart.grandTotal, cartCalc.grandTotal, "Order grandTotal m
     sug.brands.length > 0 && sug.brands.some((b) => /MAKITA|มากิต้า/i.test(b.label)) && sug.products.length > 0,
     "suggestProducts returns matching brand + products fast",
   );
+
+  // Karaoke word segmentation & spoken-duration weighting
+  const { segmentKaraokeWords } = await import("../lib/spoken-thai.ts");
+  assert.deepEqual(segmentKaraokeWords(""), [], "segmentKaraokeWords returns [] on empty input");
+  const kSpans = segmentKaraokeWords("เบอร์ 1 เอโร่ น้ำจิ้มหมูกระทะ 220 บาทต่อแกลลอน รับเบอร์ไหนดีครับ");
+  assert.ok(kSpans.length >= 10, `expected >= 10 Thai karaoke word spans, got ${kSpans.length}`);
+  assert.equal(kSpans[0].start, 0, "first karaoke span starts at 0");
+  assert.equal(kSpans[kSpans.length - 1].end, 100, "last karaoke span ends at 100");
+  for (let idx = 0; idx < kSpans.length; idx++) {
+    assert.ok(kSpans[idx].end > kSpans[idx].start, `karaoke span ${idx} (${kSpans[idx].w}) has end > start`);
+    if (idx > 0) {
+      assert.ok(
+        Math.abs(kSpans[idx].start - kSpans[idx - 1].end) < 1e-9,
+        `karaoke spans are contiguous at ${idx}`,
+      );
+    }
+  }
+  const numSpan = kSpans.find((x) => x.w === "220");
+  const wordSpan = kSpans.find((x) => x.w === "รับ");
+  assert.ok(numSpan && wordSpan, "found both numeric token 220 and Thai word รับ");
+  assert.ok(
+    numSpan.end - numSpan.start > wordSpan.end - wordSpan.start,
+    `numeric 220 share (${(numSpan.end - numSpan.start).toFixed(2)}%) > Thai รับ share (${(wordSpan.end - wordSpan.start).toFixed(2)}%)`,
+  );
+  const spaceSpans = kSpans.filter((x) => x.isSpace);
+  assert.ok(spaceSpans.length > 0 && spaceSpans.every((s) => s.end - s.start < wordSpan.end - wordSpan.start), "space tokens are flagged and lightweight");
 }
 
 console.log(`✓ MarketBrain selftest passed (${stats.totalProducts} products, ${stats.totalNotes} notes, ${stats.totalSynapses} synapses, order=${testOrder.orderNo})`);

@@ -58,12 +58,15 @@ const DIM_X_RE = new RegExp(String.raw`(${NUM})\s*[xX×]\s*(${NUM})`, "g");
 // "x 3+1" -> "3 แถม 1"
 const FREEBIE_RE = /(\d+)\s*\+\s*(\d+)(?!\s*%)/g;
 
-const THAI_SEG = new Intl.Segmenter("th", { granularity: "word" });
+const THAI_SEG =
+  typeof Intl !== "undefined" && "Segmenter" in Intl
+    ? new Intl.Segmenter("th", { granularity: "word" })
+    : null;
 
 /** Expand Thai reduplication mark "ๆ" ("ตรงๆ" -> "ตรง ตรง") so OmniVoice never misreads "ๆ" as "กี่". */
 function expandMaiYamok(text: string): string {
   if (!text.includes("ๆ")) return text;
-  const parts = Array.from(THAI_SEG.segment(text), (s) => s.segment);
+  const parts = THAI_SEG ? Array.from(THAI_SEG.segment(text), (s) => s.segment) : text.split(/(\s+)/);
   const out: string[] = [];
   for (let i = 0; i < parts.length; i++) {
     const cur = parts[i];
@@ -111,4 +114,59 @@ export function toSpokenThai(text: string): string {
   return expandMaiYamok(out)
     .replace(/[ \t]{2,}/g, " ")
     .trim();
+}
+
+export type KaraokeWordSpan = {
+  w: string;
+  start: number;
+  end: number;
+  isSpace: boolean;
+};
+
+const COMBINING_THAI_RE = /[่-๋็์ัิ-ฺู]/g;
+const PURE_PUNCT_RE = /^[.,!?;:()\[\]"\u201C\u201D\-–—/]+$/;
+
+/**
+ * Estimates relative spoken duration weight for a segmented token so Thai karaoke highlighting
+ * paces realistically across digits ("220"), tone marks/vowels, spaces, and punctuation.
+ */
+function spokenTokenWeight(token: string): number {
+  if (!/\S/.test(token)) return 0.25;
+  if (PURE_PUNCT_RE.test(token)) return 0.4;
+  if (/\d/.test(token)) {
+    const digits = (token.match(/\d/g) || []).length;
+    const seps = (token.match(/[.,]/g) || []).length;
+    const others = token.replace(/[\d.,\s]/g, "").length;
+    return Math.max(2.5, digits * 3.2 + seps * 1.5 + others);
+  }
+  const expanded =
+    token.includes("ๆ") || token.includes("/") || token.includes("ฯ") ? toSpokenThai(token) : token;
+  const compact = expanded.replace(/\s+/g, "");
+  const combiningCount = (compact.match(COMBINING_THAI_RE) || []).length;
+  const baseCount = compact.replace(COMBINING_THAI_RE, "").length;
+  return Math.max(1.0, baseCount * 1.0 + combiningCount * 0.25);
+}
+
+/** Splits Thai/English text into word spans weighted by spoken duration for smooth 0-100% karaoke sync. */
+export function segmentKaraokeWords(text: string): KaraokeWordSpan[] {
+  if (!text) return [];
+  const tokens = THAI_SEG ? Array.from(THAI_SEG.segment(text), (s) => s.segment) : text.split(/(\s+)/);
+  if (tokens.length === 0) return [];
+  const weights = tokens.map((w) => spokenTokenWeight(w));
+  const totalWeight = Math.max(
+    1,
+    weights.reduce((sum, x) => sum + x, 0),
+  );
+  let acc = 0;
+  return tokens.map((w, idx) => {
+    const start = (acc / totalWeight) * 100;
+    acc += weights[idx];
+    const end = idx === tokens.length - 1 ? 100 : (acc / totalWeight) * 100;
+    return {
+      w,
+      start,
+      end,
+      isSpace: !/\S/.test(w),
+    };
+  });
 }
